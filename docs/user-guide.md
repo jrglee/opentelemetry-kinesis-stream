@@ -1,16 +1,14 @@
 # User guide
 
-This guide covers configuring and operating the paired Kinesis exporter and
-receiver: every setting with an example, and sequence diagrams for the
-runtime behaviors that matter operationally — round trip, shard rebalancing,
-graceful handoff, crash recovery, and resharding.
+This guide is everything you need to configure, operate, and test the paired
+Kinesis exporter and receiver. It documents every setting with an example,
+walks through testing against real AWS, and uses sequence diagrams to describe
+the runtime behaviors that matter operationally — round trip, shard
+rebalancing, graceful handoff, crash recovery, and resharding. You can treat
+the components as a black box; nothing here requires reading the source.
 
-For the architecture, see [`DESIGN.md`](../DESIGN.md); for the decisions behind
-specific behaviors, see the [ADRs](adr/).
-
-> **Status:** proof of concept. Traces only. Several knobs the architecture
-> calls for are deliberately deferred — see [ADR-0005](adr/0005-poc-milestone-scope-cuts.md)
-> and [Limitations](#limitations).
+> **Status:** proof of concept. Traces only. Several capabilities are
+> deliberately deferred — see [Limitations](#limitations).
 
 ## Contents
 
@@ -56,9 +54,7 @@ Both register under the component type `awskinesis`.
 
 This walkthrough takes you from nothing to a verified round trip on real
 Kinesis and DynamoDB, then exercises rebalancing, failover, and resharding so
-you can watch the distributed behavior with your own eyes. It is the L3 path of
-the [testing strategy](adr/0004-testing-strategy-middleware-ministack-real-aws.md);
-the local `make e2e` stack (MiniStack) is the L2 rehearsal of the same flow.
+you can watch the distributed behavior with your own eyes.
 
 You need: AWS credentials with permission to create a Kinesis stream and a
 DynamoDB table, the AWS CLI, Docker (or `make collector` for a local binary),
@@ -204,17 +200,15 @@ WORKER_ID=c2 bin/otelcol-kinesis --config file:consumer.yaml
 
 Within a couple of `discovery_interval`s, scan the lease table again — the two
 shards should now be split, one owned by `c1` and one by `c2`. That is the
-leaderless fair-share rebalancing converging
-([ADR-0008](adr/0008-leaderless-fair-share-rebalancing.md)). Generate more load
+leaderless fair-share rebalancing converging. Generate more load
 and confirm both consumers report spans.
 
 ### 7. Observe failover and graceful handoff
 
 - **Graceful (scale-down):** stop `c2` with `Ctrl-C`. It drains: finishes its
   in-flight batch, checkpoints, and releases its shard. `c1` picks the shard up
-  within a discovery pass and resumes from `c2`'s checkpoint — no re-read
-  ([ADR-0009](adr/0009-graceful-lease-handoff-and-shutdown.md)). The lease table
-  shows the shard move to `c1`.
+  within a discovery pass and resumes from `c2`'s checkpoint — no re-read. The
+  lease table shows the shard move to `c1`.
 - **Crash:** `kill -9` a consumer instead. It cannot drain, so its lease simply
   stops heartbeating; after `lease_duration` the survivor reclaims it and
   resumes from the last checkpoint, re-reading at most the final uncheckpointed
@@ -386,7 +380,7 @@ sequenceDiagram
     P->>EX: ConsumeTraces(td)
     EX->>EX: encode (otlp_proto) + compress (gzip)
     EX->>K: PutRecords(record, partitionKey=UUID)
-    Note over K: record routed to a shard<br/>by partition-key hash
+    Note over K: record routed to a shard by partition-key hash
     RX->>K: GetRecords(shardIterator)
     K-->>RX: [record]
     RX->>RX: decompress + decode
@@ -401,9 +395,9 @@ the consumer accepts the data re-reads it rather than losing it.
 ### Shard acquisition and fair-share rebalancing
 
 Every replica independently runs the same fair-share computation each
-`discovery_interval`. There is no leader. `target = ceil(activeShards /
-activeWorkers)`, where an active worker is a distinct heartbeating owner (plus
-self). See [ADR-0008](adr/0008-leaderless-fair-share-rebalancing.md).
+`discovery_interval`. There is no leader. The target each replica aims for is
+`ceil(activeShards / activeWorkers)`, where an active worker is a distinct
+heartbeating owner (counting itself).
 
 ```mermaid
 sequenceDiagram
@@ -411,35 +405,35 @@ sequenceDiagram
     participant L as Lease store
     participant B as Replica B (new)
 
-    Note over A: target = ceil(2/1) = 2 (alone)
+    Note over A: alone, target ceil(2/1)=2
     A->>L: heartbeat S0, S1
 
-    Note over B: B starts, sees S0,S1 owned by A
+    Note over B: B starts, sees S0 and S1 owned by A
     B->>L: List leases
-    Note over B: target = ceil(2/2) = 1; owns 0;<br/>nothing free → steal one
-    B->>L: Acquire(S1, owner=B, counter=n)
-    L-->>B: ok (counter=n+1)
+    Note over B: target ceil(2/2)=1, owns 0, nothing free, so steal one
+    B->>L: Acquire S1 as owner B, expect counter n
+    L-->>B: ok, counter now n+1
 
-    A->>L: Heartbeat(S1, counter=n)
-    L-->>A: conflict (counter advanced)
-    Note over A: A lost S1 → stops its S1 poller
+    A->>L: Heartbeat S1 with counter n
+    L-->>A: conflict, counter already advanced
+    Note over A: A lost S1, stops its S1 poller
 
-    Note over A: target now 1, owns S0 → balanced
-    Note over B: owns S1 → balanced
+    Note over A: target now 1, owns S0, balanced
+    Note over B: owns S1, balanced
 ```
 
 A new replica becomes visible by taking one shard (a *steal*); thereafter
 over-target owners shed surplus **cooperatively** (see next section) and
 under-target peers pick up the freed shards. Convergence is even-as-possible:
-`S=2,W=2 → 1-1`; `S=3,W=2 → 2-1` (stable).
+2 shards across 2 workers settle at 1 each; 3 shards across 2 workers settle at
+2 and 1.
 
 ### Graceful handoff and shutdown
 
 When a worker sheds a surplus shard (rebalance) or the collector shuts down,
 the poller **drains**: it finishes the in-flight batch, persists that batch's
 checkpoint, and only then releases the lease. The next owner resumes from a
-current checkpoint with no re-delivered records. See
-[ADR-0009](adr/0009-graceful-lease-handoff-and-shutdown.md).
+current checkpoint with no re-delivered records.
 
 ```mermaid
 sequenceDiagram
@@ -447,7 +441,7 @@ sequenceDiagram
     participant L as Lease store
     participant B as Replica B (acquiring S1)
 
-    Note over A: reconcile: over target → shed S1
+    Note over A: reconcile: over target, shed S1
     A->>A: drain S1 poller (signal)
     A->>A: finish in-flight batch
     A->>L: Checkpoint(S1, lastSeq)
@@ -455,7 +449,7 @@ sequenceDiagram
     L-->>A: ok (owner cleared)
 
     B->>L: List leases
-    Note over B: S1 unowned, under target → acquire
+    Note over B: S1 unowned, under target, acquire
     B->>L: Acquire(S1, owner=B)
     B->>L: GetShardIterator(AfterSequenceNumber=lastSeq)
     Note over B: resumes exactly where A stopped
@@ -479,17 +473,17 @@ sequenceDiagram
 
     A->>L: Heartbeat(S0) ✓
     A->>L: Checkpoint(S0, seq=100)
-    Note over A: 💥 crash (no drain)
+    Note over A: CRASH (no drain)
 
     loop every discovery_interval
         B->>L: List leases
         Note over B: S0 owner=A, counter unchanged
     end
-    Note over B: counter stale ≥ lease_duration → reclaim
+    Note over B: counter stale >= lease_duration, reclaim
     B->>L: Acquire(S0, owner=B, counter=last)
     L-->>B: ok
     B->>L: GetShardIterator(AfterSequenceNumber=100)
-    Note over B: re-reads only what A delivered<br/>but did not checkpoint
+    Note over B: re-reads only what A delivered but did not checkpoint
 ```
 
 Set a **stable `worker_id`** so a quickly-restarting replica reclaims its own
@@ -507,12 +501,12 @@ sequenceDiagram
     participant RX as Receiver
     participant L as Lease store
 
-    RX->>L: ListShards → parent P, children C1, C2 (parent=P)
+    RX->>L: ListShards -> parent P, children C1, C2 (parent=P)
     RX->>L: Ensure(C1, parents=[P]), Ensure(C2, parents=[P])
-    Note over RX: C1,C2 have parent P not at SHARD_END → skipped
+    Note over RX: C1,C2 have parent P not at SHARD_END, skipped
     RX->>RX: drain P to its end
     RX->>L: Checkpoint(P, SHARD_END)
-    Note over RX: next pass: P drained → C1,C2 acquirable
+    Note over RX: next pass: P drained, C1,C2 acquirable
     RX->>L: Acquire(C1), Acquire(C2)
 ```
 
@@ -532,7 +526,7 @@ sequenceDiagram
 
     RX->>RX: decompress + decode record
     alt decode/decompress fails
-        Note over RX: unprocessable bytes → skip, advance past
+        Note over RX: unprocessable bytes, skip, advance past
     else permanent downstream rejection
         RX->>C: ConsumeTraces
         C-->>RX: permanent error
@@ -540,7 +534,7 @@ sequenceDiagram
     else transient downstream rejection
         RX->>C: ConsumeTraces
         C-->>RX: error (backpressure)
-        Note over RX: do NOT advance; re-read from checkpoint
+        Note over RX: do NOT advance, re-read from checkpoint
     else success
         RX->>C: ConsumeTraces
         C-->>RX: ok
@@ -555,7 +549,7 @@ the persisted checkpoint rather than reused.
 ## Tuning
 
 - **`heartbeat_interval` vs `lease_duration`.** The heartbeat must comfortably
-  beat the lease expiry. A rule of thumb is `lease_duration ≈ 3–6 ×
+  beat the lease expiry. A rule of thumb is `lease_duration ≈ 3–6 x
   heartbeat_interval`. Too tight risks false reclaims of a healthy owner under
   a latency spike; too loose slows crash recovery.
 - **`discovery_interval`.** Drives how fast rebalancing converges and how fast
@@ -571,8 +565,7 @@ the persisted checkpoint rather than reused.
 
 ## Limitations
 
-This is a proof of concept. Deliberately deferred (see
-[ADR-0005](adr/0005-poc-milestone-scope-cuts.md)):
+This is a proof of concept. Deliberately deferred:
 
 - Traces only — no metrics or logs.
 - `otlp_proto` encoding and `none`/`gzip` compression only; `otlp_json`,
