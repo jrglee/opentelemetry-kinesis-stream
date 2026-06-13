@@ -27,6 +27,7 @@ implementing it.
 - [0013 — Dead-letter via pipeline re-emit; exporter observability](0013-dead-letter-via-pipeline-reemit.md)
 - [0014 — Model shard coordination on KCL](0014-model-shard-coordination-on-kcl.md)
 - [0015 — Delegate observability to the collector's built-in telemetry](0015-delegate-observability-to-collector-telemetry.md)
+- [0016 — Add OTLP JSON encoding; recommend compressed OTLP-proto](0016-add-otlp-json-encoding.md)
 
 ## How to add an ADR
 

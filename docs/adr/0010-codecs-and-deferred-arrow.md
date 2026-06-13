@@ -1,6 +1,9 @@
 # 0010. zstd/snappy codecs; OTel-Arrow deferred
 
-- **Status:** Accepted
+- **Status:** Accepted. The zstd/snappy codec decision stands; the OTel-Arrow
+  "no usable Go module" rationale is superseded by
+  [ADR-0016](0016-add-otlp-json-encoding.md) — the module now exists, and Arrow
+  is the next encoding to land.
 - **Date:** 2026-06-13
 
 ## Context

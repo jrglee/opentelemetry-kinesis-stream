@@ -29,9 +29,11 @@ type Encoding string
 const (
 	// EncodingOTLPProto is the OTLP protobuf encoding.
 	EncodingOTLPProto Encoding = "otlp_proto"
-	// EncodingOTLPJSON is the OTLP JSON encoding. Not yet implemented in this PoC.
+	// EncodingOTLPJSON is the OTLP JSON encoding.
 	EncodingOTLPJSON Encoding = "otlp_json"
-	// EncodingOTelArrow is the OpenTelemetry Arrow encoding. Not yet implemented in this PoC.
+	// EncodingOTelArrow is the OpenTelemetry Arrow encoding. It is not yet
+	// supported and is the next encoding planned to land; until then it is a
+	// reserved name that fails validation.
 	EncodingOTelArrow Encoding = "otel_arrow"
 )
 
@@ -66,15 +68,25 @@ type Compressor interface {
 	Decompress(in []byte) ([]byte, error)
 }
 
+// errUnsupportedEncoding is returned for a reserved-but-unsupported encoding
+// (currently otel_arrow, the next encoding planned to land). It points
+// operators at the encodings that are available today.
+func errUnsupportedEncoding(e Encoding) error {
+	return fmt.Errorf("encoding %q is not yet supported; "+
+		"use otlp_proto or otlp_json, optionally with zstd/snappy", e)
+}
+
 // NewTracesEncoder returns the traces encoder for the named wire encoding.
-// Unknown or not-yet-implemented encodings return an error so configuration
-// validation fails fast rather than at first record.
+// Unknown or unsupported encodings return an error so configuration validation
+// fails fast rather than at first record.
 func NewTracesEncoder(e Encoding) (TracesEncoder, error) {
 	switch e {
 	case EncodingOTLPProto:
 		return otlpProtoTraces{}, nil
-	case EncodingOTLPJSON, EncodingOTelArrow:
-		return nil, fmt.Errorf("encoding %q is not implemented in this PoC", e)
+	case EncodingOTLPJSON:
+		return otlpJSONTraces{}, nil
+	case EncodingOTelArrow:
+		return nil, errUnsupportedEncoding(e)
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", e)
 	}
@@ -85,8 +97,10 @@ func NewTracesDecoder(e Encoding) (TracesDecoder, error) {
 	switch e {
 	case EncodingOTLPProto:
 		return otlpProtoTraces{}, nil
-	case EncodingOTLPJSON, EncodingOTelArrow:
-		return nil, fmt.Errorf("encoding %q is not implemented in this PoC", e)
+	case EncodingOTLPJSON:
+		return otlpJSONTraces{}, nil
+	case EncodingOTelArrow:
+		return nil, errUnsupportedEncoding(e)
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", e)
 	}
@@ -97,8 +111,10 @@ func NewMetricsEncoder(e Encoding) (MetricsEncoder, error) {
 	switch e {
 	case EncodingOTLPProto:
 		return otlpProtoMetrics{}, nil
-	case EncodingOTLPJSON, EncodingOTelArrow:
-		return nil, fmt.Errorf("encoding %q is not implemented in this PoC", e)
+	case EncodingOTLPJSON:
+		return otlpJSONMetrics{}, nil
+	case EncodingOTelArrow:
+		return nil, errUnsupportedEncoding(e)
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", e)
 	}
@@ -109,8 +125,10 @@ func NewMetricsDecoder(e Encoding) (MetricsDecoder, error) {
 	switch e {
 	case EncodingOTLPProto:
 		return otlpProtoMetrics{}, nil
-	case EncodingOTLPJSON, EncodingOTelArrow:
-		return nil, fmt.Errorf("encoding %q is not implemented in this PoC", e)
+	case EncodingOTLPJSON:
+		return otlpJSONMetrics{}, nil
+	case EncodingOTelArrow:
+		return nil, errUnsupportedEncoding(e)
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", e)
 	}

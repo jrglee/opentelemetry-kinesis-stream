@@ -9,18 +9,23 @@ New here and want to *run* it? Start with the **[user guide](docs/user-guide.md)
 This README is about *why the project exists* and *how it is built* — the
 motivations and architectural choices, for evaluators and contributors.
 
-**Status:** working proof of concept. Traces and metrics flow end-to-end, and
-shard ownership is coordinated and rebalanced across replicas via a KCL-shaped
-DynamoDB lease table. Several capabilities are deliberately deferred — see
-[ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md).
+**Status:** working proof of concept. Traces and metrics flow end-to-end with
+`otlp_proto`/`otlp_json` encodings and `none`/`gzip`/`zstd`/`snappy`
+compression, and shard ownership is coordinated and rebalanced across replicas
+via a KCL-shaped DynamoDB lease table. The `otel_arrow` encoding is the next
+addition; other remaining gaps (logs signal, real-AWS reshard verification) are
+tracked in [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md) and
+[ADR-0016](docs/adr/0016-add-otlp-json-encoding.md).
 
 ## Why this exists
 
 The `opentelemetry-collector-contrib` project ships a Kinesis **exporter** but
 no Kinesis Data Streams **receiver** — there is no first-party way to consume
 OTLP telemetry back off a stream. This project closes that gap, and along the
-way lifts ceilings the contrib exporter leaves in place (5 MiB records,
-additional codecs, deterministic partition keys).
+way lifts ceilings the contrib exporter leaves in place. The biggest is
+**compression**: the contrib exporter does not compress, which is a real limiter
+against Kinesis's per-record size cap — this exporter adds `zstd`/`snappy`/`gzip`
+over OTLP-proto, plus 5 MiB records and deterministic partition keys.
 
 The hard part is not writing to or reading from Kinesis — it is consuming a
 sharded, resharding stream correctly across multiple collector replicas without
@@ -50,9 +55,13 @@ and consequences. The overall architecture lives in [`DESIGN.md`](DESIGN.md).
   group/compress/PutRecords path and one poll/decode path; only the pdata
   marshaling differs per signal.
   [ADR-0011](docs/adr/0011-metrics-signal-via-sink-seam.md).
-- **Pluggable wire encoding and compression.** Encoding and codec are config,
-  with a wire contract that lets exporter and receiver agree.
-  [ADR-0010](docs/adr/0010-codecs-and-deferred-arrow.md).
+- **Pluggable wire encoding and compression.** Encoding (`otlp_proto`,
+  `otlp_json`) and codec (`none`/`gzip`/`zstd`/`snappy`) are config, with a
+  headerless wire contract that lets exporter and receiver agree. Compressed
+  OTLP-proto is the recommended path and the contrib-gap closer; `otel_arrow` is
+  the next encoding to land.
+  [ADR-0010](docs/adr/0010-codecs-and-deferred-arrow.md),
+  [ADR-0016](docs/adr/0016-add-otlp-json-encoding.md).
 - **Deterministic partition keys and tag-grouped microbatching**, so records
   that should stay ordered share a shard and related records ride one record.
   [ADR-0012](docs/adr/0012-tag-grouping-and-oversize-repack.md).

@@ -7,8 +7,10 @@ the runtime behaviors that matter operationally — round trip, shard
 rebalancing, graceful handoff, crash recovery, and resharding. You can treat
 the components as a black box; nothing here requires reading the source.
 
-> **Status:** proof of concept. Traces and metrics. Several capabilities are
-> deliberately deferred — see [Limitations](#limitations).
+> **Status:** proof of concept. Traces and metrics, `otlp_proto`/`otlp_json`
+> encodings, `none`/`gzip`/`zstd`/`snappy` compression. Known gaps and
+> follow-ups (logs, `otel_arrow`, live-reshard verification) are in
+> [Limitations](#limitations).
 
 ## Contents
 
@@ -16,6 +18,7 @@ the components as a black box; nothing here requires reading the source.
 - [Signals (traces and metrics)](#signals-traces-and-metrics)
 - [Testing against real AWS](#testing-against-real-aws) — **start here to try it end-to-end**
 - [Exporter configuration](#exporter-configuration)
+  - [Encodings](#encodings)
   - [Choosing compression](#choosing-compression)
   - [Tag-grouped microbatching](#tag-grouped-microbatching)
   - [Oversize records](#oversize-records)
@@ -276,7 +279,7 @@ a stable key (see [Tag-grouped microbatching](#tag-grouped-microbatching)).
 | `stream_name`             | string | —            | yes      | Target Kinesis Data Stream. |
 | `region`                  | string | —            | yes      | AWS region of the stream. |
 | `endpoint`                | string | (SDK default)| no       | Override the AWS endpoint URL. Set this for emulators (e.g. `http://ministack:4566`). |
-| `encoding`                | string | `otlp_proto` | no       | Wire format. Only `otlp_proto` is implemented; `otlp_json` and `otel_arrow` are reserved and rejected at validation. |
+| `encoding`                | string | `otlp_proto` | no       | Wire format: `otlp_proto` (compact, recommended) or `otlp_json` (interoperable/debuggable). `otel_arrow` is the next encoding to land and is rejected at validation until then — see [Encodings](#encodings). |
 | `compression`             | string | `none`       | no       | Payload codec. One of `none`, `gzip`, `zstd`, `snappy`. See [Choosing compression](#choosing-compression). |
 | `partition_key.strategy`  | string | `random`     | no       | `random` (one key per record, spreads across shards) or `tag_hash` (stable key per resource-attribute tuple, co-locates by tag and groups the batch). |
 | `partition_key.tags`      | list   | —            | if tag_hash | Ordered list of resource attribute keys forming the tag tuple. Records sharing a tuple get the same key and land on the same shard. |
@@ -330,11 +333,33 @@ service:
 The wire layout (encoding + compression, headerless) must match what the
 receiver expects — they are agreed by configuration on both ends.
 
+### Encodings
+
+| Encoding     | Status | When to reach for it |
+|--------------|--------|----------------------|
+| `otlp_proto` | supported (default) | The compact, recommended choice. Pair with a codec for the smallest records. Wire-compatible with the contrib exporter. |
+| `otlp_json`  | supported | Human-readable and broadly interoperable — useful for debugging or for a downstream consumer that wants JSON. It is more verbose than proto, so compress it (e.g. `zstd`). |
+| `otel_arrow` | coming next | The next encoding to land. Reserved name; rejected at validation until then. See [ADR-0016](adr/0016-add-otlp-json-encoding.md). |
+
+Adopt `otlp_json` by setting it on both ends (encoding is agreed by config):
+
+```yaml
+exporters:
+  awskinesis:
+    stream_name: otel-traces
+    region: us-east-1
+    encoding: otlp_json
+    compression: zstd   # offsets JSON's verbosity
+```
+
 ### Choosing compression
 
-Compression runs before the `max_record_size` check, so a good codec packs more
-telemetry per record and reduces both shard count and dropped-or-split records.
-All four codecs must be matched by the receiver's `compression` setting.
+**Compression is this exporter's headline advantage over the contrib Kinesis
+exporter, which does not compress at all** — a real limiter against Kinesis's
+per-record size cap. Compression runs before the `max_record_size` check, so a
+good codec packs more telemetry per record and reduces both shard count and
+dropped-or-split records. The codec must be matched by the receiver's
+`compression` setting.
 
 | Codec    | When to reach for it |
 |----------|----------------------|
@@ -934,13 +959,18 @@ cleaner single-Collector path.
 
 ## Limitations
 
-This is a proof of concept. Deliberately deferred:
+This is a proof of concept. Known gaps and what's next:
 
-- Traces and metrics — no logs.
-- `otlp_proto` encoding only. `otlp_json` is not implemented and `otel_arrow`
-  is deferred (no usable Go module yet); both are reserved names that fail
-  validation.
-- Resharding is gated in code but unverified against a live split.
-- Rebalancing bootstrap uses a forced steal (at-least-once for one shard at
+- **Signals: traces and metrics only — no logs.** Neither component wires the
+  logs signal yet.
+- **`otel_arrow` encoding is coming next.** `otlp_proto` and `otlp_json` are
+  supported today; `otel_arrow` is a reserved name that fails validation until
+  the implementation lands (the Go module now exists) — see
+  [ADR-0016](adr/0016-add-otlp-json-encoding.md).
+- **Resharding** is implemented and covered by an automated simulated-split test,
+  but **not yet verified against a real AWS reshard**.
+- **Rebalancing bootstrap uses a forced steal** (at-least-once for one shard at
   worker-join); planned sheds and shutdowns are graceful (effectively
   exactly-once). Exactly-once is not claimed across crashes.
+- **No enhanced fan-out (EFO).** `GetRecords` polling only; `SubscribeToShard`
+  is out of scope.
