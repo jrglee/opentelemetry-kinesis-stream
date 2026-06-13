@@ -1,0 +1,35 @@
+# Consumer collector: Kinesis in, file out. Run as two replicas (a/b) that
+# share one DynamoDB lease table, so shard ownership is split between them.
+# REPLICA is injected per container and disambiguates both the lease worker
+# identity and the output file.
+receivers:
+  awskinesis:
+    stream_name: otel-traces
+    region: us-east-1
+    endpoint: http://ministack:4566
+    encoding: otlp_proto
+    compression: gzip
+    poll_interval: 250ms
+    max_records: 1000
+    lease_backend: dynamodb
+    lease_table: otel-leases
+    worker_id: ${env:REPLICA}
+    # Short timings so a takeover is observable within an E2E run.
+    lease_duration: 10s
+    heartbeat_interval: 2s
+    discovery_interval: 3s
+
+exporters:
+  file:
+    path: /shared/out-${env:REPLICA}.jsonl
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [awskinesis]
+      exporters: [file, debug]

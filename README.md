@@ -6,19 +6,25 @@ Kinesis exporter (5 MiB records, zstd, OpenTelemetry Arrow, deterministic
 partition keys). The receiver closes the gap contrib leaves open: there is
 no first-party Kinesis Data Streams receiver today.
 
-**Status:** early scaffolding. See [`DESIGN.md`](DESIGN.md) for the
-architecture and [`docs/adr/`](docs/adr/) for decisions made during
-implementation.
+**Status:** working proof of concept. Traces flow end-to-end — exporter to
+Kinesis, receiver back out — with shard ownership coordinated across replicas
+via a KCL-shaped DynamoDB lease table. Many capabilities are deliberately
+deferred (see [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md)). See
+[`DESIGN.md`](DESIGN.md) for the architecture and [`docs/adr/`](docs/adr/) for
+decisions made during implementation.
 
 ## Build
 
 ```
 mise install
-make check
+make check          # format, vet, lint, unit tests
+make e2e            # full docker-compose round-trip test (needs Docker)
 ```
 
-`mise install` pins the toolchain (Go, golangci-lint, gofumpt). `make check`
-runs format, vet, lint, and tests.
+`mise install` pins the toolchain (Go, golangci-lint, gofumpt, awscli).
+`make check` is the pre-push gate. `make e2e` stands up a producer collector,
+the MiniStack emulator, and two consumer replicas, then asserts every span is
+delivered exactly once.
 
 ## License
 

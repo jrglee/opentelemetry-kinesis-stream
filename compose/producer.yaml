@@ -1,0 +1,33 @@
+# Producer collector: OTLP in, Kinesis out. Used by the E2E stack.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    # Small batch so the E2E doesn't wait long for the timeout trigger.
+    timeout: 1s
+    send_batch_size: 50
+
+exporters:
+  awskinesis:
+    stream_name: otel-traces
+    region: us-east-1
+    endpoint: http://ministack:4566
+    encoding: otlp_proto
+    compression: gzip
+    max_record_size: 1048576
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [awskinesis, debug]

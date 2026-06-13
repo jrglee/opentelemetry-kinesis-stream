@@ -2,3 +2,4 @@
 go = "1.26.4"
 golangci-lint = "2.12.2"
 gofumpt = "0.10.0"
+awscli = "2.35.4"

@@ -13,3 +13,6 @@ coverage.out
 
 # OS
 .DS_Store
+
+# E2E consumer output (bind-mount target)
+compose/shared/

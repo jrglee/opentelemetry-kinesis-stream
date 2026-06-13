@@ -1,0 +1,94 @@
+# E2E stack: producer -> MiniStack Kinesis -> two consumer replicas -> files.
+# The two consumers share a DynamoDB lease table, so shard ownership is split
+# between them and the E2E can assert no span is delivered twice.
+#
+# Consumer output lands on a named volume (not a host bind mount, which colima
+# does not surface back to the macOS host); the test harness pulls the files
+# out with `docker compose cp`.
+name: otel-kinesis-e2e
+
+services:
+  ministack:
+    image: ministackorg/ministack:1.3.63
+    ports:
+      - "4566:4566"
+
+  stream-init:
+    image: amazon/aws-cli:2.31.13
+    entrypoint: ["/bin/sh", "/init/stream-init.sh"]
+    volumes:
+      - ./stream-init.sh:/init/stream-init.sh:ro
+    depends_on:
+      ministack:
+        condition: service_started
+
+  producer:
+    image: otelcol-kinesis:dev
+    build:
+      context: ..
+      dockerfile: cmd/otelcol-kinesis/Dockerfile
+    command: ["--config", "file:/etc/otelcol/config.yaml"]
+    ports:
+      - "4317:4317"
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./producer.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      stream-init:
+        condition: service_completed_successfully
+
+  consumer-a:
+    image: otelcol-kinesis:dev
+    build:
+      context: ..
+      dockerfile: cmd/otelcol-kinesis/Dockerfile
+    command: ["--config", "file:/etc/otelcol/config.yaml"]
+    environment:
+      REPLICA: a
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./consumer.yaml:/etc/otelcol/config.yaml:ro
+      - shared:/shared
+    depends_on:
+      stream-init:
+        condition: service_completed_successfully
+
+  consumer-b:
+    image: otelcol-kinesis:dev
+    build:
+      context: ..
+      dockerfile: cmd/otelcol-kinesis/Dockerfile
+    command: ["--config", "file:/etc/otelcol/config.yaml"]
+    environment:
+      REPLICA: b
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./consumer.yaml:/etc/otelcol/config.yaml:ro
+      - shared:/shared
+    depends_on:
+      stream-init:
+        condition: service_completed_successfully
+
+  # Not started with `up`; the test invokes it via `docker compose run` once
+  # the stack is confirmed ready, so we control emission timing.
+  telemetrygen:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.154.0
+    profiles: ["tools"]
+    command:
+      - traces
+      - --traces=100
+      # rate=0 disables throttling; the default is 1 span/s, which would make
+      # 200 spans take ~200s. child-spans=1 → 2 spans per trace → 200 spans.
+      - --rate=0
+      - --otlp-endpoint=producer:4317
+      - --otlp-insecure
+
+volumes:
+  shared:

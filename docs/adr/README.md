@@ -16,6 +16,9 @@ implementing it.
 - [0002 — Component naming mirrors contrib](0002-component-naming-mirrors-contrib.md)
 - [0003 — mise pins the toolchain; Makefile owns task running](0003-mise-and-makefile-for-build-tooling.md)
 - [0004 — Testing strategy: middleware fakes, MiniStack, real AWS](0004-testing-strategy-middleware-ministack-real-aws.md)
+- [0005 — PoC milestone scope cuts](0005-poc-milestone-scope-cuts.md)
+- [0006 — Shard lease coordination via a KCL-shaped lease store](0006-shard-lease-coordination.md)
+- [0007 — Hand-written collector binary and docker-compose E2E stack](0007-custom-collector-binary-and-e2e-stack.md)
 
 ## How to add an ADR
 

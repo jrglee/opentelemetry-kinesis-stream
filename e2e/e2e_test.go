@@ -1,0 +1,166 @@
+//go:build e2e
+
+// Package e2e drives the full docker-compose stack: a producer collector
+// (OTLP -> Kinesis), MiniStack as the Kinesis/DynamoDB emulator, and two
+// consumer collectors (Kinesis -> file) sharing one DynamoDB lease table.
+// telemetrygen emits a fixed number of spans through the producer; the test
+// asserts every span arrives exactly once across the two consumers, which
+// proves both the wire round-trip and multi-replica lease coordination.
+package e2e
+
+import (
+	"bufio"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"go.opentelemetry.io/collector/pdata/ptrace"
+)
+
+const (
+	tracesEmitted  = 100
+	spansPerTrace  = 2 // telemetrygen emits a parent+child pair per trace
+	expectedSpans  = tracesEmitted * spansPerTrace
+	settleDeadline = 60 * time.Second
+	deliverWait    = 90 * time.Second
+)
+
+func TestRoundTripMultiReplica(t *testing.T) {
+	requireDocker(t)
+
+	// Host-local scratch dir that consumer output is copied into (not a bind
+	// mount — see harness copyShared).
+	shared := t.TempDir()
+	env := composeEnv()
+
+	t.Cleanup(func() {
+		out, err := compose(t, env, 60*time.Second, "down", "-v")
+		if err != nil {
+			t.Logf("compose down failed: %v\n%s", err, out)
+		}
+	})
+
+	if out, err := compose(t, env, 5*time.Minute, "up", "-d", "--build"); err != nil {
+		t.Fatalf("compose up: %v\n%s", err, out)
+	}
+
+	// Wait until every shard has an owner before emitting, so no span is lost
+	// to a window where nobody is reading a shard. Ownership may land entirely
+	// on one replica — the lease coordinator does not rebalance healthy leases
+	// (DESIGN.md §6) — which is fine: the safety property below holds either
+	// way, and both consumers staying subscribed is exactly what makes the
+	// no-duplicate assertion meaningful.
+	waitForOwnership(t)
+
+	if out, err := compose(t, env, 90*time.Second, "run", "--rm", "telemetrygen"); err != nil {
+		t.Fatalf("telemetrygen: %v\n%s", err, out)
+	}
+
+	unique, raw, perFile := waitForSpans(t, env, shared)
+
+	// No loss: every emitted span is present.
+	if unique != expectedSpans {
+		t.Fatalf("unique spans = %d, want %d (loss)", unique, expectedSpans)
+	}
+	// No double-delivery: raw occurrences across both consumer files equal the
+	// unique set. A span read by two replicas would make raw > unique. This is
+	// the multi-replica safety property — two subscribed consumers, each shard
+	// delivered exactly once.
+	if raw != unique {
+		t.Fatalf("raw span occurrences = %d but unique = %d: a shard was delivered to more than one replica", raw, unique)
+	}
+	bothContributed := perFile["a"] > 0 && perFile["b"] > 0
+	t.Logf("round-trip OK: %d spans delivered exactly once (consumer-a=%d, consumer-b=%d, split=%v)",
+		unique, perFile["a"], perFile["b"], bothContributed)
+	if !bothContributed {
+		t.Logf("note: ownership did not split across replicas this run — expected, the coordinator does not rebalance healthy leases")
+	}
+}
+
+// waitForSpans polls the two consumer output files until the unique span set
+// reaches expectedSpans (or the deadline passes), then returns the unique
+// count, the raw occurrence count across both files, and the per-replica raw
+// counts. raw > unique signals a span delivered to more than one replica.
+func waitForSpans(t *testing.T, env []string, shared string) (unique, raw int, perFile map[string]int) {
+	t.Helper()
+	deadline := time.Now().Add(deliverWait)
+	for time.Now().Before(deadline) {
+		unique, raw, perFile = readSpanIDs(t, env, shared)
+		if unique >= expectedSpans {
+			return unique, raw, perFile
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Fatalf("timed out: got %d/%d unique spans (consumer-a=%d, consumer-b=%d)",
+		unique, expectedSpans, perFile["a"], perFile["b"])
+	return unique, raw, perFile
+}
+
+func readSpanIDs(t *testing.T, env []string, shared string) (unique, raw int, perFile map[string]int) {
+	t.Helper()
+	copyShared(t, env, shared)
+	ids := make(map[[24]byte]struct{})
+	perFile = map[string]int{}
+	for _, replica := range []string{"a", "b"} {
+		path := filepath.Join(shared, "out-"+replica+".jsonl")
+		n := collectFromFile(t, path, ids)
+		perFile[replica] = n
+		raw += n
+	}
+	return len(ids), raw, perFile
+}
+
+// collectFromFile parses each JSON line as OTLP traces and adds every span's
+// (traceID,spanID) key to the set. Returns the number of spans seen.
+func collectFromFile(t *testing.T, path string, ids map[[24]byte]struct{}) int {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		return 0 // not created yet
+	}
+	defer f.Close()
+
+	unmarshaler := &ptrace.JSONUnmarshaler{}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
+	count := 0
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		td, err := unmarshaler.UnmarshalTraces([]byte(line))
+		if err != nil {
+			t.Fatalf("unmarshal line in %s: %v", path, err)
+		}
+		count += addSpanIDs(td, ids)
+	}
+	return count
+}
+
+// addSpanIDs adds each span's (traceID,spanID) key to the set and returns the
+// number of spans seen on this Traces (including any that were already in the
+// set, so the caller's raw count reflects duplicate deliveries).
+func addSpanIDs(td ptrace.Traces, ids map[[24]byte]struct{}) int {
+	count := 0
+	rss := td.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		sss := rss.At(i).ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			spans := sss.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				s := spans.At(k)
+				var key [24]byte
+				tid := s.TraceID()
+				sid := s.SpanID()
+				copy(key[:16], tid[:])
+				copy(key[16:], sid[:])
+				ids[key] = struct{}{}
+				count++
+			}
+		}
+	}
+	return count
+}
