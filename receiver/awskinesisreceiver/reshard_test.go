@@ -81,6 +81,7 @@ func TestReshardParentDrainsBeforeChild(t *testing.T) {
 		comp:     comp,
 		sink:     tracesSink{decoder: dec, consumer: consumeFn},
 		logger:   zaptest.NewLogger(t),
+		tel:      testTelemetry(t),
 		workerID: "w1",
 		active:   make(map[string]*activePoller),
 		observed: make(map[string]observation),

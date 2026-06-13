@@ -47,7 +47,7 @@ func createTracesReceiver(
 	if !ok {
 		return nil, fmt.Errorf("unexpected config type %T", rawCfg)
 	}
-	return newTracesReceiver(cfg, next, set.Logger)
+	return newTracesReceiver(cfg, next, set)
 }
 
 func createMetricsReceiver(
@@ -60,5 +60,5 @@ func createMetricsReceiver(
 	if !ok {
 		return nil, fmt.Errorf("unexpected config type %T", rawCfg)
 	}
-	return newMetricsReceiver(cfg, next, set.Logger)
+	return newMetricsReceiver(cfg, next, set)
 }

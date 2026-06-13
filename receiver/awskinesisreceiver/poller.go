@@ -33,6 +33,7 @@ type shardPoller struct {
 	comp   encoding.Compressor
 	sink   sink
 	logger *zap.Logger
+	tel    *receiverTelemetry
 
 	leaseMu sync.Mutex
 	leased  lease.Lease
@@ -87,10 +88,12 @@ func (p *shardPoller) runHeartbeat(ctx context.Context, stop context.CancelFunc,
 		if err := p.heartbeat(ctx); err != nil {
 			if !errors.Is(err, context.Canceled) {
 				logger.Warn("heartbeat lost lease; stopping poller", zap.Error(err))
+				p.tel.recordLeaseEvent(ctx, leaseHeartbeatGot, resultConflict)
 			}
 			stop()
 			return
 		}
+		logger.Debug("heartbeat ok", zap.Int64("counter", p.leaseCounter()))
 	}
 }
 
@@ -120,6 +123,7 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 			p.writeShardEnd(ctx, logger)
 			return
 		}
+		pollStart := time.Now()
 		out, err := p.client.GetRecords(ctx, &kinesis.GetRecordsInput{
 			ShardIterator: iter,
 			Limit:         aws.Int32(p.cfg.MaxRecords),
@@ -150,6 +154,19 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 			continue
 		}
 
+		pollMs := float64(time.Since(pollStart).Microseconds()) / 1000
+		pollBytes := 0
+		for i := range out.Records {
+			pollBytes += len(out.Records[i].Data)
+		}
+		p.tel.recordPoll(ctx, len(out.Records), pollBytes, pollMs)
+		logger.Debug(
+			"polled shard",
+			zap.Int("records", len(out.Records)),
+			zap.Int("bytes", pollBytes),
+			zap.Float64("duration_ms", pollMs),
+		)
+
 		// Advance the checkpoint only over records that were delivered or are
 		// permanently unprocessable. A record the downstream transiently
 		// rejected must NOT be skipped — we stop the batch there, checkpoint
@@ -174,6 +191,8 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 				stop()
 				return
 			}
+			p.tel.recordLeaseEvent(ctx, leaseCheckpoint, resultSuccess)
+			logger.Debug("checkpoint advanced", zap.String("seq", advanceSeq))
 		}
 		if retry {
 			// Re-read from the just-advanced checkpoint after a short pause so
@@ -238,6 +257,12 @@ func (p *shardPoller) openIterator(ctx context.Context) (*string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get_shard_iterator: %w", err)
 	}
+	p.logger.Debug(
+		"opened iterator",
+		zap.String("shard", shardID),
+		zap.String("type", string(input.ShardIteratorType)),
+		zap.String("checkpoint", checkpoint),
+	)
 	return out.ShardIterator, nil
 }
 
@@ -374,4 +399,10 @@ func (p *shardPoller) shardID() string {
 	p.leaseMu.Lock()
 	defer p.leaseMu.Unlock()
 	return p.leased.ShardID
+}
+
+func (p *shardPoller) leaseCounter() int64 {
+	p.leaseMu.Lock()
+	defer p.leaseMu.Unlock()
+	return p.leased.Counter
 }

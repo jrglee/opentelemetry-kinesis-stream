@@ -10,10 +10,22 @@ import (
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	noopmetric "go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
 )
+
+// testTelemetry builds a no-op-backed telemetry struct for tests that exercise
+// the poller/coordinator without asserting on emitted metrics.
+func testTelemetry(t *testing.T) *receiverTelemetry {
+	t.Helper()
+	tel, err := newReceiverTelemetry(noopmetric.NewMeterProvider())
+	if err != nil {
+		t.Fatalf("telemetry: %v", err)
+	}
+	return tel
+}
 
 func tracesRecord(t *testing.T, name string) types.Record {
 	t.Helper()
@@ -77,6 +89,7 @@ func newPoller(t *testing.T, s sink, deadLetter bool) *shardPoller {
 		comp:   comp,
 		sink:   s,
 		logger: zaptest.NewLogger(t),
+		tel:    testTelemetry(t),
 	}
 }
 

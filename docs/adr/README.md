@@ -25,6 +25,8 @@ implementing it.
 - [0011 — Metrics signal via a single signal-agnostic seam](0011-metrics-signal-via-sink-seam.md)
 - [0012 — Tag-hash partition keys, group-by-tag microbatching, oversize repack](0012-tag-grouping-and-oversize-repack.md)
 - [0013 — Dead-letter via pipeline re-emit; exporter observability](0013-dead-letter-via-pipeline-reemit.md)
+- [0014 — Model shard coordination on KCL](0014-model-shard-coordination-on-kcl.md)
+- [0015 — Delegate observability to the collector's built-in telemetry](0015-delegate-observability-to-collector-telemetry.md)
 
 ## How to add an ADR
 

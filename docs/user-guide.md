@@ -30,6 +30,7 @@ the components as a black box; nothing here requires reading the source.
   - [Crash recovery](#crash-recovery)
   - [Resharding](#resharding)
   - [Per-record failure handling](#per-record-failure-handling)
+- [Observability](#observability)
 - [Tuning](#tuning)
 - [Limitations](#limitations)
 
@@ -825,6 +826,94 @@ sequenceDiagram
 A transient failure stops the batch and re-reads it, so spans are retried, not
 lost, under backpressure. A failed or expired shard iterator is re-opened from
 the persisted checkpoint rather than reused.
+
+## Observability
+
+Both components delegate observability to the Collector's built-in telemetry —
+they hold no logging or metrics config of their own. Logs go through the
+Collector's logger and metrics through its `MeterProvider`, so everything is
+controlled by `service::telemetry` and routed with the same exporters you
+already use. (Why: [ADR-0015](adr/0015-delegate-observability-to-collector-telemetry.md).)
+For symptom-driven debugging, see [troubleshooting](troubleshooting.md).
+
+### Logs
+
+```yaml
+service:
+  telemetry:
+    logs:
+      level: info        # set to debug to watch normal operation
+      encoding: json     # or console
+```
+
+At `info` you see milestones and failures (receiver started, shard
+stolen/released, lease lost, record rejected). At `debug` you also see each poll
+cycle (`polled shard` with record/byte counts and duration), `checkpoint
+advanced`, `lease acquired`, `reconcile pass`, `opened iterator`, `heartbeat
+ok`, and the exporter's `emit` / `put_records`.
+
+**In ECS**, Collector logs go to stderr and the task's `awslogs` log driver
+ships them to CloudWatch Logs — no Collector config needed. (Alternatively,
+`service::telemetry::logs::processors` can push logs as OTLP.)
+
+### Metrics
+
+The components emit internal performance instruments. Expose them with a metrics
+reader; `level: none` disables them (the component is handed a no-op meter).
+
+```yaml
+service:
+  telemetry:
+    resource:
+      deployment.environment: prod   # static tags on all internal telemetry
+      cloud.region: us-west-2
+    metrics:
+      level: detailed
+      readers:
+        - pull:                        # scrape at http://<host>:8888/metrics
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+        # or push via OTLP:
+        # - periodic:
+        #     exporter:
+        #       otlp:
+        #         protocol: http/protobuf
+        #         endpoint: https://collector:4318
+```
+
+Emitted instruments (scope `awskinesisexporter` / `awskinesisreceiver`):
+
+| Metric | Type | Unit | Notes |
+|--------|------|------|-------|
+| `kinesis.exporter.batch.records` | histogram | `{record}` | records per `PutRecords` call |
+| `kinesis.exporter.batch.bytes` | histogram | `By` | aggregate payload bytes per call |
+| `kinesis.exporter.flush.duration_ms` | histogram | `ms` | `PutRecords` latency |
+| `kinesis.exporter.records_dropped` | counter | `{item}` | `reason` = `oversize` \| `rejected` |
+| `kinesis.receiver.poll.records` | histogram | `{record}` | records per `GetRecords` call |
+| `kinesis.receiver.poll.bytes` | histogram | `By` | aggregate record bytes per call |
+| `kinesis.receiver.poll.duration_ms` | histogram | `ms` | `GetRecords` latency |
+| `kinesis.receiver.lease.events` | counter | `{event}` | `event` = `acquire`/`release`/`steal`/`checkpoint`/`heartbeat_lost`, `result` = `success`/`conflict` |
+| `kinesis.receiver.shards.owned` | up-down counter | `{shard}` | shards actively polled by this replica |
+
+Instruments carry no per-shard or per-sequence attributes by design (that detail
+lives in debug logs), so cardinality stays bounded.
+
+**In ECS → CloudWatch metrics**, route these into a pipeline with the
+`awsemfexporter`; the CloudWatch namespace is set there, not on this component:
+
+```yaml
+exporters:
+  awsemf:
+    namespace: KinesisOtel
+    region: us-west-2
+```
+
+Feed the internal metrics into that pipeline with a `periodic` OTLP reader
+(above) pointing at the Collector's own OTLP receiver, or by scraping the
+`pull` Prometheus endpoint with a `prometheusreceiver`. The OTLP reader is the
+cleaner single-Collector path.
 
 ## Tuning
 
