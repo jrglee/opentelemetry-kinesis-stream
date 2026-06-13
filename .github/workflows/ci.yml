@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Unit tests, vet, lint, and format/tidy checks. Runs on both amd64 and
+  # arm64 Linux: all development happened on arm64 macOS, so this is the first
+  # time the code is exercised on Linux and on x86_64. arm64 Linux runners are
+  # free for public repositories.
+  check:
+    name: check (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (Go, golangci-lint, gofumpt)
+        uses: jdx/mise-action@v2
+      - name: Build
+        run: make build
+      - name: CI gate (fmt-check, tidy-check, vet, lint, test)
+        run: make ci
+
+  # Full docker-compose round trip (traces + InfluxDB metrics) against the
+  # MiniStack emulator. amd64 only; the GitHub-hosted runner provides Docker.
+  e2e:
+    name: e2e (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Traces + metrics E2E
+        run: go test -tags e2e -count=1 -timeout 900s ./e2e/...
