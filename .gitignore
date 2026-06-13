@@ -1,1 +1,15 @@
 .cachebro/
+
+# Go build artifacts
+bin/
+*.test
+*.out
+coverage.out
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

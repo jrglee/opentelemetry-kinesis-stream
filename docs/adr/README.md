@@ -1,0 +1,32 @@
+# Architectural Decision Records
+
+These records capture cross-cutting decisions made during implementation
+that future contributors need to understand in order to read the code as
+intentional rather than accidental. They are deliberately lightweight: a
+short context, the decision stated as a positive imperative, and the
+consequences worth revisiting.
+
+The top-level [`DESIGN.md`](../../DESIGN.md) covers the overall architecture.
+The ADRs here cover the smaller, sharper decisions that fall out of
+implementing it.
+
+## Index
+
+- [0001 — Standalone repo, single Go module](0001-standalone-repo-single-module.md)
+- [0002 — Component naming mirrors contrib](0002-component-naming-mirrors-contrib.md)
+- [0003 — mise pins the toolchain; Makefile owns task running](0003-mise-and-makefile-for-build-tooling.md)
+- [0004 — Testing strategy: middleware fakes, MiniStack, real AWS](0004-testing-strategy-middleware-ministack-real-aws.md)
+
+## How to add an ADR
+
+1. Copy [`template.md`](template.md) to `NNNN-kebab-title.md` using the next
+   sequential number.
+2. Fill in Context, Decision, Consequences. Keep each section short — if a
+   section grows past a few paragraphs, the decision is probably more than
+   one ADR.
+3. Add a one-line entry to the index above.
+4. Open a PR.
+
+ADRs are immutable once accepted. To change a decision, write a new ADR
+that supersedes the old one and update the old one's `Status` to
+`Superseded by NNNN`.
