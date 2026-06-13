@@ -8,7 +8,7 @@ import (
 
 func TestRoundTrip(t *testing.T) {
 	encodings := []Encoding{EncodingOTLPProto}
-	codecs := []Codec{CodecNone, CodecGzip}
+	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy}
 
 	for _, e := range encodings {
 		for _, c := range codecs {

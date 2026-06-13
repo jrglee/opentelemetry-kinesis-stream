@@ -11,6 +11,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/kinesis v1.44.2
 	github.com/aws/smithy-go v1.27.1
 	github.com/google/uuid v1.6.0
+	github.com/klauspost/compress v1.18.6
 	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter v0.154.0
 	go.opentelemetry.io/collector/component v1.60.0
 	go.opentelemetry.io/collector/confmap v1.60.0
@@ -69,7 +70,6 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/knadh/koanf/maps v0.1.2 // indirect
 	github.com/knadh/koanf/providers/confmap v1.0.0 // indirect
 	github.com/knadh/koanf/v2 v2.3.5 // indirect

@@ -15,8 +15,10 @@ const (
 	CodecNone Codec = "none"
 	// CodecGzip is RFC 1952 gzip.
 	CodecGzip Codec = "gzip"
-	// CodecZstd is RFC 8478 zstd. Not yet implemented in this PoC.
+	// CodecZstd is RFC 8478 zstd.
 	CodecZstd Codec = "zstd"
+	// CodecSnappy is the Snappy block format.
+	CodecSnappy Codec = "snappy"
 )
 
 // Encoding names the wire-level marshaling format of the telemetry payload
@@ -85,7 +87,9 @@ func NewCompressor(c Codec) (Compressor, error) {
 	case CodecGzip:
 		return gzipCodec{}, nil
 	case CodecZstd:
-		return nil, fmt.Errorf("codec %q is not implemented in this PoC", c)
+		return zstdCodec{}, nil
+	case CodecSnappy:
+		return snappyCodec{}, nil
 	default:
 		return nil, fmt.Errorf("unknown codec %q", c)
 	}
