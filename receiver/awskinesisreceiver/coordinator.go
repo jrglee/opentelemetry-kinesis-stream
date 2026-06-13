@@ -3,6 +3,7 @@ package awskinesisreceiver
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -41,9 +42,13 @@ type coordinator struct {
 	wg sync.WaitGroup
 }
 
+// activePoller is the coordinator's handle on a running shardPoller goroutine.
+// The pointer identity also acts as a generation token: the poller's exit
+// defer only deletes the c.active entry when the current entry is still its
+// own activePoller, so a later Acquire+startPoller cycle for the same shard
+// is not clobbered by a delayed defer from a prior generation.
 type activePoller struct {
 	cancel context.CancelFunc
-	done   chan struct{}
 }
 
 type observation struct {
@@ -101,22 +106,28 @@ func (c *coordinator) discoverShards(ctx context.Context) error {
 	return nil
 }
 
+// listShards paginates over ListShards. The AWS SDK does not ship a typed
+// paginator for this API, so we encode the StreamName-only-on-first-page
+// rule by hand. A non-nil token-with-empty-string is treated as no more
+// pages — defensive against any AWS quirk.
 func (c *coordinator) listShards(ctx context.Context) ([]types.Shard, error) {
 	var (
 		shards []types.Shard
 		token  *string
 	)
 	for {
-		input := &kinesis.ListShardsInput{NextToken: token}
+		input := &kinesis.ListShardsInput{}
 		if token == nil {
 			input.StreamName = aws.String(c.cfg.StreamName)
+		} else {
+			input.NextToken = token
 		}
 		out, err := c.client.ListShards(ctx, input)
 		if err != nil {
 			return nil, err
 		}
 		shards = append(shards, out.Shards...)
-		if out.NextToken == nil {
+		if out.NextToken == nil || aws.ToString(out.NextToken) == "" {
 			return shards, nil
 		}
 		token = out.NextToken
@@ -137,14 +148,6 @@ func (c *coordinator) reconcile(ctx context.Context) {
 
 	c.mu.Lock()
 	c.refreshObservations(leases, now)
-	// Prune pollers whose context already exited.
-	for shardID, ap := range c.active {
-		select {
-		case <-ap.done:
-			delete(c.active, shardID)
-		default:
-		}
-	}
 	c.mu.Unlock()
 
 	for _, l := range leases {
@@ -204,7 +207,7 @@ func (c *coordinator) refreshObservations(leases []lease.Lease, now time.Time) {
 		}
 	}
 	for shardID := range c.observed {
-		if !leaseExists(leases, shardID) {
+		if !slices.ContainsFunc(leases, func(l lease.Lease) bool { return l.ShardID == shardID }) {
 			delete(c.observed, shardID)
 		}
 	}
@@ -212,8 +215,7 @@ func (c *coordinator) refreshObservations(leases []lease.Lease, now time.Time) {
 
 func (c *coordinator) startPoller(ctx context.Context, l lease.Lease) {
 	pollerCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	ap := &activePoller{cancel: cancel, done: done}
+	ap := &activePoller{cancel: cancel}
 
 	c.mu.Lock()
 	c.active[l.ShardID] = ap
@@ -232,10 +234,14 @@ func (c *coordinator) startPoller(ctx context.Context, l lease.Lease) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		defer close(done)
 		defer func() {
 			c.mu.Lock()
-			delete(c.active, l.ShardID)
+			// Generation check: only clear the slot if it still holds *this*
+			// poller. A later Acquire+startPoller cycle for the same shard
+			// installs its own activePoller; we must not delete that one.
+			if c.active[l.ShardID] == ap {
+				delete(c.active, l.ShardID)
+			}
 			c.mu.Unlock()
 		}()
 		p.run(pollerCtx)
@@ -269,13 +275,4 @@ func parentsDrained(l lease.Lease, checkpoints map[string]string) bool {
 		}
 	}
 	return true
-}
-
-func leaseExists(leases []lease.Lease, shardID string) bool {
-	for _, l := range leases {
-		if l.ShardID == shardID {
-			return true
-		}
-	}
-	return false
 }
