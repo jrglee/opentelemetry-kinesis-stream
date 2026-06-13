@@ -50,14 +50,18 @@ writes live in `lease.Store`.
 - **Checkpoint after delivery.** The checkpoint advances only after downstream
   acceptance, so a crash re-reads rather than loses — KCL's at-least-once
   contract.
-- **Lease cleanup.** A lease for a shard that has aged out of the stream (no
-  longer returned by `ListShards`, i.e. trimmed past retention) is conditionally
-  deleted so the table does not accumulate dead `SHARD_END` parent rows across a
-  stream's resharding history. The liveness key is essential: Kinesis lists
-  *closed* parent shards until they are trimmed, so deleting a still-listed lease
-  would re-`Ensure` and re-read it. This is KCL's `LeaseCleanupManager` role; we
-  do NOT use a DynamoDB TTL, which is time-based and could delete an active
-  lease.
+- **Lease cleanup.** Dead lease rows for trimmed shards are reaped so the table
+  does not accumulate `SHARD_END` parent rows across a stream's resharding
+  history. Safety is layered, because `ListShards` is eventually consistent and
+  a transient omission of a live shard must never destroy a checkpoint: only a
+  lease already at `SHARD_END` is reapable (a row with a real sequence-number
+  checkpoint is an *active* shard and is never deleted), and only after the
+  shard is absent from `ListShards` for several consecutive discovery passes.
+  The conditional delete fences on the lease counter. We do NOT use a DynamoDB
+  TTL — it is time-based and could delete an active lease. This is a simplified
+  form of KCL's `LeaseCleanupManager` (KCL reaps after child leases enter
+  PROCESSING; we reap on sustained trim, which is safe for the same reason —
+  a still-needed shard is never gone from `ListShards`).
 - **Graceful handoff.** A planned release (rebalance shed) or shutdown drains:
   finish the in-flight batch, checkpoint, then release. The next owner resumes
   cleanly. This is KCL's `shutdownRequested` (vs `leaseLost`) cooperative path.
@@ -70,8 +74,14 @@ KCL-compatible columns we write: `leaseKey` (shard id, HASH), `leaseOwner`,
 `leaseCounter`, `checkpoint` (sequence number or `TRIM_HORIZON` / `SHARD_END`),
 `parentShardId` (comma-joined). KCL's other columns
 (`checkpointSubSequenceNumber`, `ownerSwitchesSinceCheckpoint`, `childShardIds`,
-`startingHashKey`/`endingHashKey`, multi-stream `streamName`/`shardID`) are left
-to KCL's defaults — a KCL consumer can still read and write the table.
+`startingHashKey`/`endingHashKey`, multi-stream `streamName`/`shardID`) are not
+written.
+
+The table is **KCL-schema-shaped**, not certified for live bidirectional
+interop: a KCL consumer reading our rows would default the missing columns, but
+we have not validated that a stock KCL version resumes cleanly from a checkpoint
+row lacking `checkpointSubSequenceNumber`. Treat KCL interop as a migration aim,
+not a tested guarantee, until exercised against a real KCL consumer.
 
 ## Feature coverage vs KCL 2.x/3.x
 

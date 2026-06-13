@@ -84,6 +84,7 @@ func TestReshardParentDrainsBeforeChild(t *testing.T) {
 		workerID: "w1",
 		active:   make(map[string]*activePoller),
 		observed: make(map[string]observation),
+		absent:   make(map[string]int),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
