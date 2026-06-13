@@ -85,6 +85,7 @@ func TestCleanupOrphans(t *testing.T) {
 		c := &coordinator{
 			store:      store,
 			logger:     zaptest.NewLogger(t),
+			tel:        testTelemetry(t),
 			cfg:        &Config{LeaseDuration: time.Second},
 			active:     map[string]*activePoller{},
 			observed:   map[string]observation{},

@@ -38,6 +38,28 @@ restart-durable deployment. Timing is controlled by `poll_interval`,
 `heartbeat_interval` (must be less than `lease_duration`), and
 `discovery_interval`.
 
+## Observability
+
+The receiver holds no logging or metrics configuration of its own; it logs
+through the Collector-provided logger and emits instruments through the
+Collector-provided `MeterProvider`. Verbosity, encoding, and routing are
+controlled by the Collector's `service::telemetry` config, and the instruments
+are exported wherever that config sends them (`level: none` disables them).
+
+Instruments (scope `awskinesisreceiver`):
+
+- `kinesis.receiver.poll.records` (histogram) — records per `GetRecords` call.
+- `kinesis.receiver.poll.bytes` (histogram) — aggregate record bytes per call.
+- `kinesis.receiver.poll.duration_ms` (histogram) — `GetRecords` latency.
+- `kinesis.receiver.lease.events` (counter, `event` =
+  `acquire`/`release`/`steal`/`checkpoint`/`heartbeat_lost`, `result` =
+  `success`/`conflict`) — shard-lease lifecycle.
+- `kinesis.receiver.shards.owned` (up-down counter) — shards this replica is
+  actively polling.
+
+Set the Collector log level to `debug` to log poll cycles, checkpoint advances,
+lease acquisition, and reconcile decisions.
+
 **Status:** working proof of concept for traces, with leaderless fair-share
 rebalancing across replicas. Resharding (parent-drains-before-child) is gated
 in the acquisition path but not yet verified against a live shard split.

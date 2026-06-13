@@ -13,7 +13,6 @@ import (
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
-	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
@@ -31,9 +30,7 @@ type kinesisExporter struct {
 	metricsEnc encoding.MetricsEncoder
 	comp       encoding.Compressor
 	logger     *zap.Logger
-	// recordsDropped counts items dropped during oversize repack, tagged by
-	// reason, so silent data loss is observable.
-	recordsDropped metric.Int64Counter
+	tel        *exporterTelemetry
 }
 
 func newExporter(ctx context.Context, cfg *Config, set exporter.Settings) (*kinesisExporter, error) {
@@ -53,22 +50,18 @@ func newExporter(ctx context.Context, cfg *Config, set exporter.Settings) (*kine
 	if err != nil {
 		return nil, fmt.Errorf("kinesis client: %w", err)
 	}
-	meter := set.MeterProvider.Meter("awskinesisexporter")
-	dropped, err := meter.Int64Counter(
-		"kinesis.exporter.records_dropped",
-		metric.WithDescription("items dropped because no oversize repack could fit them"),
-	)
+	tel, err := newExporterTelemetry(set.MeterProvider)
 	if err != nil {
-		return nil, fmt.Errorf("dropped counter: %w", err)
+		return nil, fmt.Errorf("telemetry: %w", err)
 	}
 	return &kinesisExporter{
-		cfg:            cfg,
-		client:         client,
-		tracesEnc:      tEnc,
-		metricsEnc:     mEnc,
-		comp:           comp,
-		logger:         set.Logger,
-		recordsDropped: dropped,
+		cfg:        cfg,
+		client:     client,
+		tracesEnc:  tEnc,
+		metricsEnc: mEnc,
+		comp:       comp,
+		logger:     set.Logger,
+		tel:        tel,
 	}, nil
 }
 

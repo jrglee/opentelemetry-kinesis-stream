@@ -31,6 +31,7 @@ type coordinator struct {
 	comp     encoding.Compressor
 	sink     sink
 	logger   *zap.Logger
+	tel      *receiverTelemetry
 	workerID string
 
 	// baseCtx is the lifetime of the pollers; it outlives the discovery loop so
@@ -227,8 +228,17 @@ func (c *coordinator) reconcile(ctx context.Context) {
 	}
 	if plan.Steal != "" {
 		c.logger.Info("stealing shard to rebalance", zap.String("shard", plan.Steal))
+		c.tel.recordLeaseEvent(ctx, leaseSteal, resultSuccess)
 		c.tryAcquire(ctx, byID[plan.Steal])
 	}
+
+	c.logger.Debug(
+		"reconcile pass",
+		zap.Int("owned", len(owned)),
+		zap.Int("acquire", len(plan.Acquire)),
+		zap.Int("release", len(plan.Release)),
+		zap.Bool("steal", plan.Steal != ""),
+	)
 
 	c.cleanupOrphans(ctx, leases)
 }
@@ -318,11 +328,15 @@ func (c *coordinator) tryAcquire(ctx context.Context, l lease.Lease) {
 	}
 	taken, err := c.store.Acquire(ctx, l.ShardID, c.workerID, l.Counter)
 	if err != nil {
-		if !errors.Is(err, lease.ErrLeaseConflict) {
+		if errors.Is(err, lease.ErrLeaseConflict) {
+			c.tel.recordLeaseEvent(ctx, leaseAcquire, resultConflict)
+		} else {
 			c.logger.Warn("acquire failed", zap.String("shard", l.ShardID), zap.Error(err))
 		}
 		return
 	}
+	c.tel.recordLeaseEvent(ctx, leaseAcquire, resultSuccess)
+	c.logger.Debug("lease acquired", zap.String("shard", taken.ShardID), zap.Int64("counter", taken.Counter))
 	c.startPoller(ctx, taken)
 }
 
@@ -339,6 +353,7 @@ func (c *coordinator) releasePoller(shardID string) {
 		return
 	}
 	c.logger.Info("releasing shard to rebalance", zap.String("shard", shardID))
+	c.tel.recordLeaseEvent(c.baseCtx, leaseRelease, resultSuccess)
 	ap.drain()
 }
 
@@ -369,6 +384,7 @@ func (c *coordinator) startPoller(_ context.Context, l lease.Lease) {
 		comp:    c.comp,
 		sink:    c.sink,
 		logger:  c.logger,
+		tel:     c.tel,
 		leased:  l,
 		drainCh: make(chan struct{}),
 	}
@@ -377,6 +393,7 @@ func (c *coordinator) startPoller(_ context.Context, l lease.Lease) {
 	c.mu.Lock()
 	c.active[l.ShardID] = ap
 	c.mu.Unlock()
+	c.tel.addOwnedShards(c.baseCtx, 1)
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
@@ -385,10 +402,14 @@ func (c *coordinator) startPoller(_ context.Context, l lease.Lease) {
 			// Generation check: only clear the slot if it still holds *this*
 			// poller. A later Acquire+startPoller cycle for the same shard
 			// installs its own activePoller; we must not delete that one.
-			if c.active[l.ShardID] == ap {
+			cleared := c.active[l.ShardID] == ap
+			if cleared {
 				delete(c.active, l.ShardID)
 			}
 			c.mu.Unlock()
+			if cleared {
+				c.tel.addOwnedShards(c.baseCtx, -1)
+			}
 		}()
 		p.run(pollerCtx)
 	}()

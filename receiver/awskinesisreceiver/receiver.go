@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/receiver"
 	"go.uber.org/zap"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
@@ -24,25 +25,34 @@ type kinesisReceiver struct {
 	cfg    *Config
 	sink   sink
 	logger *zap.Logger
+	tel    *receiverTelemetry
 
 	coord  *coordinator
 	cancel context.CancelFunc
 }
 
-func newTracesReceiver(cfg *Config, next consumer.Traces, logger *zap.Logger) (*kinesisReceiver, error) {
+func newTracesReceiver(cfg *Config, next consumer.Traces, set receiver.Settings) (*kinesisReceiver, error) {
 	dec, err := encoding.NewTracesDecoder(cfg.Encoding)
 	if err != nil {
 		return nil, fmt.Errorf("decoder: %w", err)
 	}
-	return &kinesisReceiver{cfg: cfg, sink: tracesSink{decoder: dec, consumer: next}, logger: logger}, nil
+	tel, err := newReceiverTelemetry(set.MeterProvider)
+	if err != nil {
+		return nil, fmt.Errorf("telemetry: %w", err)
+	}
+	return &kinesisReceiver{cfg: cfg, sink: tracesSink{decoder: dec, consumer: next}, logger: set.Logger, tel: tel}, nil
 }
 
-func newMetricsReceiver(cfg *Config, next consumer.Metrics, logger *zap.Logger) (*kinesisReceiver, error) {
+func newMetricsReceiver(cfg *Config, next consumer.Metrics, set receiver.Settings) (*kinesisReceiver, error) {
 	dec, err := encoding.NewMetricsDecoder(cfg.Encoding)
 	if err != nil {
 		return nil, fmt.Errorf("decoder: %w", err)
 	}
-	return &kinesisReceiver{cfg: cfg, sink: metricsSink{decoder: dec, consumer: next}, logger: logger}, nil
+	tel, err := newReceiverTelemetry(set.MeterProvider)
+	if err != nil {
+		return nil, fmt.Errorf("telemetry: %w", err)
+	}
+	return &kinesisReceiver{cfg: cfg, sink: metricsSink{decoder: dec, consumer: next}, logger: set.Logger, tel: tel}, nil
 }
 
 func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
@@ -77,6 +87,7 @@ func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
 		comp:     comp,
 		sink:     r.sink,
 		logger:   r.logger,
+		tel:      r.tel,
 		workerID: workerID,
 		active:   make(map[string]*activePoller),
 		observed: make(map[string]observation),

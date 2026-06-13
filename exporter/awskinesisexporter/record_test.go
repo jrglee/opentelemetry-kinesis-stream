@@ -222,7 +222,7 @@ func TestOversizeSplitPreservesSpans(t *testing.T) {
 func TestOversizeSingleSpanDroppedCountsMetric(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	dropped, err := mp.Meter("awskinesisexporter").Int64Counter("kinesis.exporter.records_dropped")
+	tel, err := newExporterTelemetry(mp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestOversizeSingleSpanDroppedCountsMetric(t *testing.T) {
 	}
 	capt := &capture{}
 	exp := newTestExporterCfg(t, cfg, capt.injectSerialize())
-	exp.recordsDropped = dropped
+	exp.tel = tel
 
 	if err := exp.ConsumeTraces(context.Background(), sampleTraces()); err != nil {
 		t.Fatalf("consume: %v", err)

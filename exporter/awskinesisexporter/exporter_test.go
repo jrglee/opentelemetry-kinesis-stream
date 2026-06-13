@@ -84,18 +84,18 @@ func newTestExporterCfg(t *testing.T, cfg *Config, inject func(*kinesis.Options)
 		Region:      cfg.Region,
 		Credentials: aws.AnonymousCredentials{},
 	}, inject)
-	dropped, err := noopmetric.NewMeterProvider().Meter("test").Int64Counter("dropped")
+	tel, err := newExporterTelemetry(noopmetric.NewMeterProvider())
 	if err != nil {
-		t.Fatalf("counter: %v", err)
+		t.Fatalf("telemetry: %v", err)
 	}
 	return &kinesisExporter{
-		cfg:            cfg,
-		client:         client,
-		tracesEnc:      tEnc,
-		metricsEnc:     mEnc,
-		comp:           comp,
-		logger:         zap.NewNop(),
-		recordsDropped: dropped,
+		cfg:        cfg,
+		client:     client,
+		tracesEnc:  tEnc,
+		metricsEnc: mEnc,
+		comp:       comp,
+		logger:     zap.NewNop(),
+		tel:        tel,
 	}
 }
 

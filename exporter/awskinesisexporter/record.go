@@ -3,14 +3,13 @@ package awskinesisexporter
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 	"github.com/cespare/xxhash/v2"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 )
 
@@ -53,12 +52,18 @@ func emit[T any](ctx context.Context, e *kinesisExporter, b T, sc signalCodec[T]
 	}
 	groups := sc.groupByTags(b, tags)
 
+	strategy := partitionStrategyRandom
+	if e.cfg.tagHash() {
+		strategy = partitionStrategyTagHash
+	}
+	e.logger.Debug("emit", zap.Int("groups", len(groups)), zap.String("strategy", strategy))
+
 	entries := make([]types.PutRecordsRequestEntry, 0, len(groups))
 	for _, g := range groups {
 		key := e.partitionKey(g.key)
 		payloads, dropped := pack(g.batch, sc, e.cfg, e.comp, 0)
 		if dropped > 0 {
-			e.recordsDropped.Add(ctx, int64(dropped), metric.WithAttributes(attribute.String("reason", "oversize")))
+			e.tel.recordDrop(ctx, dropped, "oversize")
 			e.logger.Warn("dropped oversize items during repack", zap.Int("dropped", dropped))
 		}
 		for _, p := range payloads {
@@ -156,13 +161,26 @@ func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRec
 	if len(records) == 0 {
 		return nil
 	}
+	bytes := 0
+	for i := range records {
+		bytes += len(records[i].Data)
+	}
+	start := time.Now()
 	out, err := e.client.PutRecords(ctx, &kinesis.PutRecordsInput{
 		StreamName: aws.String(e.cfg.StreamName),
 		Records:    records,
 	})
+	durationMs := float64(time.Since(start).Microseconds()) / 1000
+	e.tel.recordPut(ctx, len(records), bytes, durationMs)
 	if err != nil {
 		return classifyPutRecordsError(err)
 	}
+	e.logger.Debug(
+		"put_records",
+		zap.Int("records", len(records)),
+		zap.Int("bytes", bytes),
+		zap.Float64("duration_ms", durationMs),
+	)
 	if out.FailedRecordCount != nil && *out.FailedRecordCount > 0 {
 		var throttled, rejected int
 		for i, r := range out.Records {
@@ -185,7 +203,7 @@ func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRec
 		// error) will fail identically on every retry. Drop and count those so
 		// they cannot head-of-line-block the pipeline with an infinite retry.
 		if rejected > 0 {
-			e.recordsDropped.Add(ctx, int64(rejected), metric.WithAttributes(attribute.String("reason", "rejected")))
+			e.tel.recordDrop(ctx, rejected, "rejected")
 		}
 		// Retry only if some failures were throttling — those succeed once the
 		// shard has capacity. Returning an error re-sends the whole batch (the
