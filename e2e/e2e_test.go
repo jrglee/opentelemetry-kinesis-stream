@@ -43,17 +43,23 @@ func TestRoundTripMultiReplica(t *testing.T) {
 		}
 	})
 
-	if out, err := compose(t, env, 5*time.Minute, "up", "-d", "--build"); err != nil {
+	// Build the shared image once. All three collector services reference the
+	// same otelcol-kinesis:dev tag; letting `up --build` build them in parallel
+	// races three writers onto one tag (AlreadyExists under the classic
+	// builder). Build a single service, then start without --build.
+	if out, err := compose(t, env, 5*time.Minute, "build", "producer"); err != nil {
+		t.Fatalf("compose build: %v\n%s", err, out)
+	}
+	if out, err := compose(t, env, 3*time.Minute, "up", "-d"); err != nil {
 		t.Fatalf("compose up: %v\n%s", err, out)
 	}
 
-	// Wait until every shard has an owner before emitting, so no span is lost
-	// to a window where nobody is reading a shard. Ownership may land entirely
-	// on one replica — the lease coordinator does not rebalance healthy leases
-	// (DESIGN.md §6) — which is fine: the safety property below holds either
-	// way, and both consumers staying subscribed is exactly what makes the
-	// no-duplicate assertion meaningful.
-	waitForOwnership(t)
+	// Wait until shard ownership has rebalanced to a stable even split across
+	// the two replicas before emitting. This both proves the leaderless
+	// fair-share rebalancing converges and ensures no steal happens during
+	// delivery — stealing is at-least-once around the handoff, so measuring
+	// exactly-once delivery requires a settled assignment first.
+	waitForBalancedOwnership(t)
 
 	// telemetrygen connects to the producer's OTLP listener; wait for it to
 	// accept connections so a fast --rate=0 burst is not dropped before the
@@ -87,12 +93,14 @@ func TestRoundTripMultiReplica(t *testing.T) {
 	if raw != unique {
 		t.Fatalf("raw span occurrences = %d but unique = %d: a shard was delivered to more than one replica", raw, unique)
 	}
-	bothContributed := perFile["a"] > 0 && perFile["b"] > 0
-	t.Logf("round-trip OK: %d spans delivered exactly once (consumer-a=%d, consumer-b=%d, split=%v)",
-		unique, perFile["a"], perFile["b"], bothContributed)
-	if !bothContributed {
-		t.Logf("note: ownership did not split across replicas this run — expected, the coordinator does not rebalance healthy leases")
+	// With rebalancing the shards split across replicas, so both consumers must
+	// have delivered some spans — this confirms the round trip end-to-end on a
+	// genuinely distributed assignment, not just a single active reader.
+	if perFile["a"] == 0 || perFile["b"] == 0 {
+		t.Fatalf("expected both consumers to deliver spans after rebalancing, got a=%d b=%d", perFile["a"], perFile["b"])
 	}
+	t.Logf("round-trip OK: %d spans delivered exactly once across a balanced split (consumer-a=%d, consumer-b=%d)",
+		unique, perFile["a"], perFile["b"])
 }
 
 // settleAndRead reads the consumer output repeatedly over a short window after
@@ -166,7 +174,10 @@ func collectFromFile(t *testing.T, path string, ids map[[24]byte]struct{}) int {
 		}
 		td, err := unmarshaler.UnmarshalTraces([]byte(line))
 		if err != nil {
-			t.Fatalf("unmarshal line in %s: %v", path, err)
+			// `docker compose cp` can snapshot the file mid-write, truncating
+			// the final line. The caller re-polls until the count stabilizes,
+			// so a partial line is complete on a later read — skip, don't fail.
+			continue
 		}
 		count += addSpanIDs(td, ids)
 	}

@@ -4,11 +4,15 @@ package e2e
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,24 +79,67 @@ func compose(t *testing.T, env []string, timeout time.Duration, args ...string) 
 	return string(out), err
 }
 
-// waitForOwnership polls the DynamoDB lease table (via MiniStack on
-// localhost:4566) until every shard lease has a non-empty owner, so emission
-// does not race a window where a shard has no reader. Ownership may land on a
-// single replica — the coordinator does not rebalance healthy leases — which
-// is acceptable; the no-duplicate assertion in the test holds either way.
-func waitForOwnership(t *testing.T) {
+// waitForBalancedOwnership polls the DynamoDB lease table (via MiniStack on
+// localhost:4566) until shard ownership has rebalanced to an even split across
+// distinct workers and that assignment is stable across consecutive reads.
+// "Even" means every shard is owned and the busiest and idlest worker differ
+// by at most one shard. Stability (two consecutive identical snapshots) ensures
+// rebalancing has converged so no steal happens during the subsequent emission.
+func waitForBalancedOwnership(t *testing.T) {
 	t.Helper()
 	client := dynamoClient(t)
 	deadline := time.Now().Add(settleDeadline)
+	stable := 0
+	last := ""
 	for time.Now().Before(deadline) {
 		owners, owned, total := scanOwners(t, client)
-		if total >= 2 && owned >= total {
-			t.Logf("all %d shards owned (distinct workers=%v)", total, keys(owners))
-			return
+		if total >= 2 && owned >= total && len(owners) >= 2 && balanced(owners) {
+			sig := ownersSignature(owners)
+			if sig == last {
+				stable++
+				if stable >= 2 {
+					t.Logf("balanced ownership converged: %s", sig)
+					return
+				}
+			} else {
+				stable, last = 0, sig
+			}
+		} else {
+			stable, last = 0, ""
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(3 * time.Second)
 	}
-	t.Fatal("timed out waiting for all shards to be owned")
+	t.Fatal("timed out waiting for balanced shard ownership across replicas")
+}
+
+// balanced reports whether the busiest and idlest owner differ by at most one
+// shard (an even-as-possible fair-share split).
+func balanced(owners map[string]int) bool {
+	if len(owners) == 0 {
+		return false
+	}
+	minN, maxN := math.MaxInt, 0
+	for _, n := range owners {
+		if n < minN {
+			minN = n
+		}
+		if n > maxN {
+			maxN = n
+		}
+	}
+	return maxN-minN <= 1
+}
+
+// ownersSignature is a stable string of the owner->count map for comparing
+// snapshots across polls.
+func ownersSignature(owners map[string]int) string {
+	ks := keys(owners)
+	sort.Strings(ks)
+	var b strings.Builder
+	for _, k := range ks {
+		fmt.Fprintf(&b, "%s=%d;", k, owners[k])
+	}
+	return b.String()
 }
 
 // waitForProducer blocks until the producer's OTLP gRPC port (published to the

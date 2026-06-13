@@ -134,9 +134,10 @@ func (c *coordinator) listShards(ctx context.Context) ([]types.Shard, error) {
 	}
 }
 
-// reconcile is the lease-acquisition pass. It snapshots known leases,
-// classifies each, and attempts to take ownership of stealable ones whose
-// parents are drained.
+// reconcile is the fair-share rebalancing pass. It snapshots the lease table,
+// computes this worker's target share via planRebalance, and executes the
+// resulting acquire / release / steal actions. Every replica runs the same
+// computation against the same snapshot, so they converge without a leader.
 func (c *coordinator) reconcile(ctx context.Context) {
 	leases, err := c.store.List(ctx)
 	if err != nil {
@@ -144,57 +145,81 @@ func (c *coordinator) reconcile(ctx context.Context) {
 		return
 	}
 	now := time.Now()
-	parentCheckpoints := indexCheckpoints(leases)
+	checkpoints := indexCheckpoints(leases)
 
 	c.mu.Lock()
 	c.refreshObservations(leases, now)
+	fresh := make(map[string]bool, len(leases))
+	for _, l := range leases {
+		obs, ok := c.observed[l.ShardID]
+		fresh[l.ShardID] = l.Owner != "" && ok && now.Sub(obs.seenAt) < c.cfg.LeaseDuration
+	}
+	owned := make(map[string]bool, len(c.active))
+	for shardID := range c.active {
+		owned[shardID] = true
+	}
 	c.mu.Unlock()
 
+	drained := make(map[string]bool, len(leases))
+	byID := make(map[string]lease.Lease, len(leases))
 	for _, l := range leases {
-		if l.Checkpoint == lease.CheckpointShardEnd {
-			continue
-		}
-		if !parentsDrained(l, parentCheckpoints) {
-			continue
-		}
-		c.mu.Lock()
-		_, alreadyOwn := c.active[l.ShardID]
-		c.mu.Unlock()
-		if alreadyOwn {
-			continue
-		}
-		if !c.shouldAttempt(l, now) {
-			continue
-		}
-		taken, err := c.store.Acquire(ctx, l.ShardID, c.workerID, l.Counter)
-		if err != nil {
-			if !errors.Is(err, lease.ErrLeaseConflict) {
-				c.logger.Warn(
-					"acquire failed",
-					zap.String("shard", l.ShardID),
-					zap.Error(err),
-				)
-			}
-			continue
-		}
-		c.startPoller(ctx, taken)
+		drained[l.ShardID] = parentsDrained(l, checkpoints)
+		byID[l.ShardID] = l
+	}
+
+	plan := planRebalance(rebalanceInput{
+		leases:  leases,
+		self:    c.workerID,
+		fresh:   fresh,
+		drained: drained,
+		owned:   owned,
+	})
+
+	for _, shardID := range plan.release {
+		c.releasePoller(shardID)
+	}
+	for _, shardID := range plan.acquire {
+		c.tryAcquire(ctx, byID[shardID])
+	}
+	if plan.steal != "" {
+		c.logger.Info("stealing shard to rebalance", zap.String("shard", plan.steal))
+		c.tryAcquire(ctx, byID[plan.steal])
 	}
 }
 
-// shouldAttempt decides whether to try Acquire on a given lease. Unowned
-// leases are always fair game. Owned leases are stealable only if they
-// haven't been heartbeated for at least LeaseDuration.
-func (c *coordinator) shouldAttempt(l lease.Lease, now time.Time) bool {
-	if l.Owner == "" || l.Owner == c.workerID {
-		return true
-	}
+// tryAcquire claims a lease for this worker, conditional on the counter we
+// observed, and starts a poller on success. A conflict means another worker
+// won the race or the owner heartbeated since the snapshot; it is retried next
+// pass and not logged as an error.
+func (c *coordinator) tryAcquire(ctx context.Context, l lease.Lease) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	obs, ok := c.observed[l.ShardID]
-	if !ok {
-		return false
+	_, own := c.active[l.ShardID]
+	c.mu.Unlock()
+	if own {
+		return
 	}
-	return obs.counter == l.Counter && now.Sub(obs.seenAt) >= c.cfg.LeaseDuration
+	taken, err := c.store.Acquire(ctx, l.ShardID, c.workerID, l.Counter)
+	if err != nil {
+		if !errors.Is(err, lease.ErrLeaseConflict) {
+			c.logger.Warn("acquire failed", zap.String("shard", l.ShardID), zap.Error(err))
+		}
+		return
+	}
+	c.startPoller(ctx, taken)
+}
+
+// releasePoller cancels the poller for a shard this worker is giving up. The
+// poller's deferred Release frees the lease row so an under-target peer can
+// take it.
+func (c *coordinator) releasePoller(shardID string) {
+	c.mu.Lock()
+	ap, ok := c.active[shardID]
+	c.mu.Unlock()
+	if !ok {
+		return
+	}
+	c.logger.Info("releasing shard to rebalance", zap.String("shard", shardID))
+	ap.cancel()
 }
 
 // refreshObservations resets the "last seen" timestamp on counters that

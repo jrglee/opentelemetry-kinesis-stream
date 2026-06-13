@@ -11,11 +11,15 @@ downstream acceptance.
 
 ## Ownership and failure handling
 
-- Each replica heartbeats its leases; a lease whose heartbeat lapses for
-  `lease_duration` may be claimed by another replica. There is no preemptive
-  rebalancing — a healthy owner keeps its shards, so one replica can hold more
-  than its even share. Acquisition is fenced by a per-lease counter, so two
-  replicas never make progress on the same shard concurrently.
+- Each replica heartbeats its leases and, on every reconcile pass, computes its
+  fair share (`ceil(activeShards / activeWorkers)`) from the lease-table
+  snapshot. A replica over its share releases surplus shards; a replica under
+  its share acquires unowned or stale shards, and failing that steals one shard
+  per pass from the most-overloaded peer. This converges to an even split as
+  replicas join and leave, with no leader. Acquisition and stealing are fenced
+  by a per-lease counter, so two replicas never make progress on the same shard
+  concurrently. Stealing a healthy lease is graceful but at-least-once around
+  the handoff (the new owner resumes from the last checkpoint).
 - The checkpoint advances only over records that were delivered downstream or
   are permanently unprocessable (a decode/decompress failure, or a downstream
   rejection marked permanent). A record the downstream **transiently** rejects
@@ -34,6 +38,6 @@ restart-durable deployment. Timing is controlled by `poll_interval`,
 `heartbeat_interval` (must be less than `lease_duration`), and
 `discovery_interval`.
 
-**Status:** working proof of concept for traces over a single, non-resharding
-stream. Resharding (parent-drains-before-child) and capacity rebalancing are
-not implemented yet.
+**Status:** working proof of concept for traces, with leaderless fair-share
+rebalancing across replicas. Resharding (parent-drains-before-child) is gated
+in the acquisition path but not yet verified against a live shard split.

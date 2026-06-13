@@ -1,6 +1,7 @@
 # 0006. Shard lease coordination via a KCL-shaped lease store
 
-- **Status:** Accepted
+- **Status:** Accepted (rebalancing stance superseded by
+  [0008](0008-leaderless-fair-share-rebalancing.md))
 - **Date:** 2026-06-13
 
 ## Context

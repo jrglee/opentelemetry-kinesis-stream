@@ -7,9 +7,15 @@ receivers:
 
 processors:
   batch:
-    # Small batch so the E2E doesn't wait long for the timeout trigger.
-    timeout: 1s
-    send_batch_size: 50
+    # Force one span per exported batch -> one Kinesis record per span -> one
+    # random partition key per span. send_batch_max_size is the lever that
+    # actually splits a large incoming batch; send_batch_size alone only sets
+    # the flush trigger and would emit all spans as a single record. Many keys
+    # spread spans evenly across shards so the E2E reliably exercises both
+    # shards (and both consumer replicas).
+    timeout: 200ms
+    send_batch_size: 1
+    send_batch_max_size: 1
 
 exporters:
   awskinesis:
