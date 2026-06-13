@@ -20,6 +20,7 @@ implementing it.
 - [0006 — Shard lease coordination via a KCL-shaped lease store](0006-shard-lease-coordination.md)
 - [0007 — Hand-written collector binary and docker-compose E2E stack](0007-custom-collector-binary-and-e2e-stack.md)
 - [0008 — Leaderless fair-share shard rebalancing](0008-leaderless-fair-share-rebalancing.md)
+- [0009 — Graceful lease handoff and shutdown drain](0009-graceful-lease-handoff-and-shutdown.md)
 
 ## How to add an ADR
 

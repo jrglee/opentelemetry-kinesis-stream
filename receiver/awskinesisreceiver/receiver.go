@@ -88,18 +88,22 @@ func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
 	return nil
 }
 
-// Shutdown cancels the coordinator and waits for in-flight pollers to finish.
-// The collector-provided ctx may carry a deadline; if it fires before
-// pollers drain, we return its error rather than blocking the host. Pollers
-// internally bound their own Release calls with a small timeout so a hung
-// store call cannot push us past the deadline either.
+// Shutdown drains the receiver gracefully: it stops shard discovery and asks
+// every poller to finish its in-flight batch, persist a final checkpoint, and
+// release its lease. A clean drain means a redeployed or rebalanced consumer
+// resumes from a current checkpoint without re-delivering records. If the
+// collector-provided deadline fires before draining completes, in-flight
+// pollers are hard-cancelled (their Release calls are independently bounded)
+// and the deadline error is returned.
 func (r *kinesisReceiver) Shutdown(ctx context.Context) error {
-	if r.cancel != nil {
-		r.cancel()
-	}
 	if r.coord == nil {
+		if r.cancel != nil {
+			r.cancel()
+		}
 		return nil
 	}
+
+	r.coord.drainAndStop()
 	done := make(chan struct{})
 	go func() {
 		r.coord.wait()
@@ -107,9 +111,12 @@ func (r *kinesisReceiver) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		r.cancel()
 		return nil
 	case <-ctx.Done():
-		r.logger.Warn("shutdown deadline expired with pollers still running", zap.Error(ctx.Err()))
+		r.logger.Warn("shutdown deadline expired; hard-cancelling pollers", zap.Error(ctx.Err()))
+		r.cancel()
+		<-done
 		return ctx.Err()
 	}
 }

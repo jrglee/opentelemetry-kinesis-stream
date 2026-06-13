@@ -35,6 +35,12 @@ type coordinator struct {
 	logger   *zap.Logger
 	workerID string
 
+	// baseCtx is the lifetime of the pollers; it outlives the discovery loop so
+	// that stopping discovery (graceful shutdown) does not hard-cancel pollers
+	// mid-batch. stopDiscovery cancels only the discovery/reconcile loop.
+	baseCtx       context.Context
+	stopDiscovery context.CancelFunc
+
 	mu       sync.Mutex
 	active   map[string]*activePoller
 	observed map[string]observation
@@ -46,9 +52,11 @@ type coordinator struct {
 // The pointer identity also acts as a generation token: the poller's exit
 // defer only deletes the c.active entry when the current entry is still its
 // own activePoller, so a later Acquire+startPoller cycle for the same shard
-// is not clobbered by a delayed defer from a prior generation.
+// is not clobbered by a delayed defer from a prior generation. cancel aborts
+// the poller; drain asks it to stop gracefully after a final checkpoint.
 type activePoller struct {
 	cancel context.CancelFunc
+	drain  func()
 }
 
 type observation struct {
@@ -57,12 +65,35 @@ type observation struct {
 }
 
 func (c *coordinator) start(ctx context.Context) error {
+	c.baseCtx = ctx
 	if err := c.discoverShards(ctx); err != nil {
 		return err
 	}
+	discCtx, cancel := context.WithCancel(ctx)
+	c.stopDiscovery = cancel
 	c.wg.Add(1)
-	go c.run(ctx)
+	go c.run(discCtx)
 	return nil
+}
+
+// drainAndStop is the graceful-shutdown entry point. It stops the discovery
+// loop so no new pollers start, then asks every active poller to drain
+// (finish its in-flight batch, checkpoint, release). Pollers run on baseCtx,
+// which is NOT cancelled here, so they get to finish cleanly. The caller waits
+// on wait() and hard-cancels baseCtx only if a deadline forces it.
+func (c *coordinator) drainAndStop() {
+	if c.stopDiscovery != nil {
+		c.stopDiscovery()
+	}
+	c.mu.Lock()
+	pollers := make([]*activePoller, 0, len(c.active))
+	for _, ap := range c.active {
+		pollers = append(pollers, ap)
+	}
+	c.mu.Unlock()
+	for _, ap := range pollers {
+		ap.drain()
+	}
 }
 
 func (c *coordinator) run(ctx context.Context) {
@@ -208,9 +239,11 @@ func (c *coordinator) tryAcquire(ctx context.Context, l lease.Lease) {
 	c.startPoller(ctx, taken)
 }
 
-// releasePoller cancels the poller for a shard this worker is giving up. The
-// poller's deferred Release frees the lease row so an under-target peer can
-// take it.
+// releasePoller asks the poller for a shard this worker is giving up to drain
+// gracefully: finish its in-flight batch, persist a final checkpoint, then
+// Release the lease. Draining (not cancelling) means the peer that acquires
+// the freed lease resumes from a current checkpoint with no re-delivered
+// records — the handoff is effectively exactly-once.
 func (c *coordinator) releasePoller(shardID string) {
 	c.mu.Lock()
 	ap, ok := c.active[shardID]
@@ -219,7 +252,7 @@ func (c *coordinator) releasePoller(shardID string) {
 		return
 	}
 	c.logger.Info("releasing shard to rebalance", zap.String("shard", shardID))
-	ap.cancel()
+	ap.drain()
 }
 
 // refreshObservations resets the "last seen" timestamp on counters that
@@ -238,14 +271,10 @@ func (c *coordinator) refreshObservations(leases []lease.Lease, now time.Time) {
 	}
 }
 
-func (c *coordinator) startPoller(ctx context.Context, l lease.Lease) {
-	pollerCtx, cancel := context.WithCancel(ctx)
-	ap := &activePoller{cancel: cancel}
-
-	c.mu.Lock()
-	c.active[l.ShardID] = ap
-	c.mu.Unlock()
-
+func (c *coordinator) startPoller(_ context.Context, l lease.Lease) {
+	// Pollers run on baseCtx, not the discovery context, so a graceful shutdown
+	// can stop discovery and let pollers drain rather than aborting them.
+	pollerCtx, cancel := context.WithCancel(c.baseCtx)
 	p := &shardPoller{
 		cfg:      c.cfg,
 		client:   c.client,
@@ -255,7 +284,13 @@ func (c *coordinator) startPoller(ctx context.Context, l lease.Lease) {
 		consumer: c.consumer,
 		logger:   c.logger,
 		leased:   l,
+		drainCh:  make(chan struct{}),
 	}
+	ap := &activePoller{cancel: cancel, drain: p.drain}
+
+	c.mu.Lock()
+	c.active[l.ShardID] = ap
+	c.mu.Unlock()
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()

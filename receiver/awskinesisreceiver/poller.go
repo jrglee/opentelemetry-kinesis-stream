@@ -39,6 +39,19 @@ type shardPoller struct {
 
 	leaseMu sync.Mutex
 	leased  lease.Lease
+
+	// drainCh is closed to request a graceful stop: finish the in-flight
+	// batch, persist its checkpoint, then release. Distinct from context
+	// cancellation, which aborts mid-batch. Graceful drain is what makes a
+	// planned handoff (rebalance or shutdown) avoid re-delivering an
+	// uncheckpointed batch to the next owner.
+	drainCh   chan struct{}
+	drainOnce sync.Once
+}
+
+// drain requests a graceful stop. Idempotent.
+func (p *shardPoller) drain() {
+	p.drainOnce.Do(func() { close(p.drainCh) })
 }
 
 // run is the poller's main entry point. The heartbeat lives on its own
@@ -98,6 +111,14 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 		if ctx.Err() != nil {
 			return
 		}
+		// Graceful drain: the last completed batch is already checkpointed, so
+		// exiting here (before the next GetRecords) hands off cleanly.
+		select {
+		case <-p.drainCh:
+			logger.Info("draining shard; releasing after final checkpoint")
+			return
+		default:
+		}
 		if iter == nil {
 			p.writeShardEnd(ctx, logger)
 			return
@@ -120,7 +141,7 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 				stop()
 				return
 			}
-			if waitOrDone(ctx, pollTick) {
+			if p.waitOrStop(ctx, pollTick) {
 				return
 			}
 			continue
@@ -159,7 +180,7 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 				stop()
 				return
 			}
-			if waitOrDone(ctx, pollTick) {
+			if p.waitOrStop(ctx, pollTick) {
 				return
 			}
 			continue
@@ -167,18 +188,21 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 		iter = out.NextShardIterator
 
 		if len(out.Records) == 0 {
-			if waitOrDone(ctx, pollTick) {
+			if p.waitOrStop(ctx, pollTick) {
 				return
 			}
 		}
 	}
 }
 
-// waitOrDone blocks until the poll ticker fires or the context is cancelled.
-// It returns true if the context was cancelled (the caller should return).
-func waitOrDone(ctx context.Context, tick *time.Ticker) bool {
+// waitOrStop blocks until the poll ticker fires, the context is cancelled, or
+// a graceful drain is requested. It returns true if the caller should stop
+// (cancel or drain) — in both cases the last batch is already checkpointed.
+func (p *shardPoller) waitOrStop(ctx context.Context, tick *time.Ticker) bool {
 	select {
 	case <-ctx.Done():
+		return true
+	case <-p.drainCh:
 		return true
 	case <-tick.C:
 		return false
