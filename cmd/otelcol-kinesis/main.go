@@ -7,6 +7,8 @@ import (
 	"log"
 
 	fileexporter "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/groupbyattrsprocessor"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/influxdbreceiver"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/confmap/provider/envprovider"
@@ -60,12 +62,14 @@ func components() (otelcol.Factories, error) {
 	if factories.Receivers, err = otelcol.MakeFactoryMap(
 		otlpreceiver.NewFactory(),
 		awskinesisreceiver.NewFactory(),
+		influxdbreceiver.NewFactory(),
 	); err != nil {
 		return factories, err
 	}
 
 	if factories.Processors, err = otelcol.MakeFactoryMap(
 		batchprocessor.NewFactory(),
+		groupbyattrsprocessor.NewFactory(),
 	); err != nil {
 		return factories, err
 	}

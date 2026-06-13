@@ -1,0 +1,85 @@
+# Metrics E2E stack: InfluxDB line protocol -> producer (influxdb ->
+# groupbyattrs -> Kinesis) -> MiniStack Kinesis -> consumer (Kinesis -> file).
+#
+# A separate stack from docker-compose.yaml so the traces E2E stays untouched.
+# It exercises tag-hash partition keys: groupbyattrs promotes the host/region
+# InfluxDB tags to resource attributes, and the exporter hashes that tuple into
+# a stable partition key, co-locating each tuple's datapoints.
+#
+# Consumer output lands on a named volume (not a host bind mount, which colima
+# does not surface back to the macOS host); the test harness pulls the file out
+# with `docker compose cp`.
+name: otel-kinesis-influx
+
+services:
+  ministack:
+    image: ministackorg/ministack:1.3.63
+    ports:
+      - "4566:4566"
+
+  stream-init-metrics:
+    image: amazon/aws-cli:2.31.13
+    entrypoint: ["/bin/sh", "/init/stream-init-metrics.sh"]
+    volumes:
+      - ./stream-init-metrics.sh:/init/stream-init-metrics.sh:ro
+    depends_on:
+      ministack:
+        condition: service_started
+
+  producer-metrics:
+    image: otelcol-kinesis:dev
+    build:
+      context: ..
+      dockerfile: cmd/otelcol-kinesis/Dockerfile
+    command: ["--config", "file:/etc/otelcol/config.yaml"]
+    ports:
+      - "8086:8086"
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./producer-metrics.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      stream-init-metrics:
+        condition: service_completed_successfully
+
+  consumer-metrics:
+    image: otelcol-kinesis:dev
+    build:
+      context: ..
+      dockerfile: cmd/otelcol-kinesis/Dockerfile
+    command: ["--config", "file:/etc/otelcol/config.yaml"]
+    environment:
+      REPLICA: a
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./consumer-metrics.yaml:/etc/otelcol/config.yaml:ro
+      - shared:/shared
+    depends_on:
+      stream-init-metrics:
+        condition: service_completed_successfully
+
+  # Not started with `up`; the test invokes it via `docker compose run` once the
+  # producer is confirmed ready, so emission timing is controlled.
+  linegen:
+    image: linegen:dev
+    build:
+      context: ..
+      dockerfile: cmd/linegen/Dockerfile
+    profiles: ["tools"]
+    environment:
+      INFLUX_ENDPOINT: http://producer-metrics:8086
+      TOTAL: "2000"
+      HOSTS: "8"
+      REGIONS: "3"
+      SERVICES: "4"
+      BATCH: "200"
+    depends_on:
+      producer-metrics:
+        condition: service_started
+
+volumes:
+  shared:

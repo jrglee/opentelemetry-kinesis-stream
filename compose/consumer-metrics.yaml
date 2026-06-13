@@ -1,0 +1,37 @@
+# Metrics consumer collector: Kinesis in, file out. Reads the otel-metrics
+# stream, coordinating shard ownership through its own DynamoDB lease table
+# (separate from the traces E2E). dead_letter re-emits unprocessable records
+# into the pipeline rather than dropping them silently.
+receivers:
+  awskinesis:
+    stream_name: otel-metrics
+    region: us-east-1
+    endpoint: http://ministack:4566
+    encoding: otlp_proto
+    compression: zstd
+    poll_interval: 250ms
+    max_records: 1000
+    lease_backend: dynamodb
+    lease_table: otel-leases-metrics
+    worker_id: ${env:REPLICA}
+    # Short timings so a takeover is observable within an E2E run.
+    lease_duration: 10s
+    heartbeat_interval: 2s
+    discovery_interval: 3s
+    dead_letter:
+      enabled: true
+
+exporters:
+  file:
+    path: /shared/metrics-out.jsonl
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    metrics:
+      receivers: [awskinesis]
+      exporters: [file, debug]
