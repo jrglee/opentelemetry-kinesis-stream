@@ -2,6 +2,7 @@ package awskinesisexporter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 
@@ -60,11 +62,12 @@ func (e *kinesisExporter) Capabilities() consumer.Capabilities {
 func (e *kinesisExporter) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
 	raw, err := e.encoder.Marshal(td)
 	if err != nil {
-		return fmt.Errorf("marshal traces: %w", err)
+		// Encoding failures are deterministic in the input; retrying is wasted work.
+		return consumererror.NewPermanent(fmt.Errorf("marshal traces: %w", err))
 	}
 	payload, err := e.comp.Compress(raw)
 	if err != nil {
-		return fmt.Errorf("compress payload: %w", err)
+		return consumererror.NewPermanent(fmt.Errorf("compress payload: %w", err))
 	}
 	if len(payload) > e.cfg.MaxRecordSize {
 		// PoC failure policy: log and continue. Repacking lands later.
@@ -84,7 +87,7 @@ func (e *kinesisExporter) ConsumeTraces(ctx context.Context, td ptrace.Traces) e
 		}},
 	})
 	if err != nil {
-		return fmt.Errorf("put_records: %w", err)
+		return classifyPutRecordsError(err)
 	}
 	if out.FailedRecordCount != nil && *out.FailedRecordCount > 0 {
 		// Per-record failures: log with codes and let Collector retry the
@@ -103,4 +106,19 @@ func (e *kinesisExporter) ConsumeTraces(ctx context.Context, td ptrace.Traces) e
 		return fmt.Errorf("put_records: %d records failed", *out.FailedRecordCount)
 	}
 	return nil
+}
+
+// classifyPutRecordsError marks errors the Collector's retry helper has no
+// reason to retry. Throttling and unclassified AWS errors stay unwrapped so
+// the standard retry/backoff path picks them up.
+func classifyPutRecordsError(err error) error {
+	var notFound *types.ResourceNotFoundException
+	if errors.As(err, &notFound) {
+		return consumererror.NewPermanent(fmt.Errorf("put_records: %w", err))
+	}
+	var invalid *types.InvalidArgumentException
+	if errors.As(err, &invalid) {
+		return consumererror.NewPermanent(fmt.Errorf("put_records: %w", err))
+	}
+	return fmt.Errorf("put_records: %w", err)
 }
