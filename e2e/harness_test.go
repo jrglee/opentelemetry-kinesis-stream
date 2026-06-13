@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +93,23 @@ func waitForOwnership(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}
 	t.Fatal("timed out waiting for all shards to be owned")
+}
+
+// waitForProducer blocks until the producer's OTLP gRPC port (published to the
+// host) accepts a TCP connection, so telemetrygen does not blast spans before
+// the listener is bound.
+func waitForProducer(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(settleDeadline)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", "localhost:4317", 2*time.Second)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatal("timed out waiting for producer OTLP listener on localhost:4317")
 }
 
 // scanOwners returns the distinct non-empty owners, the count of leases with

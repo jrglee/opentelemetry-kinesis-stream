@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.uber.org/zap"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
@@ -58,6 +59,9 @@ func (p *shardPoller) run(parentCtx context.Context) {
 		p.runHeartbeat(pollCtx, stop, logger)
 	}()
 	p.runPoll(pollCtx, stop, logger)
+	// runPoll may return without cancelling (e.g. SHARD_END); cancel here so
+	// the heartbeat goroutine always exits and wg.Wait does not hang.
+	stop()
 	wg.Wait()
 }
 
@@ -106,28 +110,40 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 			if ctx.Err() != nil {
 				return
 			}
-			logger.Warn("get_records failed", zap.Error(err))
-			select {
-			case <-ctx.Done():
+			// Re-open from the persisted checkpoint rather than reusing the
+			// iterator: an ExpiredIteratorException would otherwise make the
+			// loop spin on a dead iterator forever. Other transient errors
+			// (throttling) resume from the same point harmlessly.
+			logger.Warn("get_records failed; re-opening iterator", zap.Error(err))
+			if iter, err = p.openIterator(ctx); err != nil {
+				logger.Error("re-open iterator failed; stopping poller", zap.Error(err))
+				stop()
 				return
-			case <-pollTick.C:
+			}
+			if waitOrDone(ctx, pollTick) {
+				return
 			}
 			continue
 		}
 
-		// PoC failure policy: skip bad records but advance the checkpoint
-		// past them so a takeover does not replay the same poison-pill
-		// forever. Records that successfully decode + ConsumeTraces are
-		// delivered downstream; records that fail are logged.
-		var lastSeq string
+		// Advance the checkpoint only over records that were delivered or are
+		// permanently unprocessable. A record the downstream transiently
+		// rejected must NOT be skipped — we stop the batch there, checkpoint
+		// the good prefix, and re-read from that point so valid telemetry is
+		// not silently dropped under backpressure.
+		var advanceSeq string
+		retry := false
 		for _, rec := range out.Records {
-			p.handleRecord(ctx, rec)
+			if p.handleRecord(ctx, rec) == recordRetry {
+				retry = true
+				break
+			}
 			if s := aws.ToString(rec.SequenceNumber); s != "" {
-				lastSeq = s
+				advanceSeq = s
 			}
 		}
-		if lastSeq != "" {
-			if err := p.checkpoint(ctx, lastSeq); err != nil {
+		if advanceSeq != "" {
+			if err := p.checkpoint(ctx, advanceSeq); err != nil {
 				if !errors.Is(err, context.Canceled) {
 					logger.Warn("checkpoint lost lease; stopping poller", zap.Error(err))
 				}
@@ -135,15 +151,37 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 				return
 			}
 		}
+		if retry {
+			// Re-read from the just-advanced checkpoint after a short pause so
+			// the rejected record (and the rest of the batch) is retried.
+			if iter, err = p.openIterator(ctx); err != nil {
+				logger.Error("re-open iterator failed; stopping poller", zap.Error(err))
+				stop()
+				return
+			}
+			if waitOrDone(ctx, pollTick) {
+				return
+			}
+			continue
+		}
 		iter = out.NextShardIterator
 
 		if len(out.Records) == 0 {
-			select {
-			case <-ctx.Done():
+			if waitOrDone(ctx, pollTick) {
 				return
-			case <-pollTick.C:
 			}
 		}
+	}
+}
+
+// waitOrDone blocks until the poll ticker fires or the context is cancelled.
+// It returns true if the context was cancelled (the caller should return).
+func waitOrDone(ctx context.Context, tick *time.Ticker) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	case <-tick.C:
+		return false
 	}
 }
 
@@ -193,35 +231,60 @@ func (p *shardPoller) writeShardEnd(ctx context.Context, logger *zap.Logger) {
 	}
 }
 
-func (p *shardPoller) handleRecord(ctx context.Context, rec types.Record) {
+// recordResult tells the poll loop whether the checkpoint may advance past a
+// record. recordRetry means a valid record was transiently rejected and must
+// be re-read; recordSkip and recordOK both let the checkpoint advance.
+type recordResult int
+
+const (
+	recordOK    recordResult = iota // delivered downstream
+	recordSkip                      // permanently unprocessable — safe to skip
+	recordRetry                     // transient downstream failure — must re-read
+)
+
+func (p *shardPoller) handleRecord(ctx context.Context, rec types.Record) recordResult {
 	raw, err := p.comp.Decompress(rec.Data)
 	if err != nil {
 		p.logger.Warn(
-			"decompress failed",
+			"decompress failed; skipping record",
 			zap.String("shard", p.shardID()),
 			zap.String("seq", aws.ToString(rec.SequenceNumber)),
 			zap.Error(err),
 		)
-		return
+		return recordSkip
 	}
 	td, err := p.decoder.Unmarshal(raw)
 	if err != nil {
 		p.logger.Warn(
-			"decode failed",
+			"decode failed; skipping record",
 			zap.String("shard", p.shardID()),
 			zap.String("seq", aws.ToString(rec.SequenceNumber)),
 			zap.Error(err),
 		)
-		return
+		return recordSkip
 	}
 	if err := p.consumer.ConsumeTraces(ctx, td); err != nil {
+		// A permanent error means the data is rejected for good — skip it. A
+		// transient error (backpressure, downstream restart) must be retried,
+		// or valid telemetry is silently lost.
+		if consumererror.IsPermanent(err) {
+			p.logger.Warn(
+				"consume_traces permanently rejected; skipping record",
+				zap.String("shard", p.shardID()),
+				zap.String("seq", aws.ToString(rec.SequenceNumber)),
+				zap.Error(err),
+			)
+			return recordSkip
+		}
 		p.logger.Warn(
-			"consume_traces failed",
+			"consume_traces failed; will retry record",
 			zap.String("shard", p.shardID()),
 			zap.String("seq", aws.ToString(rec.SequenceNumber)),
 			zap.Error(err),
 		)
+		return recordRetry
 	}
+	return recordOK
 }
 
 func (p *shardPoller) heartbeat(ctx context.Context) error {

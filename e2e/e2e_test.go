@@ -25,6 +25,7 @@ const (
 	expectedSpans  = tracesEmitted * spansPerTrace
 	settleDeadline = 60 * time.Second
 	deliverWait    = 90 * time.Second
+	settleWindow   = 12 * time.Second
 )
 
 func TestRoundTripMultiReplica(t *testing.T) {
@@ -54,15 +55,30 @@ func TestRoundTripMultiReplica(t *testing.T) {
 	// no-duplicate assertion meaningful.
 	waitForOwnership(t)
 
+	// telemetrygen connects to the producer's OTLP listener; wait for it to
+	// accept connections so a fast --rate=0 burst is not dropped before the
+	// gRPC server binds.
+	waitForProducer(t)
+
 	if out, err := compose(t, env, 90*time.Second, "run", "--rm", "telemetrygen"); err != nil {
 		t.Fatalf("telemetrygen: %v\n%s", err, out)
 	}
 
 	unique, raw, perFile := waitForSpans(t, env, shared)
-
 	// No loss: every emitted span is present.
 	if unique != expectedSpans {
 		t.Fatalf("unique spans = %d, want %d (loss)", unique, expectedSpans)
+	}
+
+	// Settle: keep reading past the point the count was first reached, so a
+	// duplicate delivered a beat later (e.g. during a lease handoff) is
+	// actually observed before we assert. Without this, raw==unique could be
+	// sampled too early and mask a real double-delivery.
+	unique, raw, perFile = settleAndRead(t, env, shared)
+
+	// No loss after settle.
+	if unique != expectedSpans {
+		t.Fatalf("after settle, unique spans = %d, want %d", unique, expectedSpans)
 	}
 	// No double-delivery: raw occurrences across both consumer files equal the
 	// unique set. A span read by two replicas would make raw > unique. This is
@@ -77,6 +93,23 @@ func TestRoundTripMultiReplica(t *testing.T) {
 	if !bothContributed {
 		t.Logf("note: ownership did not split across replicas this run — expected, the coordinator does not rebalance healthy leases")
 	}
+}
+
+// settleAndRead reads the consumer output repeatedly over a short window after
+// the expected count has been reached, returning the final counts. It exists
+// so a late duplicate (raw > unique) has time to surface before the caller
+// asserts the no-double-delivery property.
+func settleAndRead(t *testing.T, env []string, shared string) (unique, raw int, perFile map[string]int) {
+	t.Helper()
+	deadline := time.Now().Add(settleWindow)
+	for time.Now().Before(deadline) {
+		unique, raw, perFile = readSpanIDs(t, env, shared)
+		if raw > unique {
+			return unique, raw, perFile // duplicate already visible; stop early
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return unique, raw, perFile
 }
 
 // waitForSpans polls the two consumer output files until the unique span set
