@@ -7,11 +7,17 @@ partition keys). The receiver closes the gap contrib leaves open: there is
 no first-party Kinesis Data Streams receiver today.
 
 **Status:** working proof of concept. Traces flow end-to-end — exporter to
-Kinesis, receiver back out — with shard ownership coordinated across replicas
-via a KCL-shaped DynamoDB lease table. Many capabilities are deliberately
-deferred (see [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md)). See
-[`DESIGN.md`](DESIGN.md) for the architecture and [`docs/adr/`](docs/adr/) for
-decisions made during implementation.
+Kinesis, receiver back out — with shard ownership coordinated and rebalanced
+across replicas via a KCL-shaped DynamoDB lease table. Many capabilities are
+deliberately deferred (see [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md)).
+
+## Documentation
+
+- [`docs/user-guide.md`](docs/user-guide.md) — configuration reference,
+  examples, behavior sequence diagrams, and a **step-by-step walkthrough for
+  testing against real AWS**.
+- [`DESIGN.md`](DESIGN.md) — architecture.
+- [`docs/adr/`](docs/adr/) — decisions made during implementation.
 
 ## Build
 
