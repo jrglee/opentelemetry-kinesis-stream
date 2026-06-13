@@ -2,10 +2,14 @@ package awskinesisreceiver
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/receiver"
+
+	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
 )
 
 var componentType = component.MustNewType("awskinesis")
@@ -20,19 +24,23 @@ func NewFactory() receiver.Factory {
 }
 
 func createDefaultConfig() component.Config {
-	return &Config{}
+	return &Config{
+		Encoding:     encoding.EncodingOTLPProto,
+		Compression:  encoding.CodecNone,
+		PollInterval: 250 * time.Millisecond,
+		MaxRecords:   10000,
+	}
 }
 
 func createTracesReceiver(
 	_ context.Context,
-	_ receiver.Settings,
-	_ component.Config,
-	_ consumer.Traces,
+	set receiver.Settings,
+	rawCfg component.Config,
+	next consumer.Traces,
 ) (receiver.Traces, error) {
-	return noopReceiver{}, nil
+	cfg, ok := rawCfg.(*Config)
+	if !ok {
+		return nil, fmt.Errorf("unexpected config type %T", rawCfg)
+	}
+	return newReceiver(cfg, next, set.Logger)
 }
-
-type noopReceiver struct{}
-
-func (noopReceiver) Start(_ context.Context, _ component.Host) error { return nil }
-func (noopReceiver) Shutdown(_ context.Context) error                { return nil }

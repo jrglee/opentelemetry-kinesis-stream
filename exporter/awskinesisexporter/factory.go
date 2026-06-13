@@ -2,11 +2,12 @@ package awskinesisexporter
 
 import (
 	"context"
+	"fmt"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/exporter"
-	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
 )
 
 var componentType = component.MustNewType("awskinesis")
@@ -21,23 +22,21 @@ func NewFactory() exporter.Factory {
 }
 
 func createDefaultConfig() component.Config {
-	return &Config{}
+	return &Config{
+		Encoding:      encoding.EncodingOTLPProto,
+		Compression:   encoding.CodecNone,
+		MaxRecordSize: 1 << 20, // 1 MiB, the standard Kinesis ceiling
+	}
 }
 
 func createTracesExporter(
-	_ context.Context,
-	_ exporter.Settings,
-	_ component.Config,
+	ctx context.Context,
+	set exporter.Settings,
+	rawCfg component.Config,
 ) (exporter.Traces, error) {
-	return noopTracesExporter{}, nil
+	cfg, ok := rawCfg.(*Config)
+	if !ok {
+		return nil, fmt.Errorf("unexpected config type %T", rawCfg)
+	}
+	return newExporter(ctx, cfg, set.Logger)
 }
-
-type noopTracesExporter struct{}
-
-func (noopTracesExporter) Start(_ context.Context, _ component.Host) error { return nil }
-func (noopTracesExporter) Shutdown(_ context.Context) error                { return nil }
-func (noopTracesExporter) Capabilities() consumer.Capabilities {
-	return consumer.Capabilities{MutatesData: false}
-}
-
-func (noopTracesExporter) ConsumeTraces(_ context.Context, _ ptrace.Traces) error { return nil }
