@@ -1,6 +1,12 @@
 # 0005. PoC milestone scope cuts
 
-- **Status:** Accepted
+- **Status:** Accepted. Most cuts are now delivered: zstd/snappy ([0010]
+  (0010-codecs-and-deferred-arrow.md)), metrics signal ([0011]
+  (0011-metrics-signal-via-sink-seam.md)), tag-hash partition keys /
+  microbatching / oversize repack ([0012](0012-tag-grouping-and-oversize-repack.md)),
+  dead-letter ([0013](0013-dead-letter-via-pipeline-reemit.md)), and `otlp_json`
+  ([0016](0016-add-otlp-json-encoding.md)). Still open: logs signal, `otel_arrow`
+  (the next encoding to land, see 0016), and EFO.
 - **Date:** 2026-06-13
 
 ## Context

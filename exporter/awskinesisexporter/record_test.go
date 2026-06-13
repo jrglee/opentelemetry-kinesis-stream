@@ -278,6 +278,92 @@ func sumDropped(t *testing.T, rm *metricdata.ResourceMetrics) int64 {
 	return 0
 }
 
+// TestPutRecordsPartialFailureRetriesTransientOnly verifies the partial-failure
+// contract: a permanently-rejected record is dropped-and-counted exactly once
+// (never re-sent), while throttled / InternalFailure records are retried in
+// place — only that transient subset, so succeeded records are not duplicated.
+func TestPutRecordsPartialFailureRetriesTransientOnly(t *testing.T) {
+	defer withFastBackoff()()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	var mu sync.Mutex
+	var callSizes []int
+
+	inject := func(o *kinesis.Options) {
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			return stack.Initialize.Add(
+				middleware.InitializeMiddlewareFunc("programmedKinesis", func(_ context.Context, in middleware.InitializeInput, _ middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
+					pr := in.Parameters.(*kinesis.PutRecordsInput)
+					n := len(pr.Records)
+					mu.Lock()
+					callSizes = append(callSizes, n)
+					first := len(callSizes) == 1
+					mu.Unlock()
+
+					recs := make([]types.PutRecordsResultEntry, n)
+					var failed int32
+					for i := range recs {
+						code := ""
+						if first {
+							switch i {
+							case 1:
+								code = "ProvisionedThroughputExceededException" // transient
+							case 2:
+								code = "InternalFailure" // transient
+							case 3:
+								code = "ValidationException" // permanent
+							}
+						}
+						if code == "" {
+							recs[i] = types.PutRecordsResultEntry{SequenceNumber: aws.String("ok")}
+						} else {
+							recs[i] = types.PutRecordsResultEntry{ErrorCode: aws.String(code), ErrorMessage: aws.String(code)}
+							failed++
+						}
+					}
+					return middleware.InitializeOutput{
+						Result: &kinesis.PutRecordsOutput{FailedRecordCount: aws.Int32(failed), Records: recs},
+					}, middleware.Metadata{}, nil
+				}),
+				middleware.Before,
+			)
+		})
+	}
+
+	exp := newTestExporterCfg(t, tagHashCfg(), inject)
+	tel, err := newExporterTelemetry(mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp.tel = tel
+
+	if err := exp.ConsumeTraces(context.Background(), tracesWith(tuples())); err != nil {
+		t.Fatalf("consume: %v", err) // transient retried to success, permanent dropped → no error
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(callSizes) != 2 {
+		t.Fatalf("PutRecords calls: got %d (%v) want 2 (initial + transient retry)", len(callSizes), callSizes)
+	}
+	if callSizes[0] != len(tuples()) {
+		t.Fatalf("first call records: got %d want %d", callSizes[0], len(tuples()))
+	}
+	if callSizes[1] != 2 {
+		t.Fatalf("retry call records: got %d want 2 (only the transient subset)", callSizes[1])
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	if got := sumDropped(t, &rm); got != 1 {
+		t.Fatalf("dropped counter: got %d want 1 (the one permanent rejection, counted once)", got)
+	}
+}
+
 func TestRandomDefaultKey(t *testing.T) {
 	capt := &capture{}
 	exp := newTestExporter(t, 1<<20, capt.injectSerialize())

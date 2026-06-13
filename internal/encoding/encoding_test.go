@@ -8,8 +8,8 @@ import (
 )
 
 func TestRoundTrip(t *testing.T) {
-	encodings := []Encoding{EncodingOTLPProto}
-	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy}
+	encodings := []Encoding{EncodingOTLPProto, EncodingOTLPJSON}
+	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy, CodecSnappyFramed, CodecZlib, CodecDeflate}
 
 	for _, e := range encodings {
 		for _, c := range codecs {
@@ -58,48 +58,52 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestMetricsRoundTrip(t *testing.T) {
-	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy}
-	for _, c := range codecs {
-		t.Run(string(c), func(t *testing.T) {
-			enc, err := NewMetricsEncoder(EncodingOTLPProto)
-			if err != nil {
-				t.Fatalf("NewMetricsEncoder: %v", err)
-			}
-			dec, err := NewMetricsDecoder(EncodingOTLPProto)
-			if err != nil {
-				t.Fatalf("NewMetricsDecoder: %v", err)
-			}
-			comp, err := NewCompressor(c)
-			if err != nil {
-				t.Fatalf("NewCompressor: %v", err)
-			}
+	encodings := []Encoding{EncodingOTLPProto, EncodingOTLPJSON}
+	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy, CodecSnappyFramed, CodecZlib, CodecDeflate}
+	for _, e := range encodings {
+		for _, c := range codecs {
+			name := string(e) + "/" + string(c)
+			t.Run(name, func(t *testing.T) {
+				enc, err := NewMetricsEncoder(e)
+				if err != nil {
+					t.Fatalf("NewMetricsEncoder: %v", err)
+				}
+				dec, err := NewMetricsDecoder(e)
+				if err != nil {
+					t.Fatalf("NewMetricsDecoder: %v", err)
+				}
+				comp, err := NewCompressor(c)
+				if err != nil {
+					t.Fatalf("NewCompressor: %v", err)
+				}
 
-			in := sampleMetrics()
-			raw, err := enc.Marshal(in)
-			if err != nil {
-				t.Fatalf("Marshal: %v", err)
-			}
-			zipped, err := comp.Compress(raw)
-			if err != nil {
-				t.Fatalf("Compress: %v", err)
-			}
-			unzipped, err := comp.Decompress(zipped)
-			if err != nil {
-				t.Fatalf("Decompress: %v", err)
-			}
-			out, err := dec.Unmarshal(unzipped)
-			if err != nil {
-				t.Fatalf("Unmarshal: %v", err)
-			}
+				in := sampleMetrics()
+				raw, err := enc.Marshal(in)
+				if err != nil {
+					t.Fatalf("Marshal: %v", err)
+				}
+				zipped, err := comp.Compress(raw)
+				if err != nil {
+					t.Fatalf("Compress: %v", err)
+				}
+				unzipped, err := comp.Decompress(zipped)
+				if err != nil {
+					t.Fatalf("Decompress: %v", err)
+				}
+				out, err := dec.Unmarshal(unzipped)
+				if err != nil {
+					t.Fatalf("Unmarshal: %v", err)
+				}
 
-			if out.DataPointCount() != in.DataPointCount() {
-				t.Fatalf("datapoint count mismatch: got %d want %d", out.DataPointCount(), in.DataPointCount())
-			}
-			gotName := out.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Name()
-			if gotName != "test-metric" {
-				t.Fatalf("metric name mismatch: got %q want %q", gotName, "test-metric")
-			}
-		})
+				if out.DataPointCount() != in.DataPointCount() {
+					t.Fatalf("datapoint count mismatch: got %d want %d", out.DataPointCount(), in.DataPointCount())
+				}
+				gotName := out.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Name()
+				if gotName != "test-metric" {
+					t.Fatalf("metric name mismatch: got %q want %q", gotName, "test-metric")
+				}
+			})
+		}
 	}
 }
 
@@ -109,6 +113,24 @@ func TestUnknownEncoding(t *testing.T) {
 	}
 	if _, err := NewCompressor("bogus"); err == nil {
 		t.Fatal("expected error for unknown codec")
+	}
+}
+
+// TestArrowUnsupported guards the deferred-follow-up boundary: otel_arrow is a
+// reserved name that every encoder/decoder constructor must reject so config
+// validation fails fast rather than at first record (see ADR-0016).
+func TestArrowUnsupported(t *testing.T) {
+	if _, err := NewTracesEncoder(EncodingOTelArrow); err == nil {
+		t.Fatal("expected error for otel_arrow traces encoder")
+	}
+	if _, err := NewTracesDecoder(EncodingOTelArrow); err == nil {
+		t.Fatal("expected error for otel_arrow traces decoder")
+	}
+	if _, err := NewMetricsEncoder(EncodingOTelArrow); err == nil {
+		t.Fatal("expected error for otel_arrow metrics encoder")
+	}
+	if _, err := NewMetricsDecoder(EncodingOTelArrow); err == nil {
+		t.Fatal("expected error for otel_arrow metrics decoder")
 	}
 }
 

@@ -2,7 +2,9 @@ package encoding
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"fmt"
 	"io"
 
@@ -93,6 +95,90 @@ func (snappyCodec) Decompress(in []byte) ([]byte, error) {
 	out, err := snappy.Decode(nil, in)
 	if err != nil {
 		return nil, fmt.Errorf("snappy decode: %w", err)
+	}
+	return out, nil
+}
+
+// snappyFramedCodec uses the Snappy stream (framing) format — the collector's
+// "x-snappy-framed" codec — as opposed to snappyCodec's block format.
+type snappyFramedCodec struct{}
+
+func (snappyFramedCodec) Compress(in []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w := snappy.NewBufferedWriter(&buf)
+	if _, err := w.Write(in); err != nil {
+		return nil, fmt.Errorf("snappy-framed write: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return nil, fmt.Errorf("snappy-framed close: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func (snappyFramedCodec) Decompress(in []byte) ([]byte, error) {
+	out, err := io.ReadAll(snappy.NewReader(bytes.NewReader(in)))
+	if err != nil {
+		return nil, fmt.Errorf("snappy-framed read: %w", err)
+	}
+	return out, nil
+}
+
+// zlibCodec uses the stdlib zlib (RFC 1950) implementation.
+type zlibCodec struct{}
+
+func (zlibCodec) Compress(in []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w := zlib.NewWriter(&buf)
+	if _, err := w.Write(in); err != nil {
+		return nil, fmt.Errorf("zlib write: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return nil, fmt.Errorf("zlib close: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func (zlibCodec) Decompress(in []byte) ([]byte, error) {
+	r, err := zlib.NewReader(bytes.NewReader(in))
+	if err != nil {
+		return nil, fmt.Errorf("zlib open: %w", err)
+	}
+	out, err := io.ReadAll(r)
+	if cerr := r.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return nil, fmt.Errorf("zlib read: %w", err)
+	}
+	return out, nil
+}
+
+// deflateCodec uses the stdlib raw DEFLATE (RFC 1951) stream.
+type deflateCodec struct{}
+
+func (deflateCodec) Compress(in []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w, err := flate.NewWriter(&buf, flate.DefaultCompression)
+	if err != nil {
+		return nil, fmt.Errorf("deflate writer: %w", err)
+	}
+	if _, err := w.Write(in); err != nil {
+		return nil, fmt.Errorf("deflate write: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return nil, fmt.Errorf("deflate close: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func (deflateCodec) Decompress(in []byte) ([]byte, error) {
+	r := flate.NewReader(bytes.NewReader(in))
+	out, err := io.ReadAll(r)
+	if cerr := r.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return nil, fmt.Errorf("deflate read: %w", err)
 	}
 	return out, nil
 }

@@ -13,13 +13,32 @@ import (
 	"go.uber.org/zap"
 )
 
-// Kinesis PutRecords ceilings: at most 500 records and 5 MiB of aggregate
-// record data per call. Flushing honors both so a single ConsumeX never
-// overruns the API regardless of how many groups/splits it produced.
-const (
-	maxRecordsPerPut = 500
-	maxBytesPerPut   = 5 << 20
+// PutRecords retry bounds. A partial PutRecords failure is retried in place for
+// only the transient (throttled / InternalFailure) subset, with capped
+// exponential backoff, so already-succeeded records are not duplicated and
+// permanently-rejected records do not head-of-line-block. After maxPutAttempts
+// the still-failing subset is handed to the Collector's retry policy.
+const maxPutAttempts = 5
+
+// Backoff bounds for the in-place transient retry. Vars (not consts) so tests
+// can shrink them; production never mutates them.
+var (
+	putBackoffBase = 100 * time.Millisecond
+	putBackoffMax  = 2 * time.Second
 )
+
+// transientPutError reports whether a per-record PutRecords ErrorCode is worth
+// retrying. Throttling clears once the shard has capacity, and InternalFailure
+// is a transient service error; any other code (e.g. a validation error) fails
+// identically on every retry and is treated as permanent.
+func transientPutError(code string) bool {
+	switch code {
+	case "ProvisionedThroughputExceededException", "InternalFailure":
+		return true
+	default:
+		return false
+	}
+}
 
 // taggedBatch pairs a signal batch with the joined tag value used to derive
 // its partition key. key is empty for the random strategy.
@@ -133,15 +152,18 @@ func pack[T any](
 }
 
 // flush sends entries via PutRecords, chunking so each call stays within the
-// 500-record and 5-MiB ceilings. Per-record and transport errors reuse the
-// traces path's classification so the Collector's retry policy behaves the same.
+// operator-configured per-call record-count and byte limits (put_records.*).
+// At least one record is always included per call even if it alone exceeds the
+// byte limit — a single record's size is bounded by max_record_size instead.
 func (e *kinesisExporter) flush(ctx context.Context, entries []types.PutRecordsRequestEntry) error {
+	maxRecords := e.cfg.PutRecords.MaxRecords
+	maxBytes := e.cfg.PutRecords.MaxBytes
 	for start := 0; start < len(entries); {
 		end := start
 		bytes := 0
-		for end < len(entries) && end-start < maxRecordsPerPut {
+		for end < len(entries) && end-start < maxRecords {
 			n := len(entries[end].Data)
-			if end > start && bytes+n > maxBytesPerPut {
+			if end > start && bytes+n > maxBytes {
 				break
 			}
 			bytes += n
@@ -155,36 +177,52 @@ func (e *kinesisExporter) flush(ctx context.Context, entries []types.PutRecordsR
 	return nil
 }
 
-// putRecords issues one PutRecords call and surfaces per-record failures the
-// same way the original single-record path did.
+// putRecords issues PutRecords for one chunk and resolves partial failures by
+// retrying only the transient subset in place. PutRecords returns a per-record
+// result array in request order, so a record that succeeded is never re-sent
+// (no duplication) and a permanently-rejected record is dropped-and-counted
+// once rather than riding a whole-batch retry. Throttled / InternalFailure
+// records are retried with capped backoff; if they still fail after
+// maxPutAttempts, the remaining subset is surfaced as a retryable error for the
+// Collector's retry policy (the at-least-once backstop).
 func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRecordsRequestEntry) error {
-	if len(records) == 0 {
-		return nil
-	}
-	bytes := 0
-	for i := range records {
-		bytes += len(records[i].Data)
-	}
-	start := time.Now()
-	out, err := e.client.PutRecords(ctx, &kinesis.PutRecordsInput{
-		StreamName: aws.String(e.cfg.StreamName),
-		Records:    records,
-	})
-	durationMs := float64(time.Since(start).Microseconds()) / 1000
-	e.tel.recordPut(ctx, len(records), bytes, durationMs)
-	if err != nil {
-		return classifyPutRecordsError(err)
-	}
-	e.logger.Debug(
-		"put_records",
-		zap.Int("records", len(records)),
-		zap.Int("bytes", bytes),
-		zap.Float64("duration_ms", durationMs),
-	)
-	if out.FailedRecordCount != nil && *out.FailedRecordCount > 0 {
-		var throttled, rejected int
+	attempt := records
+	for try := 0; ; try++ {
+		if len(attempt) == 0 {
+			return nil
+		}
+		bytes := 0
+		for i := range attempt {
+			bytes += len(attempt[i].Data)
+		}
+		start := time.Now()
+		out, err := e.client.PutRecords(ctx, &kinesis.PutRecordsInput{
+			StreamName: aws.String(e.cfg.StreamName),
+			Records:    attempt,
+		})
+		durationMs := float64(time.Since(start).Microseconds()) / 1000
+		e.tel.recordPut(ctx, len(attempt), bytes, durationMs)
+		if err != nil {
+			return classifyPutRecordsError(err)
+		}
+		if out.FailedRecordCount == nil || *out.FailedRecordCount == 0 {
+			e.logger.Debug(
+				"put_records",
+				zap.Int("records", len(attempt)),
+				zap.Int("bytes", bytes),
+				zap.Float64("duration_ms", durationMs),
+			)
+			return nil
+		}
+
+		var retry []types.PutRecordsRequestEntry
+		var rejected int
 		for i, r := range out.Records {
 			if r.ErrorCode == nil {
+				continue // succeeded
+			}
+			if transientPutError(aws.ToString(r.ErrorCode)) {
+				retry = append(retry, attempt[i])
 				continue
 			}
 			e.logger.Warn(
@@ -193,24 +231,37 @@ func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRec
 				zap.String("code", aws.ToString(r.ErrorCode)),
 				zap.String("message", aws.ToString(r.ErrorMessage)),
 			)
-			if aws.ToString(r.ErrorCode) == "ProvisionedThroughputExceededException" {
-				throttled++
-			} else {
-				rejected++
-			}
+			rejected++
 		}
-		// A record rejected for a non-throttling reason (e.g. a validation
-		// error) will fail identically on every retry. Drop and count those so
-		// they cannot head-of-line-block the pipeline with an infinite retry.
 		if rejected > 0 {
 			e.tel.recordDrop(ctx, rejected, "rejected")
 		}
-		// Retry only if some failures were throttling — those succeed once the
-		// shard has capacity. Returning an error re-sends the whole batch (the
-		// succeeded records included), which is the accepted at-least-once cost.
-		if throttled > 0 {
-			return fmt.Errorf("put_records: %d records throttled", throttled)
+		if len(retry) == 0 {
+			return nil
 		}
+		if try+1 >= maxPutAttempts {
+			return fmt.Errorf("put_records: %d records still failing after %d attempts", len(retry), try+1)
+		}
+		if err := sleepBackoff(ctx, try); err != nil {
+			return err
+		}
+		attempt = retry
 	}
-	return nil
+}
+
+// sleepBackoff waits putBackoffBase*2^try (capped at putBackoffMax) or until the
+// context is cancelled, whichever comes first.
+func sleepBackoff(ctx context.Context, try int) error {
+	d := putBackoffBase << try
+	if d > putBackoffMax || d <= 0 {
+		d = putBackoffMax
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }

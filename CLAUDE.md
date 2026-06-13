@@ -12,17 +12,24 @@ component directory.
 
 ## Status
 
-Working end-to-end round trip (traces only): the exporter encodes
-(OTLP-proto), compresses (none/gzip), and writes Kinesis records; the
-receiver coordinates shard ownership across replicas via a lease store
-(in-memory or KCL-shaped DynamoDB), polls `GetRecords`, and checkpoints
-after downstream acceptance. A docker-compose E2E proves the round trip and
-multi-replica no-duplicate delivery against the MiniStack emulator.
+Working end-to-end round trip for **traces and metrics**: the exporter encodes
+(`otlp_proto` or `otlp_json`), compresses (`none`/`gzip`/`zstd`/`snappy`),
+derives partition keys (random or tag-hash), tag-groups microbatches, repacks
+oversize records, and writes via `PutRecords`; the receiver coordinates shard
+ownership across replicas via a lease store (in-memory or KCL-shaped DynamoDB)
+with leaderless fair-share rebalancing and graceful handoff, polls `GetRecords`,
+dead-letters unprocessable records, and checkpoints after downstream acceptance.
+A docker-compose E2E proves the round trip and multi-replica no-duplicate
+delivery against the MiniStack emulator, and CI runs the gate.
 
-Deliberately deferred (see [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md)):
-OTLP-JSON/Arrow encodings, zstd, tag-hash partitioning, microbatch repacking,
-metrics/logs signals, resharding, and rebalancing/autoscaling. CI is still
-deferred.
+Remaining gaps (see [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md) and
+[ADR-0016](docs/adr/0016-add-otlp-json-encoding.md)):
+- **`otel_arrow` encoding** — the next encoding to land (the Go module now
+  exists); reserved and rejected at validation until then.
+- **Logs signal** — not wired (traces and metrics only).
+- **Resharding** — implemented and covered by a simulated-split test, but not
+  yet verified against a real AWS reshard.
+- **EFO** — `GetRecords` polling only; `SubscribeToShard` out of scope.
 
 ## Layout
 

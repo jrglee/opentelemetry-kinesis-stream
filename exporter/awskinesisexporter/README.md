@@ -8,6 +8,13 @@ to the stream's per-record size limit, and writes them with `PutRecords`.
 Records are partitioned by a configurable strategy that determines per-shard
 ordering on the consuming side.
 
+Supported encodings are `otlp_proto` (default, recommended) and `otlp_json`;
+`otel_arrow` is the next encoding to land and is rejected at validation until
+then. Compression
+(`none`/`gzip`/`zstd`/`snappy`) is the key advantage over the contrib Kinesis
+exporter, which does not compress — compressed `otlp_proto` is the recommended
+configuration.
+
 **Status:** working proof of concept for traces and metrics, including
 tag-grouped microbatching and oversize-record repacking.
 
