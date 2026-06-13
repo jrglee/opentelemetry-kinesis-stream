@@ -7,16 +7,22 @@ the runtime behaviors that matter operationally — round trip, shard
 rebalancing, graceful handoff, crash recovery, and resharding. You can treat
 the components as a black box; nothing here requires reading the source.
 
-> **Status:** proof of concept. Traces only. Several capabilities are
+> **Status:** proof of concept. Traces and metrics. Several capabilities are
 > deliberately deferred — see [Limitations](#limitations).
 
 ## Contents
 
 - [Building a collector](#building-a-collector)
+- [Signals (traces and metrics)](#signals-traces-and-metrics)
 - [Testing against real AWS](#testing-against-real-aws) — **start here to try it end-to-end**
 - [Exporter configuration](#exporter-configuration)
+  - [Choosing compression](#choosing-compression)
+  - [Tag-grouped microbatching](#tag-grouped-microbatching)
+  - [Oversize records](#oversize-records)
 - [Receiver configuration](#receiver-configuration)
+  - [Dead-letter handling](#dead-letter-handling)
 - [Lease backends](#lease-backends)
+- [Metrics with InfluxDB line protocol](#metrics-with-influxdb-line-protocol)
 - [Behavior](#behavior)
   - [End-to-end round trip](#end-to-end-round-trip)
   - [Shard acquisition and fair-share rebalancing](#shard-acquisition-and-fair-share-rebalancing)
@@ -26,6 +32,24 @@ the components as a black box; nothing here requires reading the source.
   - [Per-record failure handling](#per-record-failure-handling)
 - [Tuning](#tuning)
 - [Limitations](#limitations)
+
+## Signals (traces and metrics)
+
+Both components register `WithTraces` and `WithMetrics`, so each can serve a
+traces pipeline or a metrics pipeline. The choice is the pipeline you attach
+the component to.
+
+A given Kinesis stream carries **one signal**. The wire layout has no signal
+header, so the consumer must decode records as the same signal the producer
+encoded. Run a separate stream for traces and for metrics; point a traces
+pipeline at the traces stream and a metrics pipeline at the metrics stream.
+Mixing signals on one stream is unsupported and decodes will fail on the
+consumer.
+
+Everything in this guide — compression, partition keys, leasing, rebalancing,
+checkpointing — behaves identically for both signals. Examples that show a
+`traces:` pipeline work the same with `metrics:`; swap the keyword and use a
+metrics source and sink.
 
 ## Building a collector
 
@@ -240,22 +264,30 @@ aws dynamodb delete-table --table-name "$LEASE_TABLE"
 
 ## Exporter configuration
 
-The exporter marshals each `ConsumeTraces` call into a single Kinesis record
-and writes it with `PutRecords` using a random partition key.
+The exporter marshals each `ConsumeTraces` or `ConsumeMetrics` call into one or
+more Kinesis records and writes them with `PutRecords`. By default it produces a
+single record with a random partition key; under the `tag_hash` strategy it
+groups the batch by resource-attribute tuple and emits one record per tuple with
+a stable key (see [Tag-grouped microbatching](#tag-grouped-microbatching)).
 
-| Setting           | Type   | Default      | Required | Description |
-|-------------------|--------|--------------|----------|-------------|
-| `stream_name`     | string | —            | yes      | Target Kinesis Data Stream. |
-| `region`          | string | —            | yes      | AWS region of the stream. |
-| `endpoint`        | string | (SDK default)| no       | Override the AWS endpoint URL. Set this for emulators (e.g. `http://ministack:4566`). |
-| `encoding`        | string | `otlp_proto` | no       | Wire format. Only `otlp_proto` is implemented; `otlp_json` and `otel_arrow` are reserved and rejected at validation. |
-| `compression`     | string | `none`       | no       | Payload codec. `none` or `gzip`; `zstd` is reserved and rejected. |
-| `max_record_size` | int    | `1048576`    | no       | Post-compression byte ceiling per record. A larger payload is dropped with a log line (no repacking yet). The Kinesis hard limit is 1 MiB on the standard API. |
+| Setting                   | Type   | Default      | Required | Description |
+|---------------------------|--------|--------------|----------|-------------|
+| `stream_name`             | string | —            | yes      | Target Kinesis Data Stream. |
+| `region`                  | string | —            | yes      | AWS region of the stream. |
+| `endpoint`                | string | (SDK default)| no       | Override the AWS endpoint URL. Set this for emulators (e.g. `http://ministack:4566`). |
+| `encoding`                | string | `otlp_proto` | no       | Wire format. Only `otlp_proto` is implemented; `otlp_json` and `otel_arrow` are reserved and rejected at validation. |
+| `compression`             | string | `none`       | no       | Payload codec. One of `none`, `gzip`, `zstd`, `snappy`. See [Choosing compression](#choosing-compression). |
+| `partition_key.strategy`  | string | `random`     | no       | `random` (one key per record, spreads across shards) or `tag_hash` (stable key per resource-attribute tuple, co-locates by tag and groups the batch). |
+| `partition_key.tags`      | list   | —            | if tag_hash | Ordered list of resource attribute keys forming the tag tuple. Records sharing a tuple get the same key and land on the same shard. |
+| `partition_key.hash`      | string | `xxhash`     | no       | Hash function for the partition key. Only `xxhash` is implemented. |
+| `oversize.policy`         | string | `split_half` | no       | What to do when a record still exceeds `max_record_size` after compression. `split_half` repacks by halving, `drop_largest` drops the biggest item, `reject` fails the batch. See [Oversize records](#oversize-records). |
+| `oversize.max_attempts`   | int    | `8`          | no       | Maximum repack rounds before giving up under `split_half`. |
+| `max_record_size`         | int    | `1048576`    | no       | Post-compression byte ceiling per record. A larger payload is repacked per `oversize.policy`. The Kinesis hard limit is 1 MiB on the standard API. |
 
 Credentials come from the standard AWS SDK chain (environment, shared config,
 or IAM role). For an emulator, set dummy credentials via environment.
 
-### Example
+### Example (traces)
 
 ```yaml
 exporters:
@@ -274,8 +306,126 @@ service:
       exporters: [awskinesis]
 ```
 
+### Example (metrics)
+
+The same exporter on a metrics pipeline, pointed at a separate stream:
+
+```yaml
+exporters:
+  awskinesis:
+    stream_name: otel-metrics
+    region: us-east-1
+    encoding: otlp_proto
+    compression: zstd
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [awskinesis]
+```
+
 The wire layout (encoding + compression, headerless) must match what the
 receiver expects — they are agreed by configuration on both ends.
+
+### Choosing compression
+
+Compression runs before the `max_record_size` check, so a good codec packs more
+telemetry per record and reduces both shard count and dropped-or-split records.
+All four codecs must be matched by the receiver's `compression` setting.
+
+| Codec    | When to reach for it |
+|----------|----------------------|
+| `zstd`   | Best ratio-per-CPU for most workloads. The default recommendation when you want smaller records without paying much latency. |
+| `snappy` | Cheapest CPU and lowest latency. Use when the collector is CPU-bound or you care about per-record latency more than stream cost. |
+| `gzip`   | Broadest compatibility. Reach for it when something downstream of the stream expects gzip, or for parity with existing tooling. |
+| `none`   | No CPU spent compressing. Use for already-compact payloads, or when you would rather buy shards than CPU. |
+
+Rule of thumb: start with `zstd`. Drop to `snappy` if compression CPU shows up
+in profiles; choose `gzip` only for compatibility; choose `none` only when the
+payload does not compress or CPU is the binding constraint.
+
+### Tag-grouped microbatching
+
+By default each export becomes one record with a random partition key, so
+records spread evenly across shards but related telemetry can land anywhere.
+Under `partition_key.strategy: tag_hash` the exporter instead:
+
+1. **Groups** the incoming batch by the tuple of resource attributes named in
+   `partition_key.tags`, emitting **one record per distinct tuple**.
+2. Derives a **stable partition key** from each tuple (hashed with
+   `partition_key.hash`), so every record for a given tuple routes to the same
+   shard — giving you per-tuple locality and ordering on the consumer.
+
+Use it when a downstream consumer benefits from all data for, say, one service
+or region arriving on one shard in order. The trade-off is distribution: if one
+tuple dominates traffic, its shard runs hot. Pick tag keys with enough
+cardinality to spread load but enough coarseness to keep locality useful.
+
+```yaml
+exporters:
+  awskinesis:
+    stream_name: otel-traces
+    region: us-east-1
+    encoding: otlp_proto
+    compression: zstd
+    partition_key:
+      strategy: tag_hash
+      tags: [service.name, region]
+      hash: xxhash
+    oversize:
+      policy: split_half
+```
+
+```mermaid
+sequenceDiagram
+    participant P as Pipeline (producer)
+    participant EX as awskinesis exporter
+    participant K as Kinesis stream
+
+    P->>EX: ConsumeTraces(batch of many resources)
+    Note over EX: group by tuple (service.name, region)
+    Note over EX: one record per distinct tuple
+    EX->>EX: stable key = xxhash(tuple)
+    EX->>K: PutRecords(record A, key=hash(svc1, us-east-1))
+    EX->>K: PutRecords(record B, key=hash(svc2, us-west-2))
+    Note over K: each tuple always routes to the same shard
+```
+
+### Oversize records
+
+After compression a record may still exceed `max_record_size` (the Kinesis hard
+limit is 1 MiB). `oversize.policy` decides what happens:
+
+- **`split_half`** (default) repacks the record: it recursively halves the
+  resource list, then halves the leaf items within a resource, until each piece
+  fits or `oversize.max_attempts` rounds are spent. A single leaf item that is
+  still too large on its own cannot be split — it is dropped and counted on the
+  `kinesis.exporter.records_dropped` metric.
+- **`drop_largest`** drops the biggest item and retries, trading data for
+  forward progress without recursive repacking.
+- **`reject`** fails the batch so the pipeline surfaces the error rather than
+  silently shedding data.
+
+```mermaid
+sequenceDiagram
+    participant EX as awskinesis exporter
+    participant K as Kinesis stream
+
+    EX->>EX: compress record
+    alt fits max_record_size
+        EX->>K: PutRecords(record)
+    else too big, split_half
+        Note over EX: split resources into two halves
+        Note over EX: each half still too big splits its leaf items
+        alt half now fits
+            EX->>K: PutRecords(half)
+        else single leaf still too big
+            Note over EX: drop leaf, count records_dropped
+        end
+    end
+```
 
 ## Receiver configuration
 
@@ -290,6 +440,7 @@ pipeline, and checkpoints after downstream acceptance.
 | `endpoint`           | string   | (SDK default)| no       | Override the AWS endpoint URL (Kinesis **and** DynamoDB). Set for emulators. |
 | `encoding`           | string   | `otlp_proto` | no       | Wire format expected on records. Must match the exporter. |
 | `compression`        | string   | `none`       | no       | Codec expected on records. Must match the exporter. |
+| `dead_letter.enabled`| bool     | `false`      | no       | When true, a record that cannot be decompressed or decoded is wrapped with its metadata and re-emitted into this receiver's own pipeline instead of being skipped. See [Dead-letter handling](#dead-letter-handling). |
 | `poll_interval`      | duration | `250ms`      | no       | Delay between `GetRecords` calls on a shard after an empty response. Stay under the 5-reads/s/shard Kinesis limit. |
 | `max_records`        | int      | `10000`      | no       | Cap on records per `GetRecords` (1–10000; 10000 is the Kinesis maximum). |
 | `worker_id`          | string   | (random UUID)| no       | Unique id for this replica. A **stable** id across restarts is recommended in production so a restarting replica reclaims its own leases. Two replicas sharing an id will fight. |
@@ -334,6 +485,63 @@ receivers:
     discovery_interval: 15s
 ```
 
+### Dead-letter handling
+
+By default a record the receiver cannot decompress or decode is unprocessable:
+it is skipped and the shard advances past it (see
+[Per-record failure handling](#per-record-failure-handling)). With
+`dead_letter.enabled: true`, that record is instead **wrapped and re-emitted
+into the receiver's own pipeline** so an operator can inspect or route it rather
+than lose it.
+
+The wrapper carries the raw record bytes plus its metadata: shard id, sequence
+number, partition key, failure class, declared encoding, and declared codec.
+It is re-emitted as:
+
+- a span named `kinesis.dead_letter` on a **traces** receiver, or
+- a gauge named `kinesis.dead_letter` on a **metrics** receiver.
+
+Because it flows through the same pipeline, you route it like any other
+telemetry — for example to a separate exporter or storage for inspection — using
+the signal name and the carried attributes.
+
+Only **decode and decompress** failures are dead-lettered. A **transient**
+downstream rejection of an otherwise valid record is retried from the
+checkpoint, **not** dead-lettered — backpressure must not look like corruption.
+
+```yaml
+receivers:
+  awskinesis:
+    stream_name: otel-traces
+    region: us-east-1
+    encoding: otlp_proto
+    compression: zstd
+    lease_backend: dynamodb
+    lease_table: otel-kinesis-leases
+    dead_letter:
+      enabled: true
+```
+
+```mermaid
+sequenceDiagram
+    participant K as Kinesis stream
+    participant RX as awskinesis receiver
+    participant C as Pipeline (consumer)
+    participant OUT as Operator route
+
+    K-->>RX: [record]
+    RX->>RX: decompress + decode
+    alt decode or decompress fails
+        Note over RX: wrap raw bytes plus shard, sequence, key, class, encoding, codec
+        RX->>C: emit kinesis.dead_letter (span for traces, gauge for metrics)
+        C->>OUT: operator routes it for inspection
+    else transient downstream rejection
+        Note over RX: valid record, retry from checkpoint, not dead-lettered
+    else success
+        RX->>C: ConsumeTraces or ConsumeMetrics
+    end
+```
+
 ## Lease backends
 
 Shard ownership and checkpoints live in a *lease store*.
@@ -364,6 +572,78 @@ The receiver's IAM role needs `kinesis:DescribeStream*`, `kinesis:ListShards`,
 `kinesis:GetShardIterator`, `kinesis:GetRecords` on the stream, and
 `dynamodb:Scan`, `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem`
 on the lease table.
+
+## Metrics with InfluxDB line protocol
+
+A common metrics pipeline ingests InfluxDB line protocol, ships it through
+Kinesis with tag-grouped microbatching, and decodes it on the far side. This
+worked example pairs the `influxdbreceiver` with the Kinesis exporter on the
+producer, and the Kinesis receiver with your backend on the consumer.
+
+**Why `groupbyattrs` is required.** InfluxDB tags arrive on the
+`influxdbreceiver` as **datapoint attributes**, but the exporter's `tag_hash`
+strategy groups and keys records by **resource attributes**. The
+`groupbyattrs` processor promotes the chosen attribute keys from the datapoint
+level up to the resource level, so the exporter can group by them and derive a
+stable partition key. Keep `groupbyattrs` `keys` **equal** to the exporter's
+`partition_key.tags` — if they diverge, the exporter groups on keys that are not
+present at the resource level and locality is lost.
+
+Producer — InfluxDB in, Kinesis out:
+
+```yaml
+receivers:
+  influxdb:
+    endpoint: 0.0.0.0:8086    # accepts POST /write
+processors:
+  groupbyattrs:
+    keys: [host, region]      # equal to exporter partition_key.tags
+  batch:
+exporters:
+  awskinesis:
+    stream_name: otel-metrics
+    region: us-east-1
+    encoding: otlp_proto
+    compression: zstd
+    partition_key:
+      strategy: tag_hash
+      tags: [host, region]    # equal to groupbyattrs keys
+      hash: xxhash
+service:
+  pipelines:
+    metrics:
+      receivers: [influxdb]
+      processors: [groupbyattrs, batch]
+      exporters: [awskinesis]
+```
+
+Consumer — Kinesis in, your backend out, with dead-lettering on:
+
+```yaml
+receivers:
+  awskinesis:
+    stream_name: otel-metrics
+    region: us-east-1
+    encoding: otlp_proto
+    compression: zstd
+    lease_backend: dynamodb
+    lease_table: otel-kinesis-leases
+    worker_id: ${env:POD_NAME}
+    dead_letter:
+      enabled: true
+exporters:
+  otlp:
+    endpoint: your-backend:4317
+service:
+  pipelines:
+    metrics:
+      receivers: [awskinesis]
+      exporters: [otlp]
+```
+
+With this layout every metric for a given `(host, region)` tuple lands on one
+shard in order, and any record that fails to decode on the consumer surfaces as
+a `kinesis.dead_letter` gauge instead of being silently dropped.
 
 ## Behavior
 
@@ -567,11 +847,10 @@ the persisted checkpoint rather than reused.
 
 This is a proof of concept. Deliberately deferred:
 
-- Traces only — no metrics or logs.
-- `otlp_proto` encoding and `none`/`gzip` compression only; `otlp_json`,
-  `otel_arrow`, and `zstd` are reserved names that fail validation.
-- Random partition keys only — no tag-hash strategy.
-- No microbatch repacking — a record over `max_record_size` is dropped.
+- Traces and metrics — no logs.
+- `otlp_proto` encoding only. `otlp_json` is not implemented and `otel_arrow`
+  is deferred (no usable Go module yet); both are reserved names that fail
+  validation.
 - Resharding is gated in code but unverified against a live split.
 - Rebalancing bootstrap uses a forced steal (at-least-once for one shard at
   worker-join); planned sheds and shutdowns are graceful (effectively
