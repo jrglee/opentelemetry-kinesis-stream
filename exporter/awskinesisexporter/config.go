@@ -26,10 +26,47 @@ type Config struct {
 	Compression encoding.Codec `mapstructure:"compression"`
 	// MaxRecordSize caps the post-compression record payload in bytes. The
 	// hard Kinesis ceiling is 1 MiB on the standard API and 5 MiB once raised.
-	// PoC default is 1 MiB; oversize records are dropped with a log line
-	// rather than repacked.
+	// PoC default is 1 MiB; oversize records are repacked per Oversize.Policy.
 	MaxRecordSize int `mapstructure:"max_record_size"`
+	// PartitionKey controls how a record's Kinesis partition key is derived,
+	// which in turn controls shard fan-out and tag-grouped microbatching.
+	PartitionKey PartitionKeyConfig `mapstructure:"partition_key"`
+	// Oversize controls how a batch whose compressed payload exceeds
+	// MaxRecordSize is repacked into one or more fitting records.
+	Oversize OversizeConfig `mapstructure:"oversize"`
 }
+
+// PartitionKeyConfig selects the partition-key strategy. "random" spreads
+// records uniformly across shards; "tag_hash" co-locates records that share
+// the same ordered resource-attribute tuple onto a stable key so a downstream
+// consumer sees them in order and so per-tuple microbatching is possible.
+type PartitionKeyConfig struct {
+	// Strategy is "random" (default) or "tag_hash".
+	Strategy string `mapstructure:"strategy"`
+	// Tags is the ordered list of resource attribute keys hashed into the
+	// partition key. Required and non-empty when Strategy is "tag_hash".
+	Tags []string `mapstructure:"tags"`
+	// Hash names the hash function for "tag_hash"; only "xxhash" (default).
+	Hash string `mapstructure:"hash"`
+}
+
+// OversizeConfig is the repack policy for a payload that exceeds MaxRecordSize.
+type OversizeConfig struct {
+	// Policy is "split_half" (default), "drop_largest", or "reject".
+	Policy string `mapstructure:"policy"`
+	// MaxAttempts bounds repack recursion so a pathological input cannot loop;
+	// remaining items past the bound are dropped and counted. Default 8.
+	MaxAttempts int `mapstructure:"max_attempts"`
+}
+
+const (
+	partitionStrategyRandom  = "random"
+	partitionStrategyTagHash = "tag_hash"
+	hashXXHash               = "xxhash"
+	oversizeSplitHalf        = "split_half"
+	oversizeDropLargest      = "drop_largest"
+	oversizeReject           = "reject"
+)
 
 // Validate fails fast on configuration shapes the exporter cannot serve.
 func (c *Config) Validate() error {
@@ -48,5 +85,32 @@ func (c *Config) Validate() error {
 	if c.MaxRecordSize <= 0 {
 		return errors.New("max_record_size must be positive")
 	}
+	switch c.PartitionKey.Strategy {
+	case "", partitionStrategyRandom:
+	case partitionStrategyTagHash:
+		if len(c.PartitionKey.Tags) == 0 {
+			return errors.New("partition_key.tags is required for strategy tag_hash")
+		}
+	default:
+		return fmt.Errorf("unknown partition_key.strategy %q", c.PartitionKey.Strategy)
+	}
+	switch c.PartitionKey.Hash {
+	case "", hashXXHash:
+	default:
+		return fmt.Errorf("unknown partition_key.hash %q", c.PartitionKey.Hash)
+	}
+	switch c.Oversize.Policy {
+	case "", oversizeSplitHalf, oversizeDropLargest, oversizeReject:
+	default:
+		return fmt.Errorf("unknown oversize.policy %q", c.Oversize.Policy)
+	}
+	if c.Oversize.MaxAttempts <= 0 {
+		return errors.New("oversize.max_attempts must be positive")
+	}
 	return nil
+}
+
+// tagHash reports whether the resolved strategy is tag_hash.
+func (c *Config) tagHash() bool {
+	return c.PartitionKey.Strategy == partitionStrategyTagHash
 }

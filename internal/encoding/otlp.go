@@ -1,6 +1,8 @@
 package encoding
 
 import (
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 )
@@ -20,4 +22,20 @@ func (otlpProtoTraces) Unmarshal(buf []byte) (ptrace.Traces, error) {
 		return ptrace.Traces{}, err
 	}
 	return req.Traces(), nil
+}
+
+// otlpProtoMetrics is the metrics counterpart of otlpProtoTraces, using the
+// same OTLP protobuf layout so the wire stays consistent across signals.
+type otlpProtoMetrics struct{}
+
+func (otlpProtoMetrics) Marshal(md pmetric.Metrics) ([]byte, error) {
+	return pmetricotlp.NewExportRequestFromMetrics(md).MarshalProto()
+}
+
+func (otlpProtoMetrics) Unmarshal(buf []byte) (pmetric.Metrics, error) {
+	req := pmetricotlp.NewExportRequest()
+	if err := req.UnmarshalProto(buf); err != nil {
+		return pmetric.Metrics{}, err
+	}
+	return req.Metrics(), nil
 }

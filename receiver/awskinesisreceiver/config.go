@@ -56,6 +56,18 @@ type Config struct {
 	// DiscoveryInterval is how often the coordinator re-lists shards and
 	// re-attempts acquisition of unowned leases. Default 30s.
 	DiscoveryInterval time.Duration `mapstructure:"discovery_interval"`
+
+	// DeadLetter controls re-emitting unprocessable records into the pipeline.
+	DeadLetter DeadLetterConfig `mapstructure:"dead_letter"`
+}
+
+// DeadLetterConfig controls dead-letter handling. When enabled, a record that
+// cannot be decompressed or decoded is wrapped (raw bytes + failure metadata)
+// and re-emitted into the receiver's own pipeline — as a span for a traces
+// receiver, a gauge for a metrics receiver — so operators route failures with
+// standard components rather than losing them silently.
+type DeadLetterConfig struct {
+	Enabled bool `mapstructure:"enabled"`
 }
 
 // Validate fails fast on configuration shapes the receiver cannot serve.

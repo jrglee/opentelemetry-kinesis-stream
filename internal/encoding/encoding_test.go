@@ -3,6 +3,7 @@ package encoding
 import (
 	"testing"
 
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
@@ -56,6 +57,52 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMetricsRoundTrip(t *testing.T) {
+	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy}
+	for _, c := range codecs {
+		t.Run(string(c), func(t *testing.T) {
+			enc, err := NewMetricsEncoder(EncodingOTLPProto)
+			if err != nil {
+				t.Fatalf("NewMetricsEncoder: %v", err)
+			}
+			dec, err := NewMetricsDecoder(EncodingOTLPProto)
+			if err != nil {
+				t.Fatalf("NewMetricsDecoder: %v", err)
+			}
+			comp, err := NewCompressor(c)
+			if err != nil {
+				t.Fatalf("NewCompressor: %v", err)
+			}
+
+			in := sampleMetrics()
+			raw, err := enc.Marshal(in)
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			zipped, err := comp.Compress(raw)
+			if err != nil {
+				t.Fatalf("Compress: %v", err)
+			}
+			unzipped, err := comp.Decompress(zipped)
+			if err != nil {
+				t.Fatalf("Decompress: %v", err)
+			}
+			out, err := dec.Unmarshal(unzipped)
+			if err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+
+			if out.DataPointCount() != in.DataPointCount() {
+				t.Fatalf("datapoint count mismatch: got %d want %d", out.DataPointCount(), in.DataPointCount())
+			}
+			gotName := out.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Name()
+			if gotName != "test-metric" {
+				t.Fatalf("metric name mismatch: got %q want %q", gotName, "test-metric")
+			}
+		})
+	}
+}
+
 func TestUnknownEncoding(t *testing.T) {
 	if _, err := NewTracesEncoder("bogus"); err == nil {
 		t.Fatal("expected error for unknown encoding")
@@ -75,4 +122,16 @@ func sampleTraces() ptrace.Traces {
 	span.SetTraceID([16]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10})
 	span.SetSpanID([8]byte{0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18})
 	return td
+}
+
+func sampleMetrics() pmetric.Metrics {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "test-service")
+	m := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	m.SetName("test-metric")
+	dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetIntValue(42)
+	dp.Attributes().PutStr("host", "h1")
+	return md
 }

@@ -3,6 +3,7 @@ package encoding
 import (
 	"fmt"
 
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
@@ -46,6 +47,18 @@ type TracesDecoder interface {
 	Unmarshal(buf []byte) (ptrace.Traces, error)
 }
 
+// MetricsEncoder and MetricsDecoder are the metrics counterparts of the traces
+// pair. The same Codec compresses either signal's bytes; only the marshaling
+// differs.
+type MetricsEncoder interface {
+	Marshal(md pmetric.Metrics) ([]byte, error)
+}
+
+// MetricsDecoder is the inverse of MetricsEncoder.
+type MetricsDecoder interface {
+	Unmarshal(buf []byte) (pmetric.Metrics, error)
+}
+
 // Compressor wraps the two compression operations as a pair so call sites can
 // stay symmetric. Implementations are required to be safe for concurrent use.
 type Compressor interface {
@@ -72,6 +85,30 @@ func NewTracesDecoder(e Encoding) (TracesDecoder, error) {
 	switch e {
 	case EncodingOTLPProto:
 		return otlpProtoTraces{}, nil
+	case EncodingOTLPJSON, EncodingOTelArrow:
+		return nil, fmt.Errorf("encoding %q is not implemented in this PoC", e)
+	default:
+		return nil, fmt.Errorf("unknown encoding %q", e)
+	}
+}
+
+// NewMetricsEncoder returns the metrics encoder for the named wire encoding.
+func NewMetricsEncoder(e Encoding) (MetricsEncoder, error) {
+	switch e {
+	case EncodingOTLPProto:
+		return otlpProtoMetrics{}, nil
+	case EncodingOTLPJSON, EncodingOTelArrow:
+		return nil, fmt.Errorf("encoding %q is not implemented in this PoC", e)
+	default:
+		return nil, fmt.Errorf("unknown encoding %q", e)
+	}
+}
+
+// NewMetricsDecoder is the symmetric counterpart of NewMetricsEncoder.
+func NewMetricsDecoder(e Encoding) (MetricsDecoder, error) {
+	switch e {
+	case EncodingOTLPProto:
+		return otlpProtoMetrics{}, nil
 	case EncodingOTLPJSON, EncodingOTelArrow:
 		return nil, fmt.Errorf("encoding %q is not implemented in this PoC", e)
 	default:

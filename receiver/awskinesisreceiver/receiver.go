@@ -17,28 +17,38 @@ import (
 )
 
 // kinesisReceiver is the public component. It owns the lease store and the
-// coordinator goroutine; per-shard polling lives in coordinator/poller.
+// coordinator goroutine; per-shard polling lives in coordinator/poller. The
+// sink is the only signal-specific seam — a traces or metrics receiver differ
+// only in how a decoded payload is delivered and how a dead-letter is wrapped.
 type kinesisReceiver struct {
-	cfg      *Config
-	consumer consumer.Traces
-	logger   *zap.Logger
+	cfg    *Config
+	sink   sink
+	logger *zap.Logger
 
 	coord  *coordinator
 	cancel context.CancelFunc
 }
 
-func newReceiver(cfg *Config, next consumer.Traces, logger *zap.Logger) (*kinesisReceiver, error) {
-	return &kinesisReceiver{cfg: cfg, consumer: next, logger: logger}, nil
+func newTracesReceiver(cfg *Config, next consumer.Traces, logger *zap.Logger) (*kinesisReceiver, error) {
+	dec, err := encoding.NewTracesDecoder(cfg.Encoding)
+	if err != nil {
+		return nil, fmt.Errorf("decoder: %w", err)
+	}
+	return &kinesisReceiver{cfg: cfg, sink: tracesSink{decoder: dec, consumer: next}, logger: logger}, nil
+}
+
+func newMetricsReceiver(cfg *Config, next consumer.Metrics, logger *zap.Logger) (*kinesisReceiver, error) {
+	dec, err := encoding.NewMetricsDecoder(cfg.Encoding)
+	if err != nil {
+		return nil, fmt.Errorf("decoder: %w", err)
+	}
+	return &kinesisReceiver{cfg: cfg, sink: metricsSink{decoder: dec, consumer: next}, logger: logger}, nil
 }
 
 func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
 	client, err := newKinesisClient(ctx, r.cfg.Region, r.cfg.Endpoint)
 	if err != nil {
 		return fmt.Errorf("kinesis client: %w", err)
-	}
-	dec, err := encoding.NewTracesDecoder(r.cfg.Encoding)
-	if err != nil {
-		return fmt.Errorf("decoder: %w", err)
 	}
 	comp, err := encoding.NewCompressor(r.cfg.Compression)
 	if err != nil {
@@ -64,9 +74,8 @@ func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
 		cfg:      r.cfg,
 		client:   client,
 		store:    store,
-		decoder:  dec,
 		comp:     comp,
-		consumer: r.consumer,
+		sink:     r.sink,
 		logger:   r.logger,
 		workerID: workerID,
 		active:   make(map[string]*activePoller),

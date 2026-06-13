@@ -5,36 +5,45 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
-	"github.com/google/uuid"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumererror"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
 )
 
-// kinesisExporter is the traces exporter. Microbatching of records below the
-// 1 MiB limit is deferred to the upstream batchprocessor; this component
-// encodes each ConsumeTraces call into a single Kinesis record. PutRecords
-// is used (rather than PutRecord) so the batch shape is in place when
-// in-exporter batching lands.
+// kinesisExporter exports both traces and metrics. A single type serves either
+// signal: the factory returns it for WithTraces and WithMetrics alike, and the
+// group/compress/oversize/PutRecords pipeline is shared (see record.go), with
+// only pdata marshaling differing per signal (see signal.go). PutRecords is
+// used throughout so tag-grouped microbatches ride one call.
 type kinesisExporter struct {
-	cfg     *Config
-	client  *kinesis.Client
-	encoder encoding.TracesEncoder
-	comp    encoding.Compressor
-	logger  *zap.Logger
+	cfg        *Config
+	client     *kinesis.Client
+	tracesEnc  encoding.TracesEncoder
+	metricsEnc encoding.MetricsEncoder
+	comp       encoding.Compressor
+	logger     *zap.Logger
+	// recordsDropped counts items dropped during oversize repack, tagged by
+	// reason, so silent data loss is observable.
+	recordsDropped metric.Int64Counter
 }
 
-func newExporter(ctx context.Context, cfg *Config, logger *zap.Logger) (*kinesisExporter, error) {
-	enc, err := encoding.NewTracesEncoder(cfg.Encoding)
+func newExporter(ctx context.Context, cfg *Config, set exporter.Settings) (*kinesisExporter, error) {
+	tEnc, err := encoding.NewTracesEncoder(cfg.Encoding)
 	if err != nil {
-		return nil, fmt.Errorf("encoder: %w", err)
+		return nil, fmt.Errorf("traces encoder: %w", err)
+	}
+	mEnc, err := encoding.NewMetricsEncoder(cfg.Encoding)
+	if err != nil {
+		return nil, fmt.Errorf("metrics encoder: %w", err)
 	}
 	comp, err := encoding.NewCompressor(cfg.Compression)
 	if err != nil {
@@ -44,12 +53,22 @@ func newExporter(ctx context.Context, cfg *Config, logger *zap.Logger) (*kinesis
 	if err != nil {
 		return nil, fmt.Errorf("kinesis client: %w", err)
 	}
+	meter := set.MeterProvider.Meter("awskinesisexporter")
+	dropped, err := meter.Int64Counter(
+		"kinesis.exporter.records_dropped",
+		metric.WithDescription("items dropped because no oversize repack could fit them"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("dropped counter: %w", err)
+	}
 	return &kinesisExporter{
-		cfg:     cfg,
-		client:  client,
-		encoder: enc,
-		comp:    comp,
-		logger:  logger,
+		cfg:            cfg,
+		client:         client,
+		tracesEnc:      tEnc,
+		metricsEnc:     mEnc,
+		comp:           comp,
+		logger:         set.Logger,
+		recordsDropped: dropped,
 	}, nil
 }
 
@@ -60,52 +79,11 @@ func (e *kinesisExporter) Capabilities() consumer.Capabilities {
 }
 
 func (e *kinesisExporter) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
-	raw, err := e.encoder.Marshal(td)
-	if err != nil {
-		// Encoding failures are deterministic in the input; retrying is wasted work.
-		return consumererror.NewPermanent(fmt.Errorf("marshal traces: %w", err))
-	}
-	payload, err := e.comp.Compress(raw)
-	if err != nil {
-		return consumererror.NewPermanent(fmt.Errorf("compress payload: %w", err))
-	}
-	if len(payload) > e.cfg.MaxRecordSize {
-		// PoC failure policy: log and continue. Repacking lands later.
-		e.logger.Warn(
-			"dropping oversize kinesis record",
-			zap.Int("payload_bytes", len(payload)),
-			zap.Int("limit_bytes", e.cfg.MaxRecordSize),
-			zap.Int("span_count", td.SpanCount()),
-		)
-		return nil
-	}
-	out, err := e.client.PutRecords(ctx, &kinesis.PutRecordsInput{
-		StreamName: aws.String(e.cfg.StreamName),
-		Records: []types.PutRecordsRequestEntry{{
-			Data:         payload,
-			PartitionKey: aws.String(uuid.NewString()),
-		}},
-	})
-	if err != nil {
-		return classifyPutRecordsError(err)
-	}
-	if out.FailedRecordCount != nil && *out.FailedRecordCount > 0 {
-		// Per-record failures: log with codes and let Collector retry the
-		// whole call. Granular per-record retry is a v1 concern, not PoC.
-		for i, r := range out.Records {
-			if r.ErrorCode == nil {
-				continue
-			}
-			e.logger.Warn(
-				"kinesis record rejected",
-				zap.Int("index", i),
-				zap.String("code", aws.ToString(r.ErrorCode)),
-				zap.String("message", aws.ToString(r.ErrorMessage)),
-			)
-		}
-		return fmt.Errorf("put_records: %d records failed", *out.FailedRecordCount)
-	}
-	return nil
+	return emit(ctx, e, td, tracesCodec(e.tracesEnc))
+}
+
+func (e *kinesisExporter) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) error {
+	return emit(ctx, e, md, metricsCodec(e.metricsEnc))
 }
 
 // classifyPutRecordsError marks errors the Collector's retry helper has no

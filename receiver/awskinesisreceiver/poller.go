@@ -10,8 +10,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
-	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.uber.org/zap"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
@@ -29,13 +27,12 @@ const releaseTimeout = 5 * time.Second
 // poll-loop's Checkpoint with the heartbeat goroutine's Heartbeat so a
 // single in-process writer never races itself either.
 type shardPoller struct {
-	cfg      *Config
-	client   *kinesis.Client
-	store    lease.Store
-	decoder  encoding.TracesDecoder
-	comp     encoding.Compressor
-	consumer consumer.Traces
-	logger   *zap.Logger
+	cfg    *Config
+	client *kinesis.Client
+	store  lease.Store
+	comp   encoding.Compressor
+	sink   sink
+	logger *zap.Logger
 
 	leaseMu sync.Mutex
 	leased  lease.Lease
@@ -275,40 +272,54 @@ func (p *shardPoller) handleRecord(ctx context.Context, rec types.Record) record
 			zap.String("seq", aws.ToString(rec.SequenceNumber)),
 			zap.Error(err),
 		)
+		p.maybeDeadLetter(ctx, rec, "decompress")
 		return recordSkip
 	}
-	td, err := p.decoder.Unmarshal(raw)
-	if err != nil {
+	// The sink performs the only signal-specific work: decode + deliver. It
+	// reports a decode failure so the unprocessable bytes can be dead-lettered;
+	// a transient consume failure becomes recordRetry so the checkpoint does
+	// not advance past valid telemetry the downstream merely rejected.
+	result, decodeFailed := p.sink.consume(ctx, raw)
+	switch {
+	case decodeFailed:
 		p.logger.Warn(
 			"decode failed; skipping record",
 			zap.String("shard", p.shardID()),
 			zap.String("seq", aws.ToString(rec.SequenceNumber)),
-			zap.Error(err),
 		)
-		return recordSkip
-	}
-	if err := p.consumer.ConsumeTraces(ctx, td); err != nil {
-		// A permanent error means the data is rejected for good — skip it. A
-		// transient error (backpressure, downstream restart) must be retried,
-		// or valid telemetry is silently lost.
-		if consumererror.IsPermanent(err) {
-			p.logger.Warn(
-				"consume_traces permanently rejected; skipping record",
-				zap.String("shard", p.shardID()),
-				zap.String("seq", aws.ToString(rec.SequenceNumber)),
-				zap.Error(err),
-			)
-			return recordSkip
-		}
+		p.maybeDeadLetter(ctx, rec, "decode")
+	case result == recordRetry:
 		p.logger.Warn(
-			"consume_traces failed; will retry record",
+			"consume failed; will retry record",
+			zap.String("shard", p.shardID()),
+			zap.String("seq", aws.ToString(rec.SequenceNumber)),
+		)
+	case result == recordSkip:
+		p.logger.Warn(
+			"consume permanently rejected; skipping record",
+			zap.String("shard", p.shardID()),
+			zap.String("seq", aws.ToString(rec.SequenceNumber)),
+		)
+	}
+	return result
+}
+
+// maybeDeadLetter re-emits an unprocessable raw record into the pipeline when
+// dead-lettering is enabled, so the bytes are observable rather than silently
+// dropped. Emit failures are logged and ignored — the record is already being
+// skipped.
+func (p *shardPoller) maybeDeadLetter(ctx context.Context, rec types.Record, failureClass string) {
+	if !p.cfg.DeadLetter.Enabled {
+		return
+	}
+	if err := p.sink.deadLetter(ctx, rec, failureClass, string(p.cfg.Encoding), string(p.cfg.Compression)); err != nil {
+		p.logger.Warn(
+			"dead-letter emit failed",
 			zap.String("shard", p.shardID()),
 			zap.String("seq", aws.ToString(rec.SequenceNumber)),
 			zap.Error(err),
 		)
-		return recordRetry
 	}
-	return recordOK
 }
 
 func (p *shardPoller) heartbeat(ctx context.Context) error {

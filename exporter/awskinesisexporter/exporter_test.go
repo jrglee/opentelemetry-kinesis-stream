@@ -11,6 +11,7 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	noopmetric "go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
@@ -50,16 +51,28 @@ func injectFake(r fakeResult) func(*kinesis.Options) {
 
 func newTestExporter(t *testing.T, maxRecordSize int, inject func(*kinesis.Options)) *kinesisExporter {
 	t.Helper()
-	cfg := &Config{
+	return newTestExporterCfg(t, &Config{
 		StreamName:    "test-stream",
 		Region:        "us-east-1",
 		Encoding:      encoding.EncodingOTLPProto,
 		Compression:   encoding.CodecNone,
 		MaxRecordSize: maxRecordSize,
-	}
-	enc, err := encoding.NewTracesEncoder(cfg.Encoding)
+		PartitionKey:  PartitionKeyConfig{Strategy: partitionStrategyRandom, Hash: hashXXHash},
+		Oversize:      OversizeConfig{Policy: oversizeSplitHalf, MaxAttempts: 8},
+	}, inject)
+}
+
+// newTestExporterCfg builds an exporter wired to a Smithy-faked Kinesis client
+// for an arbitrary config, with no-op logging/metering so tests stay hermetic.
+func newTestExporterCfg(t *testing.T, cfg *Config, inject func(*kinesis.Options)) *kinesisExporter {
+	t.Helper()
+	tEnc, err := encoding.NewTracesEncoder(cfg.Encoding)
 	if err != nil {
-		t.Fatalf("encoder: %v", err)
+		t.Fatalf("traces encoder: %v", err)
+	}
+	mEnc, err := encoding.NewMetricsEncoder(cfg.Encoding)
+	if err != nil {
+		t.Fatalf("metrics encoder: %v", err)
 	}
 	comp, err := encoding.NewCompressor(cfg.Compression)
 	if err != nil {
@@ -71,12 +84,18 @@ func newTestExporter(t *testing.T, maxRecordSize int, inject func(*kinesis.Optio
 		Region:      cfg.Region,
 		Credentials: aws.AnonymousCredentials{},
 	}, inject)
+	dropped, err := noopmetric.NewMeterProvider().Meter("test").Int64Counter("dropped")
+	if err != nil {
+		t.Fatalf("counter: %v", err)
+	}
 	return &kinesisExporter{
-		cfg:     cfg,
-		client:  client,
-		encoder: enc,
-		comp:    comp,
-		logger:  zap.NewNop(),
+		cfg:            cfg,
+		client:         client,
+		tracesEnc:      tEnc,
+		metricsEnc:     mEnc,
+		comp:           comp,
+		logger:         zap.NewNop(),
+		recordsDropped: dropped,
 	}
 }
 
@@ -165,7 +184,9 @@ func TestConsumeTraces(t *testing.T) {
 			expectHits: 1,
 		},
 		{
-			name:          "oversize record is dropped without calling kinesis",
+			// A single span cannot be split, so split_half drops the atomic
+			// leaf without ever calling Kinesis.
+			name:          "oversize single span is dropped without calling kinesis",
 			maxRecordSize: 16,
 			result: func(hits *atomic.Int32) fakeResult {
 				return fakeResult{hits: hits}

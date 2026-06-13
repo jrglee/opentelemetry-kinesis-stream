@@ -10,7 +10,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
-	"go.opentelemetry.io/collector/consumer"
 	"go.uber.org/zap"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
@@ -29,9 +28,8 @@ type coordinator struct {
 	cfg      *Config
 	client   *kinesis.Client
 	store    lease.Store
-	decoder  encoding.TracesDecoder
 	comp     encoding.Compressor
-	consumer consumer.Traces
+	sink     sink
 	logger   *zap.Logger
 	workerID string
 
@@ -276,15 +274,14 @@ func (c *coordinator) startPoller(_ context.Context, l lease.Lease) {
 	// can stop discovery and let pollers drain rather than aborting them.
 	pollerCtx, cancel := context.WithCancel(c.baseCtx)
 	p := &shardPoller{
-		cfg:      c.cfg,
-		client:   c.client,
-		store:    c.store,
-		decoder:  c.decoder,
-		comp:     c.comp,
-		consumer: c.consumer,
-		logger:   c.logger,
-		leased:   l,
-		drainCh:  make(chan struct{}),
+		cfg:     c.cfg,
+		client:  c.client,
+		store:   c.store,
+		comp:    c.comp,
+		sink:    c.sink,
+		logger:  c.logger,
+		leased:  l,
+		drainCh: make(chan struct{}),
 	}
 	ap := &activePoller{cancel: cancel, drain: p.drain}
 
