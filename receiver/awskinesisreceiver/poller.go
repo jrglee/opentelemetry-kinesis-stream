@@ -128,15 +128,21 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 			if ctx.Err() != nil {
 				return
 			}
-			// Re-open from the persisted checkpoint rather than reusing the
-			// iterator: an ExpiredIteratorException would otherwise make the
-			// loop spin on a dead iterator forever. Other transient errors
-			// (throttling) resume from the same point harmlessly.
-			logger.Warn("get_records failed; re-opening iterator", zap.Error(err))
-			if iter, err = p.openIterator(ctx); err != nil {
-				logger.Error("re-open iterator failed; stopping poller", zap.Error(err))
-				stop()
-				return
+			// Re-open the iterator ONLY for an expired one (iterators live ~5
+			// minutes); reusing it would spin forever. For throttling and other
+			// transient errors, keep the same iterator and back off — calling
+			// GetShardIterator has its own 5 TPS/shard limit, so re-opening under
+			// throttle would add load to an already-throttled shard.
+			var expired *types.ExpiredIteratorException
+			if errors.As(err, &expired) {
+				logger.Warn("shard iterator expired; re-opening from checkpoint", zap.Error(err))
+				if iter, err = p.openIterator(ctx); err != nil {
+					logger.Error("re-open iterator failed; stopping poller", zap.Error(err))
+					stop()
+					return
+				}
+			} else {
+				logger.Warn("get_records failed; backing off", zap.Error(err))
 			}
 			if p.waitOrStop(ctx, pollTick) {
 				return

@@ -84,6 +84,21 @@ func (s *MemoryStore) Release(_ context.Context, lease Lease) error {
 	return err
 }
 
+// Delete implements [Store].
+func (s *MemoryStore) Delete(_ context.Context, shardID string, expectedCounter int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.leases[shardID]
+	if !ok {
+		return nil // already gone — idempotent
+	}
+	if cur.Counter != expectedCounter {
+		return ErrLeaseConflict
+	}
+	delete(s.leases, shardID)
+	return nil
+}
+
 func (s *MemoryStore) conditionalUpdate(expected Lease, mutate func(*Lease)) (Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

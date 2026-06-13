@@ -80,6 +80,7 @@ func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
 		workerID: workerID,
 		active:   make(map[string]*activePoller),
 		observed: make(map[string]observation),
+		absent:   make(map[string]int),
 	}
 
 	bgCtx, cancel := context.WithCancel(context.Background())

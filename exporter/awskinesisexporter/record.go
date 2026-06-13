@@ -164,6 +164,7 @@ func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRec
 		return classifyPutRecordsError(err)
 	}
 	if out.FailedRecordCount != nil && *out.FailedRecordCount > 0 {
+		var throttled, rejected int
 		for i, r := range out.Records {
 			if r.ErrorCode == nil {
 				continue
@@ -174,8 +175,24 @@ func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRec
 				zap.String("code", aws.ToString(r.ErrorCode)),
 				zap.String("message", aws.ToString(r.ErrorMessage)),
 			)
+			if aws.ToString(r.ErrorCode) == "ProvisionedThroughputExceededException" {
+				throttled++
+			} else {
+				rejected++
+			}
 		}
-		return fmt.Errorf("put_records: %d records failed", *out.FailedRecordCount)
+		// A record rejected for a non-throttling reason (e.g. a validation
+		// error) will fail identically on every retry. Drop and count those so
+		// they cannot head-of-line-block the pipeline with an infinite retry.
+		if rejected > 0 {
+			e.recordsDropped.Add(ctx, int64(rejected), metric.WithAttributes(attribute.String("reason", "rejected")))
+		}
+		// Retry only if some failures were throttling — those succeed once the
+		// shard has capacity. Returning an error re-sends the whole batch (the
+		// succeeded records included), which is the accepted at-least-once cost.
+		if throttled > 0 {
+			return fmt.Errorf("put_records: %d records throttled", throttled)
+		}
 	}
 	return nil
 }
