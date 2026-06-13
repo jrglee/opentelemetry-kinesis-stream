@@ -9,7 +9,7 @@ import (
 
 func TestRoundTrip(t *testing.T) {
 	encodings := []Encoding{EncodingOTLPProto, EncodingOTLPJSON}
-	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy}
+	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy, CodecSnappyFramed, CodecZlib, CodecDeflate}
 
 	for _, e := range encodings {
 		for _, c := range codecs {
@@ -59,7 +59,7 @@ func TestRoundTrip(t *testing.T) {
 
 func TestMetricsRoundTrip(t *testing.T) {
 	encodings := []Encoding{EncodingOTLPProto, EncodingOTLPJSON}
-	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy}
+	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy, CodecSnappyFramed, CodecZlib, CodecDeflate}
 	for _, e := range encodings {
 		for _, c := range codecs {
 			name := string(e) + "/" + string(c)

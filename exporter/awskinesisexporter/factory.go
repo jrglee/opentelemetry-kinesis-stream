@@ -26,7 +26,7 @@ func createDefaultConfig() component.Config {
 	return &Config{
 		Encoding:      encoding.EncodingOTLPProto,
 		Compression:   encoding.CodecNone,
-		MaxRecordSize: 1 << 20, // 1 MiB, the standard Kinesis ceiling
+		MaxRecordSize: 1 << 20, // 1 MiB: conservative floor every stream accepts
 		PartitionKey: PartitionKeyConfig{
 			Strategy: partitionStrategyRandom,
 			Hash:     hashXXHash,
@@ -34,6 +34,10 @@ func createDefaultConfig() component.Config {
 		Oversize: OversizeConfig{
 			Policy:      oversizeSplitHalf,
 			MaxAttempts: 8,
+		},
+		PutRecords: PutRecordsConfig{
+			MaxRecords: 500,     // conservative per-call record count
+			MaxBytes:   5 << 20, // 5 MiB: conservative per-call aggregate
 		},
 	}
 }

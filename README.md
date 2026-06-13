@@ -22,10 +22,11 @@ tracked in [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md) and
 The `opentelemetry-collector-contrib` project ships a Kinesis **exporter** but
 no Kinesis Data Streams **receiver** — there is no first-party way to consume
 OTLP telemetry back off a stream. This project closes that gap, and along the
-way lifts ceilings the contrib exporter leaves in place. The biggest is
+way addresses gaps the contrib exporter leaves in place. The biggest is
 **compression**: the contrib exporter does not compress, which is a real limiter
 against Kinesis's per-record size cap — this exporter adds `zstd`/`snappy`/`gzip`
-over OTLP-proto, plus 5 MiB records and deterministic partition keys.
+over OTLP-proto, plus deterministic partition keys. (Record size is configurable
+and defaults to the 1 MiB standard-API ceiling.)
 
 The hard part is not writing to or reading from Kinesis — it is consuming a
 sharded, resharding stream correctly across multiple collector replicas without
@@ -56,7 +57,8 @@ and consequences. The overall architecture lives in [`DESIGN.md`](DESIGN.md).
   marshaling differs per signal.
   [ADR-0011](docs/adr/0011-metrics-signal-via-sink-seam.md).
 - **Pluggable wire encoding and compression.** Encoding (`otlp_proto`,
-  `otlp_json`) and codec (`none`/`gzip`/`zstd`/`snappy`) are config, with a
+  `otlp_json`) and codec (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`,
+  mirroring the collector's set) are config, with a
   headerless wire contract that lets exporter and receiver agree. Compressed
   OTLP-proto is the recommended path and the contrib-gap closer; `otel_arrow` is
   the next encoding to land.

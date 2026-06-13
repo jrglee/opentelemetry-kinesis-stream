@@ -280,13 +280,15 @@ a stable key (see [Tag-grouped microbatching](#tag-grouped-microbatching)).
 | `region`                  | string | —            | yes      | AWS region of the stream. |
 | `endpoint`                | string | (SDK default)| no       | Override the AWS endpoint URL. Set this for emulators (e.g. `http://ministack:4566`). |
 | `encoding`                | string | `otlp_proto` | no       | Wire format: `otlp_proto` (compact, recommended) or `otlp_json` (interoperable/debuggable). `otel_arrow` is the next encoding to land and is rejected at validation until then — see [Encodings](#encodings). |
-| `compression`             | string | `none`       | no       | Payload codec. One of `none`, `gzip`, `zstd`, `snappy`. See [Choosing compression](#choosing-compression). |
+| `compression`             | string | `none`       | no       | Payload codec: `none`, `gzip`, `zstd`, `snappy`, `x-snappy-framed`, `zlib`, or `deflate` (the collector's full set). See [Choosing compression](#choosing-compression). |
 | `partition_key.strategy`  | string | `random`     | no       | `random` (one key per record, spreads across shards) or `tag_hash` (stable key per resource-attribute tuple, co-locates by tag and groups the batch). |
 | `partition_key.tags`      | list   | —            | if tag_hash | Ordered list of resource attribute keys forming the tag tuple. Records sharing a tuple get the same key and land on the same shard. |
 | `partition_key.hash`      | string | `xxhash`     | no       | Hash function for the partition key. Only `xxhash` is implemented. |
 | `oversize.policy`         | string | `split_half` | no       | What to do when a record still exceeds `max_record_size` after compression. `split_half` repacks by halving, `drop_largest` drops the biggest item, `reject` fails the batch. See [Oversize records](#oversize-records). |
 | `oversize.max_attempts`   | int    | `8`          | no       | Maximum repack rounds before giving up under `split_half`. |
-| `max_record_size`         | int    | `1048576`    | no       | Post-compression byte ceiling per record. A larger payload is repacked per `oversize.policy`. The Kinesis hard limit is 1 MiB on the standard API. |
+| `max_record_size`         | int    | `1048576`    | no       | Post-compression byte ceiling per record; a larger payload is repacked per `oversize.policy`. An **operator-owned limit** the exporter enforces verbatim — it does not track the stream's actual ceiling, which varies by account/region/stream config. The default (1 MiB) is the conservative floor every stream accepts; raise it if your stream is configured for larger records. |
+| `put_records.max_records` | int    | `500`        | no       | Maximum records per `PutRecords` call. Operator-owned limit; raise to match a stream configured for larger requests. |
+| `put_records.max_bytes`   | int    | `5242880`    | no       | Maximum aggregate record-data bytes per `PutRecords` call (default 5 MiB). Operator-owned limit; must be ≥ `max_record_size`. |
 
 Credentials come from the standard AWS SDK chain (environment, shared config,
 or IAM role). For an emulator, set dummy credentials via environment.
@@ -363,10 +365,18 @@ dropped-or-split records. The codec must be matched by the receiver's
 
 | Codec    | When to reach for it |
 |----------|----------------------|
-| `zstd`   | Best ratio-per-CPU for most workloads. The default recommendation when you want smaller records without paying much latency. |
-| `snappy` | Cheapest CPU and lowest latency. Use when the collector is CPU-bound or you care about per-record latency more than stream cost. |
-| `gzip`   | Broadest compatibility. Reach for it when something downstream of the stream expects gzip, or for parity with existing tooling. |
-| `none`   | No CPU spent compressing. Use for already-compact payloads, or when you would rather buy shards than CPU. |
+| `zstd`            | Best ratio-per-CPU for most workloads. The default recommendation when you want smaller records without paying much latency. |
+| `snappy`          | Cheapest CPU and lowest latency (Snappy block format). Use when the collector is CPU-bound or you care about per-record latency more than stream cost. |
+| `x-snappy-framed` | Snappy stream/framing format. Same trade-off as `snappy`; use it when the other end speaks framed Snappy. |
+| `gzip`            | Broadest compatibility. Reach for it when something downstream of the stream expects gzip, or for parity with existing tooling. |
+| `zlib`            | RFC 1950 zlib — gzip-class ratio with a smaller header; for parity with consumers that expect zlib. |
+| `deflate`         | Raw RFC 1951 DEFLATE stream; for parity with consumers that expect bare deflate. |
+| `none`            | No CPU spent compressing. Use for already-compact payloads, or when you would rather buy shards than CPU. |
+
+The full set mirrors the OpenTelemetry Collector's own compression codecs, so a
+consumer built on standard collector components can always match what this
+exporter writes. `zstd`, `snappy`/`x-snappy-framed`, and `gzip` are the ones
+worth reaching for; `zlib` and `deflate` exist for compatibility.
 
 Rule of thumb: start with `zstd`. Drop to `snappy` if compression CPU shows up
 in profiles; choose `gzip` only for compatibility; choose `none` only when the
@@ -388,6 +398,10 @@ Use it when a downstream consumer benefits from all data for, say, one service
 or region arriving on one shard in order. The trade-off is distribution: if one
 tuple dominates traffic, its shard runs hot. Pick tag keys with enough
 cardinality to spread load but enough coarseness to keep locality useful.
+
+Note that tag→shard locality is **not stable across a reshard**: Kinesis maps the
+partition key onto hash-key ranges, and a split or merge changes those ranges, so
+a given tag tuple can land on a different shard after resharding.
 
 ```yaml
 exporters:
@@ -421,8 +435,9 @@ sequenceDiagram
 
 ### Oversize records
 
-After compression a record may still exceed `max_record_size` (the Kinesis hard
-limit is 1 MiB). `oversize.policy` decides what happens:
+After compression a record may still exceed `max_record_size` (an operator knob;
+set it within whatever ceiling your stream and account actually allow).
+`oversize.policy` decides what happens:
 
 - **`split_half`** (default) repacks the record: it recursively halves the
   resource list, then halves the leaf items within a resource, until each piece

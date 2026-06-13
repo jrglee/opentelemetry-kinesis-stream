@@ -24,9 +24,12 @@ type Config struct {
 	Encoding encoding.Encoding `mapstructure:"encoding"`
 	// Compression is the wire-level codec applied to the marshaled payload.
 	Compression encoding.Codec `mapstructure:"compression"`
-	// MaxRecordSize caps the post-compression record payload in bytes. The
-	// hard Kinesis ceiling is 1 MiB on the standard API and 5 MiB once raised.
-	// PoC default is 1 MiB; oversize records are repacked per Oversize.Policy.
+	// MaxRecordSize caps the post-compression record payload in bytes; oversize
+	// records are repacked per Oversize.Policy. This is an operator-owned limit:
+	// the exporter enforces the value you set and asserts nothing about the
+	// stream's actual ceiling, which varies by account, region, and stream
+	// configuration. The default (1 MiB) is the conservative floor that every
+	// stream accepts; raise it if your stream is configured for larger records.
 	MaxRecordSize int `mapstructure:"max_record_size"`
 	// PartitionKey controls how a record's Kinesis partition key is derived,
 	// which in turn controls shard fan-out and tag-grouped microbatching.
@@ -34,6 +37,22 @@ type Config struct {
 	// Oversize controls how a batch whose compressed payload exceeds
 	// MaxRecordSize is repacked into one or more fitting records.
 	Oversize OversizeConfig `mapstructure:"oversize"`
+	// PutRecords caps each PutRecords call. Like MaxRecordSize, these are
+	// operator-owned limits the exporter enforces verbatim — it does not track
+	// AWS's current per-call ceilings, which change over time and differ by
+	// environment.
+	PutRecords PutRecordsConfig `mapstructure:"put_records"`
+}
+
+// PutRecordsConfig bounds a single PutRecords call. The exporter chunks a flush
+// so no call exceeds either limit. Defaults are the conservative values every
+// Kinesis stream has historically accepted; raise them to match a stream
+// configured for larger requests.
+type PutRecordsConfig struct {
+	// MaxRecords is the maximum number of records per PutRecords call.
+	MaxRecords int `mapstructure:"max_records"`
+	// MaxBytes is the maximum aggregate record-data bytes per PutRecords call.
+	MaxBytes int `mapstructure:"max_bytes"`
 }
 
 // PartitionKeyConfig selects the partition-key strategy. "random" spreads
@@ -84,6 +103,15 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxRecordSize <= 0 {
 		return errors.New("max_record_size must be positive")
+	}
+	if c.PutRecords.MaxRecords <= 0 {
+		return errors.New("put_records.max_records must be positive")
+	}
+	if c.PutRecords.MaxBytes <= 0 {
+		return errors.New("put_records.max_bytes must be positive")
+	}
+	if c.MaxRecordSize > c.PutRecords.MaxBytes {
+		return errors.New("max_record_size must not exceed put_records.max_bytes")
 	}
 	switch c.PartitionKey.Strategy {
 	case "", partitionStrategyRandom:

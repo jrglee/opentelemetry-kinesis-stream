@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
@@ -62,10 +63,26 @@ func newTestExporter(t *testing.T, maxRecordSize int, inject func(*kinesis.Optio
 	}, inject)
 }
 
+// withFastBackoff shrinks the PutRecords retry backoff to near-zero for the
+// duration of a test and returns a restore func to defer.
+func withFastBackoff() func() {
+	prevBase, prevMax := putBackoffBase, putBackoffMax
+	putBackoffBase, putBackoffMax = time.Microsecond, time.Microsecond
+	return func() { putBackoffBase, putBackoffMax = prevBase, prevMax }
+}
+
 // newTestExporterCfg builds an exporter wired to a Smithy-faked Kinesis client
 // for an arbitrary config, with no-op logging/metering so tests stay hermetic.
 func newTestExporterCfg(t *testing.T, cfg *Config, inject func(*kinesis.Options)) *kinesisExporter {
 	t.Helper()
+	// Backfill the per-call limits the factory would default, so tests need not
+	// set them and flush always makes progress.
+	if cfg.PutRecords.MaxRecords == 0 {
+		cfg.PutRecords.MaxRecords = 500
+	}
+	if cfg.PutRecords.MaxBytes == 0 {
+		cfg.PutRecords.MaxBytes = 5 << 20
+	}
 	tEnc, err := encoding.NewTracesEncoder(cfg.Encoding)
 	if err != nil {
 		t.Fatalf("traces encoder: %v", err)
@@ -100,6 +117,9 @@ func newTestExporterCfg(t *testing.T, cfg *Config, inject func(*kinesis.Options)
 }
 
 func TestConsumeTraces(t *testing.T) {
+	// Keep the in-place retry backoff negligible so retryable cases stay fast.
+	defer withFastBackoff()()
+
 	tests := []struct {
 		name          string
 		maxRecordSize int
@@ -142,7 +162,7 @@ func TestConsumeTraces(t *testing.T) {
 			},
 			expectErr:  true,
 			expectPerm: false,
-			expectHits: 1,
+			expectHits: maxPutAttempts, // throttled subset retried in place, then surfaced as retryable
 		},
 		{
 			name:          "ResourceNotFoundException is permanent",

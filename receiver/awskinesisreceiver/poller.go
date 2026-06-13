@@ -20,6 +20,19 @@ import (
 // store call cannot block the collector's graceful shutdown deadline.
 const releaseTimeout = 5 * time.Second
 
+// When the downstream consumer keeps rejecting the head record (recordRetry),
+// the poll loop re-reads the same checkpoint without advancing. Rather than
+// hammer GetRecords/GetShardIterator at PollInterval (which risks the 5 TPS/
+// shard limit and offers no relief), consecutive no-progress passes back off
+// exponentially from PollInterval up to stuckBackoffMax, and a warning is
+// surfaced after stuckWarnAfter passes so a wedged shard is observable. The
+// lease is intentionally still held and the records are never dropped — at-
+// least-once is preserved; this only changes the cadence and visibility.
+const (
+	stuckBackoffMax = 30 * time.Second
+	stuckWarnAfter  = 5
+)
+
 // shardPoller runs the GetRecords loop for one shard while holding its lease.
 // It owns Heartbeat and Checkpoint writes for the lease; the coordinator
 // owns Acquire. The split of write responsibility keeps the lease's Counter
@@ -106,6 +119,7 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 	}
 	pollTick := time.NewTicker(p.cfg.PollInterval)
 	defer pollTick.Stop()
+	stuckPasses := 0
 
 	for {
 		if ctx.Err() != nil {
@@ -195,18 +209,35 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 			logger.Debug("checkpoint advanced", zap.String("seq", advanceSeq))
 		}
 		if retry {
-			// Re-read from the just-advanced checkpoint after a short pause so
-			// the rejected record (and the rest of the batch) is retried.
+			// Re-read from the just-advanced checkpoint so the rejected record
+			// (and the rest of the batch) is retried. If the good prefix
+			// advanced this pass that is forward progress; only a pass that
+			// checkpointed nothing counts as "stuck" and earns a longer backoff.
+			if advanceSeq != "" {
+				stuckPasses = 0
+			} else {
+				stuckPasses++
+			}
 			if iter, err = p.openIterator(ctx); err != nil {
 				logger.Error("re-open iterator failed; stopping poller", zap.Error(err))
 				stop()
 				return
 			}
-			if p.waitOrStop(ctx, pollTick) {
+			delay := p.stuckBackoff(stuckPasses)
+			if stuckPasses == stuckWarnAfter {
+				logger.Warn(
+					"shard not advancing; downstream keeps rejecting the head record — backing off (lease still held, no data dropped)",
+					zap.Int("consecutive_stuck_passes", stuckPasses),
+					zap.Duration("backoff", delay),
+				)
+			}
+			if p.waitDurationOrStop(ctx, delay) {
 				return
 			}
 			continue
 		}
+		// Forward progress (or an empty poll): clear the stuck counter.
+		stuckPasses = 0
 		iter = out.NextShardIterator
 
 		if len(out.Records) == 0 {
@@ -229,6 +260,39 @@ func (p *shardPoller) waitOrStop(ctx context.Context, tick *time.Ticker) bool {
 	case <-tick.C:
 		return false
 	}
+}
+
+// waitDurationOrStop is waitOrStop for an arbitrary backoff delay rather than
+// the fixed poll ticker. Returns true if the caller should stop.
+func (p *shardPoller) waitDurationOrStop(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return true
+	case <-p.drainCh:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// stuckBackoff grows the re-read delay exponentially from PollInterval (passes
+// <= 1) up to stuckBackoffMax, so a poll loop wedged on a rejecting downstream
+// stops hammering the Kinesis read path.
+func (p *shardPoller) stuckBackoff(passes int) time.Duration {
+	if passes <= 1 {
+		return p.cfg.PollInterval
+	}
+	shift := passes - 1
+	if shift > 16 {
+		shift = 16 // guard against overflow on a pathologically long stall
+	}
+	d := p.cfg.PollInterval << shift
+	if d <= 0 || d > stuckBackoffMax {
+		return stuckBackoffMax
+	}
+	return d
 }
 
 // openIterator picks the right ShardIteratorType based on the lease's

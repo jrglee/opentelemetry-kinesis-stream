@@ -18,9 +18,12 @@ func TestCodecConcurrent(t *testing.T) {
 	)
 
 	codecs := map[Codec]Compressor{
-		CodecGzip:   gzipCodec{},
-		CodecZstd:   zstdCodec{},
-		CodecSnappy: snappyCodec{},
+		CodecGzip:         gzipCodec{},
+		CodecZstd:         zstdCodec{},
+		CodecSnappy:       snappyCodec{},
+		CodecSnappyFramed: snappyFramedCodec{},
+		CodecZlib:         zlibCodec{},
+		CodecDeflate:      deflateCodec{},
 	}
 
 	// Mixed-entropy deterministic payload. A constant byte would compress

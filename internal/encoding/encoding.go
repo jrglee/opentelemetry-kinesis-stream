@@ -20,6 +20,13 @@ const (
 	CodecZstd Codec = "zstd"
 	// CodecSnappy is the Snappy block format.
 	CodecSnappy Codec = "snappy"
+	// CodecSnappyFramed is the Snappy stream (framing) format, matching the
+	// collector's "x-snappy-framed".
+	CodecSnappyFramed Codec = "x-snappy-framed"
+	// CodecZlib is RFC 1950 zlib.
+	CodecZlib Codec = "zlib"
+	// CodecDeflate is the raw RFC 1951 DEFLATE stream.
+	CodecDeflate Codec = "deflate"
 )
 
 // Encoding names the wire-level marshaling format of the telemetry payload
@@ -145,6 +152,12 @@ func NewCompressor(c Codec) (Compressor, error) {
 		return zstdCodec{}, nil
 	case CodecSnappy:
 		return snappyCodec{}, nil
+	case CodecSnappyFramed:
+		return snappyFramedCodec{}, nil
+	case CodecZlib:
+		return zlibCodec{}, nil
+	case CodecDeflate:
+		return deflateCodec{}, nil
 	default:
 		return nil, fmt.Errorf("unknown codec %q", c)
 	}
