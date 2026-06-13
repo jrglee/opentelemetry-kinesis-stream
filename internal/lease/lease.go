@@ -86,4 +86,11 @@ type Store interface {
 	// Release relinquishes ownership voluntarily (graceful shutdown).
 	// Conditional on owner+counter. Owner is cleared; Counter is bumped.
 	Release(ctx context.Context, lease Lease) error
+
+	// Delete removes a lease row, conditional on expectedCounter so an
+	// actively-changing lease is never deleted out from under its owner.
+	// Deleting an absent row is a no-op (nil), so cleanup is idempotent.
+	// Returns ErrLeaseConflict if the row's Counter has moved on. Used to
+	// garbage-collect leases for shards Kinesis has trimmed past retention.
+	Delete(ctx context.Context, shardID string, expectedCounter int64) error
 }

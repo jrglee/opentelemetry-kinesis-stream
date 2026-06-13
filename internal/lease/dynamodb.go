@@ -150,6 +150,38 @@ func (s *DynamoDBStore) Release(ctx context.Context, lease Lease) error {
 	return err
 }
 
+// Delete removes a lease row conditional on its Counter. Deleting an absent
+// row succeeds (idempotent); a counter mismatch — the lease changed since the
+// caller observed it — is ErrLeaseConflict so an active lease is never
+// garbage-collected.
+func (s *DynamoDBStore) Delete(ctx context.Context, shardID string, expectedCounter int64) error {
+	cond := expression.Name(attrLeaseCounter).Equal(expression.Value(expectedCounter))
+	expr, err := expression.NewBuilder().WithCondition(cond).Build()
+	if err != nil {
+		return err
+	}
+	_, err = s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName:                 aws.String(s.table),
+		Key:                       leaseKey(shardID),
+		ConditionExpression:       expr.Condition(),
+		ExpressionAttributeNames:  expr.Names(),
+		ExpressionAttributeValues: expr.Values(),
+	})
+	if isConditionalCheckFailed(err) {
+		// The condition fails either because the row is gone (already deleted —
+		// success) or because the counter moved on (a real conflict).
+		exists, gerr := s.rowExists(ctx, shardID)
+		if gerr != nil {
+			return gerr
+		}
+		if !exists {
+			return nil
+		}
+		return ErrLeaseConflict
+	}
+	return err
+}
+
 // ownerCounterCondition is the fencing predicate shared by Heartbeat,
 // Checkpoint, and Release: the caller must still be the owner *and* hold
 // the latest Counter.

@@ -42,6 +42,10 @@ type coordinator struct {
 	mu       sync.Mutex
 	active   map[string]*activePoller
 	observed map[string]observation
+	// liveShards is the shard-id set from the most recent successful
+	// ListShards. nil until the first discovery succeeds. Used to garbage-
+	// collect leases for shards Kinesis has trimmed past retention.
+	liveShards map[string]bool
 
 	wg sync.WaitGroup
 }
@@ -113,13 +117,14 @@ func (c *coordinator) run(ctx context.Context) {
 	}
 }
 
-// discoverShards enumerates the stream's shards and ensures a lease row
-// exists for each. Idempotent.
+// discoverShards enumerates the stream's shards, ensures a lease row exists for
+// each, and records the live shard-id set (for orphan cleanup). Idempotent.
 func (c *coordinator) discoverShards(ctx context.Context) error {
 	shards, err := c.listShards(ctx)
 	if err != nil {
 		return err
 	}
+	live := make(map[string]bool, len(shards))
 	for _, s := range shards {
 		var parents []string
 		if pid := aws.ToString(s.ParentShardId); pid != "" {
@@ -128,10 +133,15 @@ func (c *coordinator) discoverShards(ctx context.Context) error {
 		if pid := aws.ToString(s.AdjacentParentShardId); pid != "" {
 			parents = append(parents, pid)
 		}
-		if err := c.store.Ensure(ctx, aws.ToString(s.ShardId), parents); err != nil {
+		shardID := aws.ToString(s.ShardId)
+		live[shardID] = true
+		if err := c.store.Ensure(ctx, shardID, parents); err != nil {
 			return err
 		}
 	}
+	c.mu.Lock()
+	c.liveShards = live
+	c.mu.Unlock()
 	return nil
 }
 
@@ -164,7 +174,7 @@ func (c *coordinator) listShards(ctx context.Context) ([]types.Shard, error) {
 }
 
 // reconcile is the fair-share rebalancing pass. It snapshots the lease table,
-// computes this worker's target share via planRebalance, and executes the
+// computes this worker's target share via lease.Plan, and executes the
 // resulting acquire / release / steal actions. Every replica runs the same
 // computation against the same snapshot, so they converge without a leader.
 func (c *coordinator) reconcile(ctx context.Context) {
@@ -196,23 +206,76 @@ func (c *coordinator) reconcile(ctx context.Context) {
 		byID[l.ShardID] = l
 	}
 
-	plan := planRebalance(rebalanceInput{
-		leases:  leases,
-		self:    c.workerID,
-		fresh:   fresh,
-		drained: drained,
-		owned:   owned,
+	// lease.Plan is the KCL LeaseTaker step: pure fair-share decision over the
+	// snapshot, identical on every replica so they converge leaderlessly.
+	plan := lease.Plan(lease.PlanInput{
+		Leases:  leases,
+		Self:    c.workerID,
+		Fresh:   fresh,
+		Drained: drained,
+		Owned:   owned,
 	})
 
-	for _, shardID := range plan.release {
+	for _, shardID := range plan.Release {
 		c.releasePoller(shardID)
 	}
-	for _, shardID := range plan.acquire {
+	for _, shardID := range plan.Acquire {
 		c.tryAcquire(ctx, byID[shardID])
 	}
-	if plan.steal != "" {
-		c.logger.Info("stealing shard to rebalance", zap.String("shard", plan.steal))
-		c.tryAcquire(ctx, byID[plan.steal])
+	if plan.Steal != "" {
+		c.logger.Info("stealing shard to rebalance", zap.String("shard", plan.Steal))
+		c.tryAcquire(ctx, byID[plan.Steal])
+	}
+
+	c.cleanupOrphans(ctx, leases)
+}
+
+// cleanupOrphans garbage-collects leases whose shard Kinesis has trimmed past
+// retention, so the lease table does not accumulate dead SHARD_END parent rows
+// over a stream's resharding history. This is the KCL LeaseCleanupManager role,
+// keyed on shard liveness: a lease may only be deleted once its shard is gone
+// from ListShards, because Kinesis lists closed parent shards until they are
+// trimmed, and deleting a still-listed lease would re-Ensure (and re-read) it
+// on the next discovery pass.
+//
+// Guards: cleanup runs only after a successful discovery (liveShards non-nil
+// and non-empty — an empty set is treated as a failed/partial discovery and
+// skipped), never deletes a shard this worker is actively polling, and never
+// deletes a shard held by a fresh owner. The conditional Delete fences on the
+// observed counter so a concurrently-revived lease is not removed.
+func (c *coordinator) cleanupOrphans(ctx context.Context, leases []lease.Lease) {
+	c.mu.Lock()
+	live := c.liveShards
+	c.mu.Unlock()
+	if len(live) == 0 {
+		return
+	}
+	for _, l := range leases {
+		if live[l.ShardID] {
+			continue
+		}
+		c.mu.Lock()
+		_, active := c.active[l.ShardID]
+		obs, seen := c.observed[l.ShardID]
+		c.mu.Unlock()
+		if active {
+			continue
+		}
+		// Skip a lease still being heartbeated by some owner: only reap shards
+		// that are both trimmed and quiescent.
+		if l.Owner != "" && seen && obs.counter == l.Counter && time.Since(obs.seenAt) < c.cfg.LeaseDuration {
+			continue
+		}
+		if err := c.store.Delete(ctx, l.ShardID, l.Counter); err != nil {
+			if !errors.Is(err, lease.ErrLeaseConflict) {
+				c.logger.Warn("lease cleanup failed", zap.String("shard", l.ShardID), zap.Error(err))
+			}
+			continue
+		}
+		c.logger.Info("garbage-collected lease for trimmed shard", zap.String("shard", l.ShardID))
+		c.mu.Lock()
+		delete(c.observed, l.ShardID)
+		c.mu.Unlock()
 	}
 }
 
