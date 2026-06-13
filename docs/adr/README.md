@@ -21,6 +21,10 @@ implementing it.
 - [0007 — Hand-written collector binary and docker-compose E2E stack](0007-custom-collector-binary-and-e2e-stack.md)
 - [0008 — Leaderless fair-share shard rebalancing](0008-leaderless-fair-share-rebalancing.md)
 - [0009 — Graceful lease handoff and shutdown drain](0009-graceful-lease-handoff-and-shutdown.md)
+- [0010 — zstd/snappy codecs; OTel-Arrow deferred](0010-codecs-and-deferred-arrow.md)
+- [0011 — Metrics signal via a single signal-agnostic seam](0011-metrics-signal-via-sink-seam.md)
+- [0012 — Tag-hash partition keys, group-by-tag microbatching, oversize repack](0012-tag-grouping-and-oversize-repack.md)
+- [0013 — Dead-letter via pipeline re-emit; exporter observability](0013-dead-letter-via-pipeline-reemit.md)
 
 ## How to add an ADR
 
