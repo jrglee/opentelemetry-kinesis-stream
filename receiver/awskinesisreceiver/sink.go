@@ -10,6 +10,7 @@ import (
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
 )
 
+
 // sink is the only signal-specific seam in the receiver. The lease store,
 // coordinator, and pollers all operate on raw bytes; a sink decodes a
 // decompressed payload into its signal and delivers it downstream, and wraps
@@ -70,4 +71,28 @@ func (s metricsSink) consume(ctx context.Context, payload []byte) (recordResult,
 
 func (s metricsSink) deadLetter(ctx context.Context, rec types.Record, failureClass, encName, codecName string) error {
 	return s.consumer.ConsumeMetrics(ctx, deadLetterMetrics(rec, failureClass, encName, codecName))
+}
+
+// logsSink delivers decoded logs and dead-letters failures as a log record.
+type logsSink struct {
+	decoder  encoding.LogsDecoder
+	consumer consumer.Logs
+}
+
+func (s logsSink) consume(ctx context.Context, payload []byte) (recordResult, bool) {
+	ld, err := s.decoder.Unmarshal(payload)
+	if err != nil {
+		return recordSkip, true
+	}
+	if err := s.consumer.ConsumeLogs(ctx, ld); err != nil {
+		if consumererror.IsPermanent(err) {
+			return recordSkip, false
+		}
+		return recordRetry, false
+	}
+	return recordOK, false
+}
+
+func (s logsSink) deadLetter(ctx context.Context, rec types.Record, failureClass, encName, codecName string) error {
+	return s.consumer.ConsumeLogs(ctx, deadLetterLogs(rec, failureClass, encName, codecName))
 }

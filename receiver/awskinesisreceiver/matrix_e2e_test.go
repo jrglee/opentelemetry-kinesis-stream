@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
@@ -51,6 +52,10 @@ func TestEncodingCodecMatrix(t *testing.T) {
 			t.Run(fmt.Sprintf("metrics/%s/%s", e, c), func(t *testing.T) {
 				t.Parallel()
 				runMetricsMatrixCase(t, e, c, N)
+			})
+			t.Run(fmt.Sprintf("logs/%s/%s", e, c), func(t *testing.T) {
+				t.Parallel()
+				runLogsMatrixCase(t, e, c, N)
 			})
 		}
 	}
@@ -129,6 +134,86 @@ func runTracesMatrixCase(t *testing.T, e encoding.Encoding, c encoding.Codec, n 
 	for i, name := range names {
 		if want := fmt.Sprintf("matrix-%d", i); !strings.HasSuffix(name, want) {
 			t.Fatalf("position %d delivered %q, want %q", i, name, want)
+		}
+	}
+}
+
+func runLogsMatrixCase(t *testing.T, e encoding.Encoding, c encoding.Codec, n int) {
+	t.Helper()
+
+	enc, err := encoding.NewLogsEncoder(e)
+	if err != nil {
+		t.Fatalf("NewLogsEncoder: %v", err)
+	}
+	dec, err := encoding.NewLogsDecoder(e)
+	if err != nil {
+		t.Fatalf("NewLogsDecoder: %v", err)
+	}
+	comp, err := encoding.NewCompressor(c)
+	if err != nil {
+		t.Fatalf("NewCompressor: %v", err)
+	}
+
+	records := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		ld := plog.NewLogs()
+		lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+		lr.Body().SetStr(fmt.Sprintf("l-%d", i))
+		raw, err := enc.Marshal(ld)
+		if err != nil {
+			t.Fatalf("Marshal[%d]: %v", i, err)
+		}
+		zipped, err := comp.Compress(raw)
+		if err != nil {
+			t.Fatalf("Compress[%d]: %v", i, err)
+		}
+		records[i] = zipped
+	}
+
+	fs := &fakeStream{shards: []*fakeShard{{id: "shard-matrix-l", records: records}}}
+
+	lc := &logCollector{}
+	consumeFn, err := consumer.NewLogs(lc.consume)
+	if err != nil {
+		t.Fatalf("consumer.NewLogs: %v", err)
+	}
+
+	cfg := fastCoordCfg("matrix-logs", e, c)
+	coord := newTestCoordinator(t, cfg, fs, logsSink{decoder: dec, consumer: consumeFn}, "matrix-l")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := coord.start(ctx); err != nil {
+		t.Fatalf("coordinator start: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		lc.mu.Lock()
+		got := len(lc.got)
+		lc.mu.Unlock()
+		if got >= n {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	coord.wait()
+
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	if len(lc.got) != n {
+		t.Fatalf("delivered %d log batches, want %d", len(lc.got), n)
+	}
+	counts := make(map[string]int, n)
+	for _, ld := range lc.got {
+		body := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().AsString()
+		counts[body]++
+	}
+	for i := 0; i < n; i++ {
+		want := fmt.Sprintf("l-%d", i)
+		if counts[want] != 1 {
+			t.Fatalf("log %q delivered %d times, want 1", want, counts[want])
 		}
 	}
 }
