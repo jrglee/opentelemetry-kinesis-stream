@@ -1,6 +1,8 @@
 package encoding
 
 import (
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -38,4 +40,20 @@ func (otlpJSONMetrics) Unmarshal(buf []byte) (pmetric.Metrics, error) {
 		return pmetric.Metrics{}, err
 	}
 	return req.Metrics(), nil
+}
+
+// otlpJSONLogs is the logs counterpart of otlpJSONTraces, using the same
+// OTLP JSON layout so the wire stays consistent across signals.
+type otlpJSONLogs struct{}
+
+func (otlpJSONLogs) Marshal(ld plog.Logs) ([]byte, error) {
+	return plogotlp.NewExportRequestFromLogs(ld).MarshalJSON()
+}
+
+func (otlpJSONLogs) Unmarshal(buf []byte) (plog.Logs, error) {
+	req := plogotlp.NewExportRequest()
+	if err := req.UnmarshalJSON(buf); err != nil {
+		return plog.Logs{}, err
+	}
+	return req.Logs(), nil
 }
