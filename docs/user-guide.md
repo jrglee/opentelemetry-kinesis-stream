@@ -1066,13 +1066,11 @@ make perf | tee perf.txt
 
 Compare two runs (different hosts, different commits) with [`benchstat`].
 
-A captured run of the harness — including every (encoding × codec × profile
-× batch size) cell with p50/p90/min/max/mean per call — lives at
-[`benchmark.md`](../benchmark.md). It includes the now-removed `otel_arrow`
-encoding alongside `otlp_proto` and `otlp_json`; the numbers (paired with
-[ADR-0020](adr/0020-remove-otel-arrow-encoding.md)) are why Arrow was cut.
-The byte sizes and ratios reproduce exactly on any host; wall-clock numbers
-scale to your CPU.
+A captured run of the harness — every (encoding × codec × profile × batch
+size) cell with p50/p90/min/max/mean per call, plus a short summary of the
+Arrow evaluation that motivated [ADR-0020](adr/0020-remove-otel-arrow-encoding.md)
+— lives at [`benchmark.md`](../benchmark.md). Byte sizes and ratios
+reproduce exactly on any host; wall-clock numbers scale to your CPU.
 
 [`benchstat`]: https://pkg.go.dev/golang.org/x/perf/cmd/benchstat
 
