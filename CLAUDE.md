@@ -13,7 +13,7 @@ component directory.
 ## Status
 
 Working end-to-end round trip for **traces, metrics, and logs**: the exporter encodes
-(`otlp_proto`, `otlp_json`, or `otel_arrow`), compresses
+(`otlp_proto` or `otlp_json`), compresses
 (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`),
 derives partition keys (random or tag-hash), tag-groups microbatches, repacks
 oversize records, and writes via `PutRecords`; the receiver coordinates shard

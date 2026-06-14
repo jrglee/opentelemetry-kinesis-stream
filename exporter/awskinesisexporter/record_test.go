@@ -758,9 +758,9 @@ func TestOversizeSplitMixedLeafReasons_PreservesLabels(t *testing.T) {
 
 // TestTruncateAttributePreservesUTF8 pins finding #4 from code review:
 // clampStringAttrs must backstep to a codepoint boundary so the output is
-// valid UTF-8 — strict downstream encoders (otel_arrow) reject mid-codepoint
-// truncations, and encoding/json silently substitutes the replacement
-// character.
+// valid UTF-8 — encoding/json silently substitutes the replacement character
+// on invalid sequences, and downstream consumers may reject mid-codepoint
+// truncations outright.
 func TestTruncateAttributePreservesUTF8(t *testing.T) {
 	// "héllo" — the é is 2 bytes (0xC3 0xA9). With maxBytes=2 the naive cut
 	// would land between the two bytes of é, producing invalid UTF-8.

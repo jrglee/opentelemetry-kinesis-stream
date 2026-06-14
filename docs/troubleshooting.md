@@ -115,7 +115,7 @@ With `dead_letter.enabled`, they are re-emitted into the pipeline as telemetry
 (a `kinesis.dead_letter` span, gauge, or log record) carrying the raw bytes and failure
 class; route them with standard collector components. A high dead-letter rate
 usually means the exporter and receiver disagree on `encoding`
-(`otlp_proto`/`otlp_json`/`otel_arrow`) or `compression`
+(`otlp_proto`/`otlp_json`) or `compression`
 (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`) —
 both must match on each end. See
 [dead-letter handling](user-guide.md#dead-letter-handling).

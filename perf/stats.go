@@ -30,8 +30,8 @@ func percentile(sorted []time.Duration, f float64) time.Duration {
 // reports is the mean; these four widen the view to per-call variance
 // without baking the variance into the score itself. Sample count is the
 // per-case `b.N` chosen by the testing framework — for very slow cases
-// (Arrow at n=1M) this can be 1, in which case all four numbers collapse
-// to the single observation.
+// this can be 1, in which case all four numbers collapse to the single
+// observation.
 func reportLatencyStats(b *testing.B, samples []time.Duration) {
 	b.Helper()
 	if len(samples) == 0 {

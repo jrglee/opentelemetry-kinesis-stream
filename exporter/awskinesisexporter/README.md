@@ -8,12 +8,9 @@ to the stream's per-record size limit, and writes them with `PutRecords`.
 Records are partitioned by a configurable strategy that determines per-shard
 ordering on the consuming side.
 
-Supported encodings are `otlp_proto` (default, recommended), `otlp_json`, and
-`otel_arrow`. Arrow records are self-contained per Kinesis record (fresh
-producer per record) so the receiver can decode any single record in
-isolation; the per-record schema overhead is paid every time. Compression
-(`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`) is the key
-advantage over the contrib Kinesis exporter, which ships only
+Supported encodings are `otlp_proto` (default, recommended) and `otlp_json`.
+Compression (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`)
+is the key advantage over the contrib Kinesis exporter, which ships only
 `flate`/`gzip`/`zlib`/`none` at a single level — `zstd` and `snappy` are the
 codecs that actually pay off here. Compressed `otlp_proto` is the recommended
 configuration.

@@ -58,7 +58,7 @@ e2e:
 
 # Sequential sweep over a small representative set of (encoding, compression)
 # combos. Heavy — ~15 min per combo — opt-in, not part of `check`.
-E2E_MATRIX ?= otlp_proto/none otlp_proto/zstd otlp_json/zstd otel_arrow/zstd
+E2E_MATRIX ?= otlp_proto/none otlp_proto/zstd otlp_json/zstd otlp_json/gzip
 e2e-matrix:
 	@set -e; for combo in $(E2E_MATRIX); do \
 	  enc=$${combo%/*}; cmp=$${combo#*/}; \

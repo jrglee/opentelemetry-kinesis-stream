@@ -5,8 +5,10 @@
   (0011-metrics-signal-via-sink-seam.md)), tag-hash partition keys /
   microbatching / oversize repack ([0012](0012-tag-grouping-and-oversize-repack.md)),
   dead-letter ([0013](0013-dead-letter-via-pipeline-reemit.md)), `otlp_json`
-  ([0016](0016-add-otlp-json-encoding.md)), `otel_arrow`
-  ([0018](0018-implement-otel-arrow-encoding.md)), and the logs signal (wired
+  ([0016](0016-add-otlp-json-encoding.md)), `otel_arrow` shipped
+  ([0018](0018-implement-otel-arrow-encoding.md)) then removed after
+  benchmarking ([0020](0020-remove-otel-arrow-encoding.md)), and the logs
+  signal (wired
   on the same signal-agnostic seam as metrics, see [0011]
   (0011-metrics-signal-via-sink-seam.md)). Still open: live-AWS reshard
   verification, and EFO.

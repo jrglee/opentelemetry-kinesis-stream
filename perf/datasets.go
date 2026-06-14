@@ -37,16 +37,13 @@ type Profile string
 
 const (
 	// MetricsHighCardinality models per-request or per-pod attributes —
-	// many unique attribute combinations, few datapoints per series. This is
-	// the shape where Arrow's dictionary encoding *should struggle* under
-	// fresh-producer-per-record because there's little intra-record repetition
-	// to amortize the schema overhead against.
+	// many unique attribute combinations, few datapoints per series.
+	// Stresses encoders that rely on intra-record value repetition.
 	MetricsHighCardinality Profile = "metrics-high-cardinality"
 
 	// MetricsHighFrequency models infrastructure metrics — a small
-	// attribute fan-out with many datapoints per series. Dictionary
-	// encoding within a single record has plenty of repeated label values
-	// to compress; this is where Arrow *should shine* on this transport.
+	// attribute fan-out with many datapoints per series. Plenty of
+	// repeated label values to compress within a single record.
 	MetricsHighFrequency Profile = "metrics-high-frequency"
 
 	// MetricsBalanced is the middle of the road — moderate cardinality,
@@ -67,16 +64,13 @@ var MetricsProfiles = []Profile{MetricsHighCardinality, MetricsHighFrequency, Me
 // sweep. The small end models single-event records; the large end (100k) is
 // already past any reasonable Kinesis per-record byte ceiling but is
 // retained so the harness shows where each encoding's encode/decode cost
-// scales linearly and where (e.g. JSON allocation) it does not. 1M was
-// tried and removed: Arrow at 1M takes ~3s per call and bloats CI total
-// runtime past any reasonable budget without changing the conclusions.
+// scales linearly and where (e.g. JSON allocation) it does not.
 var BatchSizes = []int{1, 10, 100, 1000, 10000, 100000}
 
 // Vocabularies are picked from by index so attribute values are deterministic
 // (no map iteration, no time.Now). Keeping them small and finite makes the
-// resulting strings highly compressible by both dictionary-style (Arrow) and
-// LZ-style (zstd) codecs — which is what real observability workloads look
-// like.
+// resulting strings highly compressible by LZ-style codecs — which is what
+// real observability workloads look like.
 var (
 	hosts     = []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"}
 	regions   = []string{"us-east-1", "us-west-2", "eu-west-1", "ap-southeast-2"}

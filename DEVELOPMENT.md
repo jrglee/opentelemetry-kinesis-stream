@@ -34,7 +34,7 @@ It is a single Go module rooted at the repo root.
 | `make docker`   | build the collector container image (`otelcol-kinesis:dev`)        |
 | `make compose-up` / `make compose-down` | bring the E2E stack up / down (with volumes) |
 | `make e2e`      | full docker-compose round-trip test (needs Docker). Honors `ENCODING=` and `COMPRESSION=` env vars; defaults to the same combo CI exercises. |
-| `make e2e-matrix` | sequentially runs `make e2e` over a small representative set of (encoding, compression) combos. Heavy (~15 min per combo); opt-in. Override via `E2E_MATRIX="otlp_proto/zstd otel_arrow/zstd"`. |
+| `make e2e-matrix` | sequentially runs `make e2e` over a small representative set of (encoding, compression) combos. Heavy (~15 min per combo); opt-in. Override via `E2E_MATRIX="otlp_proto/zstd otlp_json/gzip"`. |
 | `make perf`     | reproducible encode/decode benchmark sweep across (profile × encoding × codec × batch size). Sequential — CI-safe, no cross-bench contention. Output is `go test -bench` format; pipe through `benchstat` to compare runs. Override sample budget with `PERF_BENCHTIME=2s PERF_COUNT=3 make perf`. |
 | `make perf-parallel` | same sweep, four phases concurrently, `GOMAXPROCS=6` per process (override with `PERF_PARALLEL_CPU`). Faster on a workstation; not for CI — cross-process memory bandwidth and cache contention adds noise to `ns/op`. Sizes and ratios are deterministic and unaffected. Outputs in `perf-out/`. |
 | `make clean`    | remove build artifacts and the compose `shared/` dir               |

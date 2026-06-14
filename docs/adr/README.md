@@ -29,7 +29,9 @@ implementing it.
 - [0015 — Delegate observability to the collector's built-in telemetry](0015-delegate-observability-to-collector-telemetry.md)
 - [0016 — Add OTLP JSON encoding; recommend compressed OTLP-proto](0016-add-otlp-json-encoding.md)
 - [0017 — Operator-owned limits; full collector codec parity](0017-operator-owned-limits-and-codec-parity.md)
-- [0018 — Implement `otel_arrow` encoding with per-record self-contained batches](0018-implement-otel-arrow-encoding.md)
+- [0018 — Implement `otel_arrow` encoding with per-record self-contained batches](0018-implement-otel-arrow-encoding.md) (superseded by 0020)
+- [0019 — Oversize recovery is a chain of policies, not a single mode](0019-oversize-recovery-chain.md)
+- [0020 — Remove `otel_arrow` encoding from the PoC](0020-remove-otel-arrow-encoding.md)
 
 ## How to add an ADR
 

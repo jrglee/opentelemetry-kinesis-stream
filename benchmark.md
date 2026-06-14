@@ -1,7 +1,11 @@
 # Encoding × codec performance
 
-Empirical numbers backing the architectural decision in
-[docs/adr/0018-implement-otel-arrow-encoding.md](docs/adr/0018-implement-otel-arrow-encoding.md).
+Empirical numbers from the `otel_arrow` evaluation. The encoding was
+implemented per
+[ADR-0018](docs/adr/0018-implement-otel-arrow-encoding.md) and later
+removed per [ADR-0020](docs/adr/0020-remove-otel-arrow-encoding.md) — the
+`otel_arrow` columns below are preserved as the evidence behind that
+decision. Live encodings are `otlp_proto` and `otlp_json`.
 
 ```
 make perf | tee benchmark-raw.txt

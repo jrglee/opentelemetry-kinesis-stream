@@ -28,7 +28,6 @@ func TestEncodingCodecMatrix(t *testing.T) {
 	encodings := []encoding.Encoding{
 		encoding.EncodingOTLPProto,
 		encoding.EncodingOTLPJSON,
-		encoding.EncodingOTelArrow,
 	}
 	codecs := []encoding.Codec{
 		encoding.CodecNone,
