@@ -22,8 +22,8 @@ exporters:
     stream_name: otel-traces
     region: us-east-1
     endpoint: http://ministack:4566
-    encoding: otlp_proto
-    compression: gzip
+    encoding: ${env:ENCODING:-otlp_proto}
+    compression: ${env:COMPRESSION:-gzip}
     max_record_size: 1048576
   debug:
     verbosity: basic

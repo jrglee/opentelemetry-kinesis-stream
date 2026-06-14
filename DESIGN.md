@@ -53,7 +53,7 @@ Conceptually a small delta on contrib's existing exporter: same AWS SDK v2 clien
 
 - Make the record-size ceiling an operator knob rather than a hardcoded cap, keeping a conservative 1 MiB default for behavioral parity with existing deployments. The library enforces the operator-provided limit and stays agnostic to the AWS environment, since the real ceiling varies by account, region, and stream configuration (AWS's current published values: up to 10 MiB per record, opt-in, and a 10 MiB `PutRecords` aggregate).
 - Treat compression as a typed concern with a codec choice and a level, rather than a single string. zstd is the first new codec; the abstraction should make further codecs cheap to add without a config break.
-- Treat encoding as an open registry. OTel-Arrow was the motivating addition, but the registry shape matters more than the specific encoding added first. (As built, the registry carries `otlp_proto` and `otlp_json`; `otel_arrow` is the next encoding to land. See [ADR-0016](docs/adr/0016-add-otlp-json-encoding.md).)
+- Treat encoding as an open registry. The registry shape matters more than which encoding shipped first. As built, it carries `otlp_proto`, `otlp_json`, and `otel_arrow`. `otel_arrow` uses a fresh producer per record so each Kinesis record is a self-contained Arrow batch — see [ADR-0018](docs/adr/0018-implement-otel-arrow-encoding.md) for the rationale and the trade-off (per-record schema overhead in exchange for store-and-forward compatibility).
 
 Architectural questions worth flagging:
 

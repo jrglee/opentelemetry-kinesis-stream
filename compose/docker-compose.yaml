@@ -34,6 +34,8 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
+      ENCODING: ${ENCODING:-otlp_proto}
+      COMPRESSION: ${COMPRESSION:-gzip}
     volumes:
       - ./producer.yaml:/etc/otelcol/config.yaml:ro
     depends_on:
@@ -51,6 +53,8 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
+      ENCODING: ${ENCODING:-otlp_proto}
+      COMPRESSION: ${COMPRESSION:-gzip}
     volumes:
       - ./consumer.yaml:/etc/otelcol/config.yaml:ro
       - shared:/shared
@@ -69,6 +73,8 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
+      ENCODING: ${ENCODING:-otlp_proto}
+      COMPRESSION: ${COMPRESSION:-gzip}
     volumes:
       - ./consumer.yaml:/etc/otelcol/config.yaml:ro
       - shared:/shared

@@ -18,8 +18,8 @@ exporters:
     stream_name: otel-metrics
     region: us-east-1
     endpoint: http://ministack:4566
-    encoding: otlp_proto
-    compression: zstd
+    encoding: ${env:ENCODING:-otlp_proto}
+    compression: ${env:COMPRESSION:-zstd}
     max_record_size: 1048576
     partition_key:
       strategy: tag_hash
