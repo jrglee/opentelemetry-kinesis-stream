@@ -393,12 +393,12 @@ func logsCodec(enc encoding.LogsEncoder) signalCodec[plog.Logs] {
 }
 
 // truncateLogsAttributes returns a clone of ld with every string-valued
-// attribute (resource, scope, log record) clamped to maxBytes. String bodies
-// are clamped too, because the body is the most common bloat vector for logs
-// (long messages, stack traces, JSON dumps) and the truncate policy's purpose
-// is to trim payload bloat. Non-string bodies (maps, slices, bytes) are left
-// untouched — mutating structured kinds would rewrite semantics rather than
-// trim them, same rule as clampStringAttrs.
+// attribute (resource, scope, log record) clamped to maxBytes. The log
+// record's Body is deliberately left untouched: the policy is named
+// truncate_attribute_values, the attributes_truncated counter is labelled
+// the same way, and operators would not expect a metric increment under
+// that name to mean their log message text was mutated. A future opt-in
+// policy can clamp bodies if that recovery path is needed.
 func truncateLogsAttributes(ld plog.Logs, maxBytes int) (plog.Logs, int) {
 	out := plog.NewLogs()
 	ld.CopyTo(out)
@@ -413,15 +413,7 @@ func truncateLogsAttributes(ld plog.Logs, maxBytes int) (plog.Logs, int) {
 			changed += clampStringAttrs(sl.Scope().Attributes(), maxBytes)
 			lrs := sl.LogRecords()
 			for k := 0; k < lrs.Len(); k++ {
-				lr := lrs.At(k)
-				changed += clampStringAttrs(lr.Attributes(), maxBytes)
-				if lr.Body().Type() == pcommon.ValueTypeStr {
-					s := lr.Body().Str()
-					if len(s) > maxBytes {
-						lr.Body().SetStr(s[:utf8SafeCut(s, maxBytes)])
-						changed++
-					}
-				}
+				changed += clampStringAttrs(lrs.At(k).Attributes(), maxBytes)
 			}
 		}
 	}

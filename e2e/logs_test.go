@@ -83,16 +83,19 @@ func TestLogsRoundTrip(t *testing.T) {
 		t.Fatalf("log records = %d, want %d (loss)", got, logsEmitted)
 	}
 
-	// Settle so a late duplicate has time to surface.
+	// Settle so a late straggler or over-delivery has time to surface, then
+	// re-assert the count.
 	time.Sleep(logsSettle)
-	final, unique := readLogs(t, env, shared)
+	final := readLogs(t, env, shared)
 	if final != logsEmitted {
 		t.Fatalf("after settle, log records = %d, want %d", final, logsEmitted)
 	}
-	if final != unique {
-		t.Fatalf("raw log occurrences = %d but unique bodies = %d: a shard was delivered more than once", final, unique)
-	}
-	t.Logf("logs round-trip OK: %d records delivered exactly once", final)
+	// No per-record uniqueness assertion: telemetrygen's `logs` subcommand
+	// emits the same body for every record, so we cannot distinguish a unique
+	// record from a duplicate by content. This stack runs a single consumer
+	// replica; the multi-replica no-double-delivery property is already
+	// covered by the traces E2E and the receiver's matrix correctness sweep.
+	t.Logf("logs round-trip OK: %d records delivered", final)
 }
 
 // waitForLogsOwnership polls the logs lease table until at least one shard has
@@ -119,7 +122,7 @@ func waitForLogs(t *testing.T, env []string, shared string, want int) int {
 	deadline := time.Now().Add(logsDeliver)
 	var count int
 	for time.Now().Before(deadline) {
-		count, _ = readLogs(t, env, shared)
+		count = readLogs(t, env, shared)
 		if count >= want {
 			return count
 		}
@@ -129,25 +132,23 @@ func waitForLogs(t *testing.T, env []string, shared string, want int) int {
 	return count
 }
 
-// readLogs copies the consumer output off the shared volume and parses each
-// OTLP-JSON line, returning the total log record count and the unique-body
-// count. telemetrygen emits each record with a distinct body, so any raw
-// count above the unique count signals double delivery.
-func readLogs(t *testing.T, env []string, shared string) (count, unique int) {
+// readLogs copies the consumer output off the shared volume and returns the
+// total log record count across every OTLP-JSON line in the file.
+func readLogs(t *testing.T, env []string, shared string) int {
 	t.Helper()
 	copySharedLogsFrom(t, env, shared)
 
 	path := filepath.Join(shared, logsOutFile)
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0
+		return 0
 	}
 	defer f.Close()
 
-	bodies := make(map[string]struct{})
 	unmarshaler := &plog.JSONUnmarshaler{}
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
+	count := 0
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -159,25 +160,9 @@ func readLogs(t *testing.T, env []string, shared string) (count, unique int) {
 			// the final line; the caller re-polls until the count stabilizes.
 			continue
 		}
-		count += addLogBodies(ld, bodies)
+		count += ld.LogRecordCount()
 	}
-	return count, len(bodies)
-}
-
-func addLogBodies(ld plog.Logs, bodies map[string]struct{}) int {
-	n := 0
-	rls := ld.ResourceLogs()
-	for i := 0; i < rls.Len(); i++ {
-		sls := rls.At(i).ScopeLogs()
-		for j := 0; j < sls.Len(); j++ {
-			lrs := sls.At(j).LogRecords()
-			for k := 0; k < lrs.Len(); k++ {
-				bodies[lrs.At(k).Body().AsString()] = struct{}{}
-				n++
-			}
-		}
-	}
-	return n
+	return count
 }
 
 func copySharedLogsFrom(t *testing.T, env []string, dest string) {
