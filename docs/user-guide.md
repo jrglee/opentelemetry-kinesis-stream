@@ -7,16 +7,16 @@ the runtime behaviors that matter operationally — round trip, shard
 rebalancing, graceful handoff, crash recovery, and resharding. You can treat
 the components as a black box; nothing here requires reading the source.
 
-> **Status:** proof of concept. Traces and metrics,
+> **Status:** proof of concept. All three signals (traces, metrics, logs),
 > `otlp_proto`/`otlp_json`/`otel_arrow` encodings,
 > `none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`
-> compression. Known gaps and follow-ups (logs, live-reshard verification)
+> compression. Known gaps and follow-ups (live-reshard verification, EFO)
 > are in [Limitations](#limitations).
 
 ## Contents
 
 - [Building a collector](#building-a-collector)
-- [Signals (traces and metrics)](#signals-traces-and-metrics)
+- [Signals (traces, metrics, and logs)](#signals-traces-metrics-and-logs)
 - [Testing against real AWS](#testing-against-real-aws) — **start here to try it end-to-end**
 - [Exporter configuration](#exporter-configuration)
   - [Encodings](#encodings)
@@ -38,23 +38,22 @@ the components as a black box; nothing here requires reading the source.
 - [Tuning](#tuning)
 - [Limitations](#limitations)
 
-## Signals (traces and metrics)
+## Signals (traces, metrics, and logs)
 
-Both components register `WithTraces` and `WithMetrics`, so each can serve a
-traces pipeline or a metrics pipeline. The choice is the pipeline you attach
-the component to.
+Both components register `WithTraces`, `WithMetrics`, and `WithLogs`, so each
+can serve a traces, metrics, or logs pipeline. The choice is the pipeline you
+attach the component to.
 
 A given Kinesis stream carries **one signal**. The wire layout has no signal
 header, so the consumer must decode records as the same signal the producer
-encoded. Run a separate stream for traces and for metrics; point a traces
-pipeline at the traces stream and a metrics pipeline at the metrics stream.
-Mixing signals on one stream is unsupported and decodes will fail on the
-consumer.
+encoded. Run a separate stream per signal (e.g. `otel-traces`, `otel-metrics`,
+`otel-logs`) and point each pipeline at its own stream. Mixing signals on one
+stream is unsupported and decodes will fail on the consumer.
 
 Everything in this guide — compression, partition keys, leasing, rebalancing,
-checkpointing — behaves identically for both signals. Examples that show a
-`traces:` pipeline work the same with `metrics:`; swap the keyword and use a
-metrics source and sink.
+checkpointing — behaves identically across all three signals. Examples that
+show a `traces:` pipeline work the same with `metrics:` or `logs:`; swap the
+keyword and use the appropriate source and sink.
 
 ## Building a collector
 
@@ -269,8 +268,8 @@ aws dynamodb delete-table --table-name "$LEASE_TABLE"
 
 ## Exporter configuration
 
-The exporter marshals each `ConsumeTraces` or `ConsumeMetrics` call into one or
-more Kinesis records and writes them with `PutRecords`. By default it produces a
+The exporter marshals each `ConsumeTraces`, `ConsumeMetrics`, or `ConsumeLogs`
+call into one or more Kinesis records and writes them with `PutRecords`. By default it produces a
 single record with a random partition key; under the `tag_hash` strategy it
 groups the batch by resource-attribute tuple and emits one record per tuple with
 a stable key (see [Tag-grouped microbatching](#tag-grouped-microbatching)).
@@ -287,7 +286,7 @@ a stable key (see [Tag-grouped microbatching](#tag-grouped-microbatching)).
 | `partition_key.hash`      | string | `xxhash`     | no       | Hash function for the partition key. Only `xxhash` is implemented. |
 | `oversize.policies`       | list   | `[split_half]` | no     | Ordered recovery chain tried against a payload that exceeds `max_record_size`. Entries: `truncate_attribute_values`, `split_half`, `reject`. The first policy whose output fits wins; chain exhaustion drops the remainder. See [Oversize records](#oversize-records). |
 | `oversize.max_attempts`   | int    | `8`          | no       | Maximum recursion depth per `split_half` chain step before falling through to the next policy (or dropping). |
-| `oversize.max_attribute_value_bytes` | int | `4096` | no       | UTF-8 byte ceiling for `truncate_attribute_values`. String attribute values longer than this are clamped to this length. Non-string kinds are never touched. |
+| `oversize.max_attribute_value_bytes` | int | `4096` | no       | UTF-8 byte ceiling for `truncate_attribute_values`. String attribute values longer than this are clamped to this length. For logs, string log bodies are clamped too. Non-string kinds are never touched. |
 | `max_record_size`         | int    | `1048576`    | no       | Byte ceiling on the bytes handed to Kinesis — i.e. after compression, since Kinesis treats each record as opaque bytes. A larger payload is repacked per `oversize.policies`. An **operator-owned limit** the exporter enforces verbatim; it does not track the stream's actual ceiling, which varies by account/region/stream config. The default (1 MiB) is the conservative floor every stream accepts; raise it if your stream is configured for larger records (Kinesis [supports up to 10 MiB](https://aws.amazon.com/blogs/big-data/amazon-kinesis-data-streams-now-supports-10x-larger-record-sizes-simplifying-real-time-data-processing) per record, opt-in via the stream's `maxRecordSize`). |
 | `put_records.max_records` | int    | `500`        | no       | Maximum records per `PutRecords` call. Operator-owned limit; raise to match a stream configured for larger requests. |
 | `put_records.max_bytes`   | int    | `5242880`    | no       | Maximum aggregate record-data bytes per `PutRecords` call (default 5 MiB). Operator-owned limit; must be ≥ `max_record_size`. |
@@ -329,6 +328,26 @@ exporters:
 service:
   pipelines:
     metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [awskinesis]
+```
+
+### Example (logs)
+
+The same exporter on a logs pipeline, pointed at its own stream:
+
+```yaml
+exporters:
+  awskinesis:
+    stream_name: otel-logs
+    region: us-east-1
+    encoding: otlp_proto
+    compression: zstd
+
+service:
+  pipelines:
+    logs:
       receivers: [otlp]
       processors: [batch]
       exporters: [awskinesis]
@@ -466,9 +485,11 @@ one fits or the chain is exhausted:
   `kinesis.exporter.records_dropped` with `reason=irreducible`.
 - **`truncate_attribute_values`** clones the batch and clamps any string
   attribute value strictly longer than `oversize.max_attribute_value_bytes` to
-  that length, walking resource, scope, and span/datapoint attributes (plus
-  span events, links, and exemplars on the metrics side). Non-string attribute
-  kinds are never touched. Items that survive are counted on the new
+  that length, walking resource, scope, and span/datapoint/log-record
+  attributes (plus span events, links, and exemplars on the metrics side, and
+  the log record's string `Body` on the logs side — the most common bloat
+  vector for log payloads). Non-string attribute kinds (and non-string bodies)
+  are never touched. Items that survive are counted on the new
   `kinesis.exporter.attributes_truncated` counter — incremented every time a
   value is clamped, whether truncation alone fit the payload or `split_half`
   shipped it afterward (the mutation happened either way). A non-zero rate is
@@ -582,8 +603,9 @@ The wrapper carries the raw record bytes plus its metadata: shard id, sequence
 number, partition key, failure class, declared encoding, and declared codec.
 It is re-emitted as:
 
-- a span named `kinesis.dead_letter` on a **traces** receiver, or
-- a gauge named `kinesis.dead_letter` on a **metrics** receiver.
+- a span named `kinesis.dead_letter` on a **traces** receiver,
+- a gauge named `kinesis.dead_letter` on a **metrics** receiver, or
+- a log record whose body is `kinesis.dead_letter` on a **logs** receiver.
 
 Because it flows through the same pipeline, you route it like any other
 telemetry — for example to a separate exporter or storage for inspection — using
@@ -617,12 +639,12 @@ sequenceDiagram
     RX->>RX: decompress + decode
     alt decode or decompress fails
         Note over RX: wrap raw bytes plus shard, sequence, key, class, encoding, codec
-        RX->>C: emit kinesis.dead_letter (span for traces, gauge for metrics)
+        RX->>C: emit kinesis.dead_letter (span / gauge / log record)
         C->>OUT: operator routes it for inspection
     else transient downstream rejection
         Note over RX: valid record, retry from checkpoint, not dead-lettered
     else success
-        RX->>C: ConsumeTraces or ConsumeMetrics
+        RX->>C: ConsumeTraces / ConsumeMetrics / ConsumeLogs
     end
 ```
 
@@ -1060,8 +1082,6 @@ ratios exactly, with wall-clock numbers scaled to your CPU.
 
 This is a proof of concept. Known gaps and what's next:
 
-- **Signals: traces and metrics only — no logs.** Neither component wires the
-  logs signal yet.
 - **Resharding** is implemented and covered by an automated simulated-split test,
   but **not yet verified against a real AWS reshard**.
 - **Rebalancing bootstrap uses a forced steal** (at-least-once for one shard at

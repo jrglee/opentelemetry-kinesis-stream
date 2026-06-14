@@ -10,7 +10,6 @@ import (
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
 )
 
-
 // sink is the only signal-specific seam in the receiver. The lease store,
 // coordinator, and pollers all operate on raw bytes; a sink decodes a
 // decompressed payload into its signal and delivers it downstream, and wraps

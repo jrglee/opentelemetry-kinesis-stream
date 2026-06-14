@@ -9,13 +9,13 @@ New here and want to *run* it? Start with the **[user guide](docs/user-guide.md)
 This README is about *why the project exists* and *how it is built* — the
 motivations and architectural choices, for evaluators and contributors.
 
-**Status:** working proof of concept. Traces and metrics flow end-to-end with
-`otlp_proto`/`otlp_json`/`otel_arrow` encodings and the full collector codec
-set (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`), and
-shard ownership is coordinated and rebalanced across replicas via a KCL-shaped
-DynamoDB lease table. Remaining gaps (logs signal, real-AWS reshard
-verification) are tracked in
-[ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md).
+**Status:** working proof of concept. All three signals (traces, metrics, and
+logs) flow end-to-end with `otlp_proto`/`otlp_json`/`otel_arrow` encodings and
+the full collector codec set
+(`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`), and shard
+ownership is coordinated and rebalanced across replicas via a KCL-shaped
+DynamoDB lease table. Remaining gaps (real-AWS reshard verification, EFO) are
+tracked in [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md).
 
 ## Why this exists
 
@@ -52,7 +52,7 @@ and consequences. The overall architecture lives in [`DESIGN.md`](DESIGN.md).
   in-flight batch and checkpoints before releasing, so the next owner resumes
   cleanly instead of re-reading.
   [ADR-0009](docs/adr/0009-graceful-lease-handoff-and-shutdown.md).
-- **A single signal-agnostic seam.** Traces and metrics share one
+- **A single signal-agnostic seam.** Traces, metrics, and logs share one
   group/compress/PutRecords path and one poll/decode path; only the pdata
   marshaling differs per signal.
   [ADR-0011](docs/adr/0011-metrics-signal-via-sink-seam.md).

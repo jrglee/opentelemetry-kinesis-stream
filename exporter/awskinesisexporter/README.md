@@ -16,7 +16,7 @@ isolation; the per-record schema overhead is paid every time. Compression
 advantage over the contrib Kinesis exporter, which does not compress —
 compressed `otlp_proto` is the recommended configuration.
 
-**Status:** working proof of concept for traces and metrics, including
+**Status:** working proof of concept for traces, metrics, and logs, including
 tag-grouped microbatching and oversize-record repacking.
 
 ## Observability

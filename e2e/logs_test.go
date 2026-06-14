@@ -20,11 +20,11 @@ import (
 )
 
 const (
-	logsEmitted   = 200
-	logsLeaseTbl  = "otel-leases-logs"
-	logsOutFile   = "logs-out.jsonl"
-	logsDeliver   = 90 * time.Second
-	logsSettle    = 10 * time.Second
+	logsEmitted  = 200
+	logsLeaseTbl = "otel-leases-logs"
+	logsOutFile  = "logs-out.jsonl"
+	logsDeliver  = 90 * time.Second
+	logsSettle   = 10 * time.Second
 )
 
 // composeLogs runs `docker compose` against the logs stack file. Mirrors the
@@ -186,4 +186,3 @@ func copySharedLogsFrom(t *testing.T, env []string, dest string) {
 		t.Logf("cp shared (not ready yet?): %v\n%s", err, out)
 	}
 }
-

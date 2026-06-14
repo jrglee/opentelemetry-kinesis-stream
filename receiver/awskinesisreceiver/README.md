@@ -63,6 +63,7 @@ lease acquisition, and reconcile decisions.
 Supported encodings are `otlp_proto` (default), `otlp_json`, and `otel_arrow`.
 The encoding and codec must match the exporter's.
 
-**Status:** working proof of concept for traces and metrics, with leaderless
-fair-share rebalancing across replicas. Resharding (parent-drains-before-child)
-is gated in the acquisition path but not yet verified against a live shard split.
+**Status:** working proof of concept for traces, metrics, and logs, with
+leaderless fair-share rebalancing across replicas. Resharding
+(parent-drains-before-child) is gated in the acquisition path but not yet
+verified against a live shard split.

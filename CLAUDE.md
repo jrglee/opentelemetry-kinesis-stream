@@ -12,7 +12,7 @@ component directory.
 
 ## Status
 
-Working end-to-end round trip for **traces and metrics**: the exporter encodes
+Working end-to-end round trip for **traces, metrics, and logs**: the exporter encodes
 (`otlp_proto`, `otlp_json`, or `otel_arrow`), compresses
 (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`),
 derives partition keys (random or tag-hash), tag-groups microbatches, repacks
@@ -24,7 +24,6 @@ A docker-compose E2E proves the round trip and multi-replica no-duplicate
 delivery against the MiniStack emulator, and CI runs the gate.
 
 Remaining gaps (see [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md)):
-- **Logs signal** — not wired (traces and metrics only).
 - **Resharding** — implemented and covered by a simulated-split test, but not
   yet verified against a real AWS reshard.
 - **EFO** — `GetRecords` polling only; `SubscribeToShard` out of scope.
