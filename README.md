@@ -10,12 +10,12 @@ This README is about *why the project exists* and *how it is built* — the
 motivations and architectural choices, for evaluators and contributors.
 
 **Status:** working proof of concept. Traces and metrics flow end-to-end with
-`otlp_proto`/`otlp_json` encodings and `none`/`gzip`/`zstd`/`snappy`
-compression, and shard ownership is coordinated and rebalanced across replicas
-via a KCL-shaped DynamoDB lease table. The `otel_arrow` encoding is the next
-addition; other remaining gaps (logs signal, real-AWS reshard verification) are
-tracked in [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md) and
-[ADR-0016](docs/adr/0016-add-otlp-json-encoding.md).
+`otlp_proto`/`otlp_json`/`otel_arrow` encodings and the full collector codec
+set (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`), and
+shard ownership is coordinated and rebalanced across replicas via a KCL-shaped
+DynamoDB lease table. Remaining gaps (logs signal, real-AWS reshard
+verification) are tracked in
+[ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md).
 
 ## Why this exists
 
@@ -57,13 +57,15 @@ and consequences. The overall architecture lives in [`DESIGN.md`](DESIGN.md).
   marshaling differs per signal.
   [ADR-0011](docs/adr/0011-metrics-signal-via-sink-seam.md).
 - **Pluggable wire encoding and compression.** Encoding (`otlp_proto`,
-  `otlp_json`) and codec (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`,
-  mirroring the collector's set) are config, with a
-  headerless wire contract that lets exporter and receiver agree. Compressed
-  OTLP-proto is the recommended path and the contrib-gap closer; `otel_arrow` is
-  the next encoding to land.
+  `otlp_json`/`otel_arrow`) and codec
+  (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate` — the
+  collector's set minus `lz4`) are config, with a headerless wire contract that lets
+  exporter and receiver agree. Compressed OTLP-proto is the recommended path
+  and the contrib-gap closer; `otel_arrow` carries a self-contained batch per
+  Kinesis record so any record decodes in isolation.
   [ADR-0010](docs/adr/0010-codecs-and-deferred-arrow.md),
-  [ADR-0016](docs/adr/0016-add-otlp-json-encoding.md).
+  [ADR-0016](docs/adr/0016-add-otlp-json-encoding.md),
+  [ADR-0018](docs/adr/0018-implement-otel-arrow-encoding.md).
 - **Deterministic partition keys and tag-grouped microbatching**, so records
   that should stay ordered share a shard and related records ride one record.
   [ADR-0012](docs/adr/0012-tag-grouping-and-oversize-repack.md).

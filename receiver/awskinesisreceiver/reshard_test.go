@@ -16,10 +16,8 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/ptrace"
-	"go.uber.org/zap/zaptest"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
-	"github.com/jrglee/opentelemetry-kinesis-stream/internal/lease"
 )
 
 // TestReshardParentDrainsBeforeChild verifies the parent-drains-before-child
@@ -58,35 +56,9 @@ func TestReshardParentDrainsBeforeChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	comp, err := encoding.NewCompressor(encoding.CodecNone)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	cfg := &Config{
-		StreamName:        "rs",
-		Encoding:          encoding.EncodingOTLPProto,
-		Compression:       encoding.CodecNone,
-		PollInterval:      20 * time.Millisecond,
-		MaxRecords:        100,
-		LeaseDuration:     500 * time.Millisecond,
-		HeartbeatInterval: 50 * time.Millisecond,
-		DiscoveryInterval: 40 * time.Millisecond,
-	}
-
-	c := &coordinator{
-		cfg:      cfg,
-		client:   fakeKinesisClient(fs),
-		store:    lease.NewMemoryStore(),
-		comp:     comp,
-		sink:     tracesSink{decoder: dec, consumer: consumeFn},
-		logger:   zaptest.NewLogger(t),
-		tel:      testTelemetry(t),
-		workerID: "w1",
-		active:   make(map[string]*activePoller),
-		observed: make(map[string]observation),
-		absent:   make(map[string]int),
-	}
+	cfg := fastCoordCfg("rs", encoding.EncodingOTLPProto, encoding.CodecNone)
+	c := newTestCoordinator(t, cfg, fs, tracesSink{decoder: dec, consumer: consumeFn}, "w1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

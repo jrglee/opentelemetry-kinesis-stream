@@ -13,7 +13,8 @@ component directory.
 ## Status
 
 Working end-to-end round trip for **traces and metrics**: the exporter encodes
-(`otlp_proto` or `otlp_json`), compresses (`none`/`gzip`/`zstd`/`snappy`),
+(`otlp_proto`, `otlp_json`, or `otel_arrow`), compresses
+(`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`),
 derives partition keys (random or tag-hash), tag-groups microbatches, repacks
 oversize records, and writes via `PutRecords`; the receiver coordinates shard
 ownership across replicas via a lease store (in-memory or KCL-shaped DynamoDB)
@@ -22,10 +23,7 @@ dead-letters unprocessable records, and checkpoints after downstream acceptance.
 A docker-compose E2E proves the round trip and multi-replica no-duplicate
 delivery against the MiniStack emulator, and CI runs the gate.
 
-Remaining gaps (see [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md) and
-[ADR-0016](docs/adr/0016-add-otlp-json-encoding.md)):
-- **`otel_arrow` encoding** — the next encoding to land (the Go module now
-  exists); reserved and rejected at validation until then.
+Remaining gaps (see [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md)):
 - **Logs signal** — not wired (traces and metrics only).
 - **Resharding** — implemented and covered by a simulated-split test, but not
   yet verified against a real AWS reshard.

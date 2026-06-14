@@ -7,8 +7,8 @@ receivers:
     stream_name: otel-metrics
     region: us-east-1
     endpoint: http://ministack:4566
-    encoding: otlp_proto
-    compression: zstd
+    encoding: ${env:ENCODING:-otlp_proto}
+    compression: ${env:COMPRESSION:-zstd}
     poll_interval: 250ms
     max_records: 1000
     lease_backend: dynamodb

@@ -1,6 +1,7 @@
 # 0016. Add OTLP JSON encoding; recommend compressed OTLP-proto
 
-- **Status:** Accepted
+- **Status:** Accepted. Arrow follow-up landed in
+  [ADR-0018](0018-implement-otel-arrow-encoding.md).
 - **Date:** 2026-06-13
 - Supersedes the encoding cut of [0005](0005-poc-milestone-scope-cuts.md) and the
   "no usable Go module" rationale for OTel-Arrow in
