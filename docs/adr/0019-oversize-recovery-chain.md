@@ -45,7 +45,8 @@ exists to answer.
     metrics); clamps string-valued attributes longer than
     `oversize.max_attribute_value_bytes` (default 4096), backstepping to a
     UTF-8 codepoint boundary so the output is never invalid UTF-8 (strict
-    encoders such as `otel_arrow` reject mid-codepoint truncations). Every
+    downstream consumers reject mid-codepoint truncations; JSON encoders
+    silently substitute U+FFFD). Every
     clamp increments `kinesis.exporter.attributes_truncated` regardless of
     whether truncation alone fit the payload or `split_half` shipped it
     afterward — the data was mutated either way, and the metric records

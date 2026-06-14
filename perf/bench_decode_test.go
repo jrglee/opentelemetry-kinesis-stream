@@ -13,11 +13,6 @@ import (
 // BenchmarkDecodeMetrics measures the receiver-side decompress + decode cost.
 // Inputs are pre-encoded at construction time so the timer captures only the
 // receiver path — the symmetric measurement to BenchmarkEncodeMetrics.
-//
-// OTel-Arrow claims decode-side superiority over OTLP-proto on streaming
-// workloads. Our model is per-record self-contained batches, so this is the
-// honest test of that claim on this transport: if Arrow's decode is faster
-// here, the numbers show it; if it isn't, the numbers show that too.
 func BenchmarkDecodeMetrics(b *testing.B) {
 	for _, profile := range MetricsProfiles {
 		for _, size := range BatchSizes {
@@ -36,9 +31,7 @@ func BenchmarkDecodeMetrics(b *testing.B) {
 					if err != nil {
 						b.Fatalf("NewCompressor(%s): %v", c, err)
 					}
-					// Seeding may panic on Arrow + extreme cardinality;
-					// skip the case rather than aborting the matrix.
-					raw, err := safeMarshal(enc.Marshal, md)
+					raw, err := enc.Marshal(md)
 					if err != nil {
 						name := fmt.Sprintf("%s/%s/%s/n=%d", profile, e, c, size)
 						b.Run(name, func(b *testing.B) {
@@ -53,14 +46,13 @@ func BenchmarkDecodeMetrics(b *testing.B) {
 
 					name := fmt.Sprintf("%s/%s/%s/n=%d", profile, e, c, size)
 					b.Run(name, func(b *testing.B) {
-						// Warm-up: prime decoder buffer pools.
 						for i := 0; i < warmupIterations; i++ {
 							unzipped, err := comp.Decompress(payload)
 							if err != nil {
 								b.Skipf("warmup Decompress: %v", err)
 								return
 							}
-							if _, err := safeUnmarshal(dec.Unmarshal, unzipped); err != nil {
+							if _, err := dec.Unmarshal(unzipped); err != nil {
 								b.Skipf("warmup Unmarshal: %v", err)
 								return
 							}
@@ -74,7 +66,7 @@ func BenchmarkDecodeMetrics(b *testing.B) {
 							if err != nil {
 								b.Fatalf("Decompress: %v", err)
 							}
-							if _, err := safeUnmarshal(dec.Unmarshal, unzipped); err != nil {
+							if _, err := dec.Unmarshal(unzipped); err != nil {
 								b.Fatalf("Unmarshal: %v", err)
 							}
 							samples = append(samples, time.Since(t0))
@@ -112,7 +104,7 @@ func BenchmarkDecodeTraces(b *testing.B) {
 				if err != nil {
 					b.Fatalf("NewCompressor(%s): %v", c, err)
 				}
-				raw, err := safeMarshal(enc.Marshal, td)
+				raw, err := enc.Marshal(td)
 				if err != nil {
 					name := fmt.Sprintf("%s/%s/%s/n=%d", TracesTypical, e, c, size)
 					b.Run(name, func(b *testing.B) {
@@ -133,7 +125,7 @@ func BenchmarkDecodeTraces(b *testing.B) {
 							b.Skipf("warmup Decompress: %v", err)
 							return
 						}
-						if _, err := safeUnmarshal(dec.Unmarshal, unzipped); err != nil {
+						if _, err := dec.Unmarshal(unzipped); err != nil {
 							b.Skipf("warmup Unmarshal: %v", err)
 							return
 						}
@@ -148,7 +140,7 @@ func BenchmarkDecodeTraces(b *testing.B) {
 						if err != nil {
 							b.Fatalf("Decompress: %v", err)
 						}
-						if _, err := safeUnmarshal(dec.Unmarshal, unzipped); err != nil {
+						if _, err := dec.Unmarshal(unzipped); err != nil {
 							b.Fatalf("Unmarshal: %v", err)
 						}
 						samples = append(samples, time.Since(t0))

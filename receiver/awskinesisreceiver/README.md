@@ -60,7 +60,7 @@ Instruments (scope `awskinesisreceiver`):
 Set the Collector log level to `debug` to log poll cycles, checkpoint advances,
 lease acquisition, and reconcile decisions.
 
-Supported encodings are `otlp_proto` (default), `otlp_json`, and `otel_arrow`.
+Supported encodings are `otlp_proto` (default) and `otlp_json`.
 The encoding and codec must match the exporter's.
 
 **Status:** working proof of concept for traces, metrics, and logs, with

@@ -10,7 +10,7 @@ This README is about *why the project exists* and *how it is built* — the
 motivations and architectural choices, for evaluators and contributors.
 
 **Status:** working proof of concept. All three signals (traces, metrics, and
-logs) flow end-to-end with `otlp_proto`/`otlp_json`/`otel_arrow` encodings and
+logs) flow end-to-end with `otlp_proto`/`otlp_json` encodings and
 the full collector codec set
 (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`), and shard
 ownership is coordinated and rebalanced across replicas via a KCL-shaped
@@ -33,7 +33,7 @@ Along the way it addresses three gaps the contrib exporter leaves in place.
 (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate` — only
 `lz4` omitted) with pooled `zstd` as the recommended default. The codec
 choice is independent of the encoding choice
-(`otlp_proto`/`otlp_json`/`otel_arrow`) — compression runs on the marshaled
+(`otlp_proto`/`otlp_json`) — compression runs on the marshaled
 bytes either way. **Partition keys and microbatching**: contrib writes one
 record per `ConsumeXxx` call with a random UUID key; this exporter adds a
 stable `tag_hash` strategy and resource-tuple grouping so related telemetry
@@ -73,12 +73,17 @@ and consequences. The overall architecture lives in [`DESIGN.md`](DESIGN.md).
   marshaling differs per signal.
   [ADR-0011](docs/adr/0011-metrics-signal-via-sink-seam.md).
 - **Pluggable wire encoding and compression.** Encoding (`otlp_proto`,
-  `otlp_json`/`otel_arrow`) and codec
+  `otlp_json`) and codec
   (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate` — the
-  collector's set minus `lz4`) are config, with a headerless wire contract that lets
-  exporter and receiver agree. Compressed OTLP-proto is the recommended path
-  and the contrib-gap closer; `otel_arrow` carries a self-contained batch per
-  Kinesis record so any record decodes in isolation.
+  collector's set minus `lz4`) are config, with a headerless wire contract that
+  lets exporter and receiver agree. Compressed OTLP-proto is the recommended
+  path and the contrib-gap closer. `otel_arrow` was prototyped, benchmarked,
+  and then removed: OTAP's compression win depends on a stateful gRPC stream
+  with cross-batch dictionary deltas, which the Kinesis store-and-forward model
+  forfeits — the per-record self-contained variant carries the schema overhead
+  without the payoff. The benchmark numbers and rationale live in
+  [`benchmark.md`](benchmark.md) and
+  [ADR-0020](docs/adr/0020-remove-otel-arrow-encoding.md).
   [ADR-0010](docs/adr/0010-codecs-and-deferred-arrow.md),
   [ADR-0016](docs/adr/0016-add-otlp-json-encoding.md),
   [ADR-0018](docs/adr/0018-implement-otel-arrow-encoding.md).

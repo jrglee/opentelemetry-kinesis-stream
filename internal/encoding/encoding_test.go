@@ -1,8 +1,6 @@
 package encoding
 
 import (
-	"errors"
-	"fmt"
 	"testing"
 
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -11,7 +9,7 @@ import (
 )
 
 func TestRoundTrip(t *testing.T) {
-	encodings := []Encoding{EncodingOTLPProto, EncodingOTLPJSON, EncodingOTelArrow}
+	encodings := []Encoding{EncodingOTLPProto, EncodingOTLPJSON}
 	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy, CodecSnappyFramed, CodecZlib, CodecDeflate}
 
 	for _, e := range encodings {
@@ -61,7 +59,7 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestMetricsRoundTrip(t *testing.T) {
-	encodings := []Encoding{EncodingOTLPProto, EncodingOTLPJSON, EncodingOTelArrow}
+	encodings := []Encoding{EncodingOTLPProto, EncodingOTLPJSON}
 	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy, CodecSnappyFramed, CodecZlib, CodecDeflate}
 	for _, e := range encodings {
 		for _, c := range codecs {
@@ -111,7 +109,7 @@ func TestMetricsRoundTrip(t *testing.T) {
 }
 
 func TestLogsRoundTrip(t *testing.T) {
-	encodings := []Encoding{EncodingOTLPProto, EncodingOTLPJSON, EncodingOTelArrow}
+	encodings := []Encoding{EncodingOTLPProto, EncodingOTLPJSON}
 	codecs := []Codec{CodecNone, CodecGzip, CodecZstd, CodecSnappy, CodecSnappyFramed, CodecZlib, CodecDeflate}
 	for _, e := range encodings {
 		for _, c := range codecs {
@@ -173,116 +171,6 @@ func TestUnknownEncoding(t *testing.T) {
 	if _, err := NewCompressor("bogus"); err == nil {
 		t.Fatal("expected error for unknown codec")
 	}
-}
-
-// TestArrowSelfContained pins the load-bearing invariant of our Arrow
-// implementation: each Marshal must produce a fully self-decodable byte
-// blob — a fresh Consumer (no shared producer state, no prior schema seen)
-// must round-trip it. This guards against a future refactor introducing a
-// reused producer or any other cross-record state, which would silently break
-// Kinesis's per-record delivery model.
-func TestArrowSelfContained(t *testing.T) {
-	encT, err := NewTracesEncoder(EncodingOTelArrow)
-	if err != nil {
-		t.Fatalf("NewTracesEncoder: %v", err)
-	}
-	buf, err := encT.Marshal(sampleTraces())
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	// A brand-new decoder must succeed without any prior context.
-	decT, err := NewTracesDecoder(EncodingOTelArrow)
-	if err != nil {
-		t.Fatalf("NewTracesDecoder: %v", err)
-	}
-	out, err := decT.Unmarshal(buf)
-	if err != nil {
-		t.Fatalf("Unmarshal traces with fresh decoder: %v", err)
-	}
-	if got := out.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Name(); got != "test-span" {
-		t.Fatalf("span name = %q, want %q", got, "test-span")
-	}
-
-	encM, err := NewMetricsEncoder(EncodingOTelArrow)
-	if err != nil {
-		t.Fatalf("NewMetricsEncoder: %v", err)
-	}
-	mbuf, err := encM.Marshal(sampleMetrics())
-	if err != nil {
-		t.Fatalf("Marshal metrics: %v", err)
-	}
-	decM, err := NewMetricsDecoder(EncodingOTelArrow)
-	if err != nil {
-		t.Fatalf("NewMetricsDecoder: %v", err)
-	}
-	mout, err := decM.Unmarshal(mbuf)
-	if err != nil {
-		t.Fatalf("Unmarshal metrics with fresh decoder: %v", err)
-	}
-	if got := mout.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Name(); got != "test-metric" {
-		t.Fatalf("metric name = %q, want %q", got, "test-metric")
-	}
-
-	encL, err := NewLogsEncoder(EncodingOTelArrow)
-	if err != nil {
-		t.Fatalf("NewLogsEncoder: %v", err)
-	}
-	lbuf, err := encL.Marshal(sampleLogs())
-	if err != nil {
-		t.Fatalf("Marshal logs: %v", err)
-	}
-	decL, err := NewLogsDecoder(EncodingOTelArrow)
-	if err != nil {
-		t.Fatalf("NewLogsDecoder: %v", err)
-	}
-	lout, err := decL.Unmarshal(lbuf)
-	if err != nil {
-		t.Fatalf("Unmarshal logs with fresh decoder: %v", err)
-	}
-	if got := lout.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().AsString(); got != "test-log" {
-		t.Fatalf("log body = %q, want %q", got, "test-log")
-	}
-}
-
-// TestArrowMetricsPanicRecovered drives the upstream `arrow_record.Producer`
-// past its "Too many consecutive schema updates" trigger by feeding it
-// extreme-cardinality input. The production encoder must convert the panic
-// to an ErrArrowPanic-wrapped error instead of letting it propagate — a
-// propagated panic would crash the collector process and, on the receiver
-// side, wedge the shard in a checkpoint-free crashloop.
-func TestArrowMetricsPanicRecovered(t *testing.T) {
-	enc, err := NewMetricsEncoder(EncodingOTelArrow)
-	if err != nil {
-		t.Fatalf("NewMetricsEncoder: %v", err)
-	}
-	md := highCardinalityMetrics(20000)
-	_, err = enc.Marshal(md)
-	if err == nil {
-		t.Skip("upstream Arrow no longer panics on this input — verify the producer-side guard is still load-bearing")
-	}
-	if !errors.Is(err, ErrArrowPanic) {
-		t.Fatalf("Marshal error = %v, want errors.Is(err, ErrArrowPanic)", err)
-	}
-}
-
-// highCardinalityMetrics builds a pmetric.Metrics whose every datapoint has a
-// unique attribute set, which exceeds the upstream Producer's internal
-// schema-update budget at modest n. Deterministic — no clocks, no global RNG.
-func highCardinalityMetrics(n int) pmetric.Metrics {
-	md := pmetric.NewMetrics()
-	rm := md.ResourceMetrics().AppendEmpty()
-	rm.Resource().Attributes().PutStr("service.name", "panic-probe")
-	m := rm.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
-	m.SetName("http.server.request.duration")
-	dps := m.SetEmptyHistogram().DataPoints()
-	for i := 0; i < n; i++ {
-		dp := dps.AppendEmpty()
-		dp.SetCount(uint64(i + 1))
-		dp.SetSum(float64(i))
-		dp.Attributes().PutStr("request.id", fmt.Sprintf("req-%010d", i))
-		dp.Attributes().PutStr("user.id", fmt.Sprintf("u-%08x", i*2654435761))
-	}
-	return md
 }
 
 func sampleTraces() ptrace.Traces {

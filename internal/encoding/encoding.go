@@ -39,13 +39,6 @@ const (
 	EncodingOTLPProto Encoding = "otlp_proto"
 	// EncodingOTLPJSON is the OTLP JSON encoding.
 	EncodingOTLPJSON Encoding = "otlp_json"
-	// EncodingOTelArrow is the OpenTelemetry Arrow encoding. Each Kinesis
-	// record carries a fully self-contained Arrow batch (fresh producer per
-	// Marshal, fresh consumer per Unmarshal) so that any single record is
-	// decodable in isolation, which is required by Kinesis's store-and-forward
-	// delivery model. Cross-batch dictionary-delta compression is forfeited as
-	// a deliberate trade-off; see ADR-0018.
-	EncodingOTelArrow Encoding = "otel_arrow"
 )
 
 // TracesEncoder serializes a ptrace.Traces to its on-wire byte form. The
@@ -100,8 +93,6 @@ func NewTracesEncoder(e Encoding) (TracesEncoder, error) {
 		return otlpProtoTraces{}, nil
 	case EncodingOTLPJSON:
 		return otlpJSONTraces{}, nil
-	case EncodingOTelArrow:
-		return otlpArrowTraces{}, nil
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", e)
 	}
@@ -114,8 +105,6 @@ func NewTracesDecoder(e Encoding) (TracesDecoder, error) {
 		return otlpProtoTraces{}, nil
 	case EncodingOTLPJSON:
 		return otlpJSONTraces{}, nil
-	case EncodingOTelArrow:
-		return otlpArrowTraces{}, nil
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", e)
 	}
@@ -128,8 +117,6 @@ func NewMetricsEncoder(e Encoding) (MetricsEncoder, error) {
 		return otlpProtoMetrics{}, nil
 	case EncodingOTLPJSON:
 		return otlpJSONMetrics{}, nil
-	case EncodingOTelArrow:
-		return otlpArrowMetrics{}, nil
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", e)
 	}
@@ -142,8 +129,6 @@ func NewMetricsDecoder(e Encoding) (MetricsDecoder, error) {
 		return otlpProtoMetrics{}, nil
 	case EncodingOTLPJSON:
 		return otlpJSONMetrics{}, nil
-	case EncodingOTelArrow:
-		return otlpArrowMetrics{}, nil
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", e)
 	}
@@ -156,8 +141,6 @@ func NewLogsEncoder(e Encoding) (LogsEncoder, error) {
 		return otlpProtoLogs{}, nil
 	case EncodingOTLPJSON:
 		return otlpJSONLogs{}, nil
-	case EncodingOTelArrow:
-		return otlpArrowLogs{}, nil
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", e)
 	}
@@ -170,8 +153,6 @@ func NewLogsDecoder(e Encoding) (LogsDecoder, error) {
 		return otlpProtoLogs{}, nil
 	case EncodingOTLPJSON:
 		return otlpJSONLogs{}, nil
-	case EncodingOTelArrow:
-		return otlpArrowLogs{}, nil
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", e)
 	}

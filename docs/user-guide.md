@@ -8,7 +8,7 @@ rebalancing, graceful handoff, crash recovery, and resharding. You can treat
 the components as a black box; nothing here requires reading the source.
 
 > **Status:** proof of concept. All three signals (traces, metrics, logs),
-> `otlp_proto`/`otlp_json`/`otel_arrow` encodings,
+> `otlp_proto`/`otlp_json` encodings,
 > `none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`
 > compression. Known gaps and follow-ups (live-reshard verification, EFO)
 > are in [Limitations](#limitations).
@@ -279,7 +279,7 @@ a stable key (see [Tag-grouped microbatching](#tag-grouped-microbatching)).
 | `stream_name`             | string | —            | yes      | Target Kinesis Data Stream. |
 | `region`                  | string | —            | yes      | AWS region of the stream. |
 | `endpoint`                | string | (SDK default)| no       | Override the AWS endpoint URL. Set this for emulators (e.g. `http://ministack:4566`). |
-| `encoding`                | string | `otlp_proto` | no       | Wire format: `otlp_proto` (compact, recommended), `otlp_json` (interoperable/debuggable), or `otel_arrow` (self-contained per-record Arrow batch) — see [Encodings](#encodings). |
+| `encoding`                | string | `otlp_proto` | no       | Wire format: `otlp_proto` (compact, recommended) or `otlp_json` (interoperable/debuggable) — see [Encodings](#encodings). |
 | `compression`             | string | `none`       | no       | Payload codec: `none`, `gzip`, `zstd`, `snappy`, `x-snappy-framed`, `zlib`, or `deflate` (the collector's full set). See [Choosing compression](#choosing-compression). |
 | `partition_key.strategy`  | string | `random`     | no       | `random` (one key per record, spreads across shards) or `tag_hash` (stable key per resource-attribute tuple, co-locates by tag and groups the batch). |
 | `partition_key.tags`      | list   | —            | if tag_hash | Ordered list of resource attribute keys forming the tag tuple. Records sharing a tuple get the same key and land on the same shard. |
@@ -362,7 +362,12 @@ receiver expects — they are agreed by configuration on both ends.
 |--------------|--------|----------------------|
 | `otlp_proto` | supported (default) | The compact, recommended choice. Pair with a codec for the smallest records. Wire-compatible with the contrib exporter. |
 | `otlp_json`  | supported | Human-readable and broadly interoperable — useful for debugging or for a downstream consumer that wants JSON. It is more verbose than proto, so compress it (e.g. `zstd`). |
-| `otel_arrow` | supported | Each Kinesis record carries a self-contained Arrow batch (fresh producer per record). Per-record schema overhead is paid every time — cross-batch dictionary compression is forfeited as the price of compatibility with Kinesis's store-and-forward delivery. Reach for it if your collector edges already standardize on Arrow or you need its richer wire-level types. Run `make perf` for the empirical encode/decode and compression-ratio numbers per dataset profile. See [ADR-0018](adr/0018-implement-otel-arrow-encoding.md). |
+
+`otel_arrow` was prototyped, benchmarked, and removed: OTAP's compression
+advantage relies on a stateful gRPC stream with cross-batch dictionary deltas,
+which Kinesis's per-record store-and-forward model forfeits. The numbers and
+rationale are in [`benchmark.md`](../benchmark.md) and
+[ADR-0020](adr/0020-remove-otel-arrow-encoding.md).
 
 Adopt `otlp_json` by setting it on both ends (encoding is agreed by config):
 
@@ -373,19 +378,6 @@ exporters:
     region: us-east-1
     encoding: otlp_json
     compression: zstd   # offsets JSON's verbosity
-```
-
-Adopt `otel_arrow` the same way. Because every record re-ships the Arrow
-schema, microbatching helps amortize that overhead — set the upstream batch
-processor's `send_batch_size` larger when you can:
-
-```yaml
-exporters:
-  awskinesis:
-    stream_name: otel-metrics
-    region: us-east-1
-    encoding: otel_arrow
-    compression: zstd
 ```
 
 ### Choosing compression
@@ -1054,15 +1046,15 @@ compressed byte size, and compression ratio.
 The harness is deliberately portable across architectures: dataset bytes are
 generated from a fixed seed, so `compressed_bytes` and `compression_ratio`
 are byte-identical on any host. Wall-clock numbers (`ns/op`) vary with CPU,
-but the *ordering* of encodings on the same host — which is the comparison
-that decides "should I pick Arrow here?" — is stable.
+but the *ordering* of encodings on the same host — the comparison that
+decides "which encoding/codec pair fits my workload?" — is stable.
 
 Profiles, focused on the metrics signal where they map onto real workloads:
 
 | Profile | Shape | What it stress-tests |
 |---|---|---|
-| `metrics-high-cardinality` | Many unique attribute combinations, few datapoints per series | Arrow's per-record schema overhead — fresh-producer-per-record cannot amortize the dictionary across records. |
-| `metrics-high-frequency` | Small attribute fan-out, many datapoints per series | Where Arrow's intra-record dictionary encoding *should* pay off on this transport. |
+| `metrics-high-cardinality` | Many unique attribute combinations, few datapoints per series | Per-record encoders without cross-record state — no value repetition to amortize. |
+| `metrics-high-frequency` | Small attribute fan-out, many datapoints per series | Where dictionary-style intra-record compression should pay off. |
 | `metrics-balanced` | Moderate of both | Sanity check that the conclusions don't depend on a pathological dataset. |
 | `traces-typical` | One representative trace shape | Apples-to-apples for the OTLP-proto baseline. |
 
@@ -1073,15 +1065,12 @@ make perf | tee perf.txt
 ```
 
 Compare two runs (different hosts, different commits) with [`benchstat`].
-Read the table for your workload's profile column. The `otel_arrow`
-decode-superiority claim from upstream is either visible in the numbers for
-your profile or it isn't — argue from the data, not from the claim.
 
-A captured run of the harness — including every (encoding × codec × profile
-× batch size) cell with p50/p90/min/max/mean per call — lives at
-[`benchmark.md`](../benchmark.md). It is a snapshot from one host;
-re-running `make perf` on your own hardware reproduces the byte sizes and
-ratios exactly, with wall-clock numbers scaled to your CPU.
+A captured run of the harness — every (encoding × codec × profile × batch
+size) cell with p50/p90/min/max/mean per call, plus a short summary of the
+Arrow evaluation that motivated [ADR-0020](adr/0020-remove-otel-arrow-encoding.md)
+— lives at [`benchmark.md`](../benchmark.md). Byte sizes and ratios
+reproduce exactly on any host; wall-clock numbers scale to your CPU.
 
 [`benchstat`]: https://pkg.go.dev/golang.org/x/perf/cmd/benchstat
 

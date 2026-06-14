@@ -90,15 +90,15 @@ def fmt_ratio(x):
     return f'{x:.2f}×'
 
 def fmt_bpr(x):
-    """Bytes per record. Sub-1 B/rec is meaningful (e.g. Arrow at large n);
-    show two decimals for those, else just integer-ish."""
+    """Bytes per record. Sub-1 B/rec is meaningful at large n; show two
+    decimals for those, else just integer-ish."""
     if x is None: return '—'
     if x < 10: return f'{x:.2f}B'
     if x < 1024: return f'{x:.0f}B'
     return f'{x/1024:.1f}KiB'
 
 def codec_order(): return ['none', 'gzip', 'zstd', 'snappy', 'x-snappy-framed', 'zlib', 'deflate']
-def enc_order(): return ['otlp_proto', 'otlp_json', 'otel_arrow']
+def enc_order(): return ['otlp_proto', 'otlp_json']
 def batch_order(): return [1, 10, 100, 1000, 10000, 100000, 1000000]
 
 def cells_for(rows_by_key, codec, n, encs):

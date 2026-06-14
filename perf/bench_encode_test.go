@@ -11,10 +11,8 @@ import (
 )
 
 // warmupIterations is the number of throw-away (encode, compress) cycles we
-// run before each benchmark resets its timer. Priming both Arrow's internal
-// pools and the codec writer state keeps first-call allocation noise out of
-// the steady-state numbers. Kept small so warm-up wall time stays bounded at
-// the very large batch sizes (n=1M Arrow encode is ~3s per call).
+// run before each benchmark resets its timer. Priming codec writer state keeps
+// first-call allocation noise out of the steady-state numbers.
 const warmupIterations = 5
 
 // benchEncodings is the per-profile sweep of encodings. Codecs are swept
@@ -22,7 +20,6 @@ const warmupIterations = 5
 var benchEncodings = []encoding.Encoding{
 	encoding.EncodingOTLPProto,
 	encoding.EncodingOTLPJSON,
-	encoding.EncodingOTelArrow,
 }
 
 // benchCodecs is the full codec set the encoding layer exposes. Each codec
@@ -60,14 +57,9 @@ func BenchmarkEncodeMetrics(b *testing.B) {
 					}
 					name := fmt.Sprintf("%s/%s/%s/n=%d", profile, e, c, size)
 					b.Run(name, func(b *testing.B) {
-						// Warm-up: prime buffer pools (Arrow producer state,
-						// zstd window, etc.). Discarded before the timer runs.
-						// Upstream Arrow can panic on extreme cardinality;
-						// safeMarshal converts the panic to an error so the
-						// case is skipped and the matrix continues.
 						var rawLen, compressedLen int
 						for i := 0; i < warmupIterations; i++ {
-							raw, err := safeMarshal(enc.Marshal, md)
+							raw, err := enc.Marshal(md)
 							if err != nil {
 								b.Skipf("encode unsupported on this profile/size: %v", err)
 								return
@@ -85,7 +77,7 @@ func BenchmarkEncodeMetrics(b *testing.B) {
 						b.ReportAllocs()
 						for i := 0; i < b.N; i++ {
 							t0 := time.Now()
-							raw, err := safeMarshal(enc.Marshal, md)
+							raw, err := enc.Marshal(md)
 							if err != nil {
 								b.Fatalf("Marshal: %v", err)
 							}
@@ -103,13 +95,6 @@ func BenchmarkEncodeMetrics(b *testing.B) {
 						if compressedLen > 0 {
 							b.ReportMetric(float64(rawLen)/float64(compressedLen), "compression_ratio")
 						}
-						// bytes_per_record normalizes the on-wire size by the
-						// number of datapoints (or spans) the record carries.
-						// This is the shard-bandwidth-relevant number: doubling
-						// a record from 100 to 1000 datapoints does not double
-						// its bytes (Arrow's schema overhead amortizes,
-						// dictionaries pack tighter), so bytes/datapoint is the
-						// curve that decides "should I batch more?".
 						if size > 0 {
 							b.ReportMetric(float64(compressedLen)/float64(size), "compressed_bytes_per_record")
 							b.ReportMetric(float64(rawLen)/float64(size), "raw_bytes_per_record")
@@ -141,7 +126,7 @@ func BenchmarkEncodeTraces(b *testing.B) {
 				b.Run(name, func(b *testing.B) {
 					var rawLen, compressedLen int
 					for i := 0; i < warmupIterations; i++ {
-						raw, err := safeMarshal(enc.Marshal, td)
+						raw, err := enc.Marshal(td)
 						if err != nil {
 							b.Skipf("encode unsupported on this profile/size: %v", err)
 							return
@@ -159,7 +144,7 @@ func BenchmarkEncodeTraces(b *testing.B) {
 					b.ReportAllocs()
 					for i := 0; i < b.N; i++ {
 						t0 := time.Now()
-						raw, err := safeMarshal(enc.Marshal, td)
+						raw, err := enc.Marshal(td)
 						if err != nil {
 							b.Fatalf("Marshal: %v", err)
 						}

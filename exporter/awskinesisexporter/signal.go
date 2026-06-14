@@ -45,10 +45,9 @@ func tracesCodec(enc encoding.TracesEncoder) signalCodec[ptrace.Traces] {
 // Non-string kinds (bool, int, double, bytes, slice, map) are never touched —
 // numeric values do not bloat records, and mutating structured kinds would
 // rewrite semantics rather than trim them. The truncation backsteps to a
-// codepoint boundary so the output remains valid UTF-8; encoders downstream
-// (notably otel_arrow) reject invalid sequences, and otlp_json silently
-// substitutes the replacement character, both of which are worse than
-// emitting a few fewer bytes than maxBytes.
+// codepoint boundary so the output remains valid UTF-8; otlp_json silently
+// substitutes the replacement character on invalid sequences, which is worse
+// than emitting a few fewer bytes than maxBytes.
 func clampStringAttrs(m pcommon.Map, maxBytes int) int {
 	changed := 0
 	m.Range(func(_ string, v pcommon.Value) bool {

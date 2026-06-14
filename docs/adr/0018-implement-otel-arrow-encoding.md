@@ -1,6 +1,6 @@
 # 0018. Implement `otel_arrow` encoding with per-record self-contained batches
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0020](0020-remove-otel-arrow-encoding.md)
 - **Date:** 2026-06-13
 
 ## Context
