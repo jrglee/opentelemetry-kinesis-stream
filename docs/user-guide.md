@@ -390,9 +390,11 @@ exporters:
 
 ### Choosing compression
 
-**Compression is this exporter's headline advantage over the contrib Kinesis
-exporter, which does not compress at all** — a real limiter against Kinesis's
-per-record size cap. Compression runs before the `max_record_size` check, so a
+**Compression breadth is this exporter's headline advantage over the contrib
+Kinesis exporter, which ships only `flate`/`gzip`/`zlib`/`none` at a single
+level — no `zstd`, no `snappy`, no streaming-Snappy variants** — a real
+limiter against Kinesis's per-record size cap on the codecs that actually
+compress well per CPU spent. Compression runs before the `max_record_size` check, so a
 good codec packs more telemetry per record and reduces both shard count and
 dropped-or-split records. The codec must be matched by the receiver's
 `compression` setting.

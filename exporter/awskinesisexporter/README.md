@@ -13,8 +13,10 @@ Supported encodings are `otlp_proto` (default, recommended), `otlp_json`, and
 producer per record) so the receiver can decode any single record in
 isolation; the per-record schema overhead is paid every time. Compression
 (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`) is the key
-advantage over the contrib Kinesis exporter, which does not compress —
-compressed `otlp_proto` is the recommended configuration.
+advantage over the contrib Kinesis exporter, which ships only
+`flate`/`gzip`/`zlib`/`none` at a single level — `zstd` and `snappy` are the
+codecs that actually pay off here. Compressed `otlp_proto` is the recommended
+configuration.
 
 **Status:** working proof of concept for traces, metrics, and logs, including
 tag-grouped microbatching and oversize-record repacking.

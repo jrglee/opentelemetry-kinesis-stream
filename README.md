@@ -19,14 +19,30 @@ tracked in [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md).
 
 ## Why this exists
 
-The `opentelemetry-collector-contrib` project ships a Kinesis **exporter** but
-no Kinesis Data Streams **receiver** — there is no first-party way to consume
-OTLP telemetry back off a stream. This project closes that gap, and along the
-way addresses gaps the contrib exporter leaves in place. The biggest is
-**compression**: the contrib exporter does not compress, which is a real limiter
-against Kinesis's per-record size cap — this exporter adds `zstd`/`snappy`/`gzip`
-over OTLP-proto, plus deterministic partition keys. (Record size is configurable
-and defaults to the 1 MiB standard-API ceiling.)
+The `opentelemetry-collector-contrib` project ships an `awskinesisexporter`
+(Beta — traces, metrics, logs; encodings
+`otlp_proto`/`otlp_json`/`jaeger_proto`/`zipkin_proto`/`zipkin_json`;
+compressions `flate`/`gzip`/`zlib`/`none` at a single level; random-UUID
+partition key per record) but **no Kinesis Data Streams receiver** — there is
+no first-party way to consume OTLP telemetry back off a stream. Closing that
+gap is this project's reason to exist.
+
+Along the way it addresses three gaps the contrib exporter leaves in place.
+**Compression breadth**: this exporter exposes the Collector's full
+`configcompression` set
+(`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate` — only
+`lz4` omitted) with pooled `zstd` as the recommended default. The codec
+choice is independent of the encoding choice
+(`otlp_proto`/`otlp_json`/`otel_arrow`) — compression runs on the marshaled
+bytes either way. **Partition keys and microbatching**: contrib writes one
+record per `ConsumeXxx` call with a random UUID key; this exporter adds a
+stable `tag_hash` strategy and resource-tuple grouping so related telemetry
+co-locates on the same shard in order. **Record size**: `max_record_size` is
+an operator knob (raise to Kinesis's [10 MiB opt-in
+ceiling](https://aws.amazon.com/blogs/big-data/amazon-kinesis-data-streams-now-supports-10x-larger-record-sizes-simplifying-real-time-data-processing)),
+backed by an oversize-recovery chain (`split_half`,
+`truncate_attribute_values`, `reject`) so an oversize microbatch is repacked
+rather than dropped. Default stays at the conservative 1 MiB.
 
 The hard part is not writing to or reading from Kinesis — it is consuming a
 sharded, resharding stream correctly across multiple collector replicas without
