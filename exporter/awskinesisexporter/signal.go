@@ -5,6 +5,7 @@ import (
 	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
@@ -378,4 +379,133 @@ func metricCount(rm pmetric.ResourceMetrics) int {
 		n += sms.At(i).Metrics().Len()
 	}
 	return n
+}
+
+// logsCodec adapts plog.Logs to the generic record pipeline.
+func logsCodec(enc encoding.LogsEncoder) signalCodec[plog.Logs] {
+	return signalCodec[plog.Logs]{
+		groupByTags:        groupLogsByTags,
+		splitHalf:          splitLogsHalf,
+		truncateAttributes: truncateLogsAttributes,
+		marshal:            enc.Marshal,
+		itemCount:          func(ld plog.Logs) int { return ld.LogRecordCount() },
+	}
+}
+
+// truncateLogsAttributes returns a clone of ld with every string-valued
+// attribute (resource, scope, log record) clamped to maxBytes. String bodies
+// are clamped too, because the body is the most common bloat vector for logs
+// (long messages, stack traces, JSON dumps) and the truncate policy's purpose
+// is to trim payload bloat. Non-string bodies (maps, slices, bytes) are left
+// untouched — mutating structured kinds would rewrite semantics rather than
+// trim them, same rule as clampStringAttrs.
+func truncateLogsAttributes(ld plog.Logs, maxBytes int) (plog.Logs, int) {
+	out := plog.NewLogs()
+	ld.CopyTo(out)
+	changed := 0
+	rls := out.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		rl := rls.At(i)
+		changed += clampStringAttrs(rl.Resource().Attributes(), maxBytes)
+		sls := rl.ScopeLogs()
+		for j := 0; j < sls.Len(); j++ {
+			sl := sls.At(j)
+			changed += clampStringAttrs(sl.Scope().Attributes(), maxBytes)
+			lrs := sl.LogRecords()
+			for k := 0; k < lrs.Len(); k++ {
+				lr := lrs.At(k)
+				changed += clampStringAttrs(lr.Attributes(), maxBytes)
+				if lr.Body().Type() == pcommon.ValueTypeStr {
+					s := lr.Body().Str()
+					if len(s) > maxBytes {
+						lr.Body().SetStr(s[:utf8SafeCut(s, maxBytes)])
+						changed++
+					}
+				}
+			}
+		}
+	}
+	return out, changed
+}
+
+func groupLogsByTags(ld plog.Logs, tags []string) []taggedBatch[plog.Logs] {
+	if len(tags) == 0 {
+		return []taggedBatch[plog.Logs]{{key: "", batch: ld}}
+	}
+	byKey := map[string]plog.Logs{}
+	var order []string
+	rls := ld.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		rl := rls.At(i)
+		key := tagKey(rl.Resource().Attributes(), tags)
+		dst, ok := byKey[key]
+		if !ok {
+			dst = plog.NewLogs()
+			byKey[key] = dst
+			order = append(order, key)
+		}
+		rl.CopyTo(dst.ResourceLogs().AppendEmpty())
+	}
+	out := make([]taggedBatch[plog.Logs], 0, len(order))
+	for _, k := range order {
+		out = append(out, taggedBatch[plog.Logs]{key: k, batch: byKey[k]})
+	}
+	return out
+}
+
+// splitLogsHalf mirrors splitTracesHalf: split resources when there are
+// several, else split the single resource's log records (across all scopes)
+// in half. A LogRecord is the indivisible leaf. ok is false for one resource
+// holding one log record. The input is never mutated.
+func splitLogsHalf(ld plog.Logs) (plog.Logs, plog.Logs, bool) {
+	rls := ld.ResourceLogs()
+	if rls.Len() > 1 {
+		mid := rls.Len() / 2
+		a, b := plog.NewLogs(), plog.NewLogs()
+		for i := 0; i < rls.Len(); i++ {
+			if i < mid {
+				rls.At(i).CopyTo(a.ResourceLogs().AppendEmpty())
+			} else {
+				rls.At(i).CopyTo(b.ResourceLogs().AppendEmpty())
+			}
+		}
+		return a, b, true
+	}
+	if rls.Len() == 0 || ld.LogRecordCount() <= 1 {
+		return plog.Logs{}, plog.Logs{}, false
+	}
+	rl := rls.At(0)
+	mid := ld.LogRecordCount() / 2
+	a, b := plog.NewLogs(), plog.NewLogs()
+	ra, rb := a.ResourceLogs().AppendEmpty(), b.ResourceLogs().AppendEmpty()
+	rl.Resource().CopyTo(ra.Resource())
+	rl.Resource().CopyTo(rb.Resource())
+	ra.SetSchemaUrl(rl.SchemaUrl())
+	rb.SetSchemaUrl(rl.SchemaUrl())
+	seen := 0
+	sls := rl.ScopeLogs()
+	for i := 0; i < sls.Len(); i++ {
+		sl := sls.At(i)
+		var da, db plog.ScopeLogs
+		lrs := sl.LogRecords()
+		for j := 0; j < lrs.Len(); j++ {
+			if seen < mid {
+				if da == (plog.ScopeLogs{}) {
+					da = ra.ScopeLogs().AppendEmpty()
+					sl.Scope().CopyTo(da.Scope())
+					da.SetSchemaUrl(sl.SchemaUrl())
+				}
+				lrs.At(j).CopyTo(da.LogRecords().AppendEmpty())
+			} else {
+				if db == (plog.ScopeLogs{}) {
+					db = rb.ScopeLogs().AppendEmpty()
+					sl.Scope().CopyTo(db.Scope())
+					db.SetSchemaUrl(sl.SchemaUrl())
+				}
+				lrs.At(j).CopyTo(db.LogRecords().AppendEmpty())
+			}
+			seen++
+		}
+	}
+	return a, b, true
 }

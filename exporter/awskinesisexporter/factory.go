@@ -19,6 +19,7 @@ func NewFactory() exporter.Factory {
 		createDefaultConfig,
 		exporter.WithTraces(createTracesExporter, component.StabilityLevelDevelopment),
 		exporter.WithMetrics(createMetricsExporter, component.StabilityLevelDevelopment),
+		exporter.WithLogs(createLogsExporter, component.StabilityLevelDevelopment),
 	)
 }
 
@@ -60,6 +61,18 @@ func createMetricsExporter(
 	set exporter.Settings,
 	rawCfg component.Config,
 ) (exporter.Metrics, error) {
+	cfg, ok := rawCfg.(*Config)
+	if !ok {
+		return nil, fmt.Errorf("unexpected config type %T", rawCfg)
+	}
+	return newExporter(ctx, cfg, set)
+}
+
+func createLogsExporter(
+	ctx context.Context,
+	set exporter.Settings,
+	rawCfg component.Config,
+) (exporter.Logs, error) {
 	cfg, ok := rawCfg.(*Config)
 	if !ok {
 		return nil, fmt.Errorf("unexpected config type %T", rawCfg)

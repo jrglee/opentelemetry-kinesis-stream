@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 	"github.com/aws/smithy-go/middleware"
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -80,6 +81,18 @@ func metricsWith(tuples [][2]string) pmetric.Metrics {
 		dp.SetIntValue(1)
 	}
 	return md
+}
+
+func logsWith(tuples [][2]string) plog.Logs {
+	ld := plog.NewLogs()
+	for _, t := range tuples {
+		rl := ld.ResourceLogs().AppendEmpty()
+		rl.Resource().Attributes().PutStr("service.name", t[0])
+		rl.Resource().Attributes().PutStr("region", t[1])
+		lr := rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+		lr.Body().SetStr(t[0] + "-" + t[1])
+	}
+	return ld
 }
 
 func tagHashCfg() *Config {
@@ -176,6 +189,41 @@ func TestMetricsTagGrouping(t *testing.T) {
 	}
 	if totalDP != len(all) {
 		t.Fatalf("datapoints preserved: got %d want %d", totalDP, len(all))
+	}
+}
+
+func TestLogsTagGrouping(t *testing.T) {
+	capt := &capture{}
+	exp := newTestExporterCfg(t, tagHashCfg(), capt.injectSerialize())
+	tps := tuples()
+	all := append(append([][2]string{}, tps...), tps...)
+	if err := exp.ConsumeLogs(context.Background(), logsWith(all)); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	recs := capt.all()
+	if len(recs) != len(tps) {
+		t.Fatalf("records: got %d want %d", len(recs), len(tps))
+	}
+	dec, _ := encoding.NewLogsDecoder(encoding.EncodingOTLPProto)
+	totalLR := 0
+	keys := map[string]string{}
+	for _, r := range recs {
+		ld, err := dec.Unmarshal(r.Data)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		totalLR += ld.LogRecordCount()
+		rl := ld.ResourceLogs().At(0)
+		svc, _ := rl.Resource().Attributes().Get("service.name")
+		reg, _ := rl.Resource().Attributes().Get("region")
+		name := svc.AsString() + "/" + reg.AsString()
+		if prev, ok := keys[name]; ok && prev != aws.ToString(r.PartitionKey) {
+			t.Fatalf("unstable key for %s", name)
+		}
+		keys[name] = aws.ToString(r.PartitionKey)
+	}
+	if totalLR != len(all) {
+		t.Fatalf("log records preserved: got %d want %d", totalLR, len(all))
 	}
 }
 

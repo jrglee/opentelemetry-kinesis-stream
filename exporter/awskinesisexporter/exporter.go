@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
@@ -28,6 +29,7 @@ type kinesisExporter struct {
 	client     *kinesis.Client
 	tracesEnc  encoding.TracesEncoder
 	metricsEnc encoding.MetricsEncoder
+	logsEnc    encoding.LogsEncoder
 	comp       encoding.Compressor
 	logger     *zap.Logger
 	tel        *exporterTelemetry
@@ -41,6 +43,10 @@ func newExporter(ctx context.Context, cfg *Config, set exporter.Settings) (*kine
 	mEnc, err := encoding.NewMetricsEncoder(cfg.Encoding)
 	if err != nil {
 		return nil, fmt.Errorf("metrics encoder: %w", err)
+	}
+	lEnc, err := encoding.NewLogsEncoder(cfg.Encoding)
+	if err != nil {
+		return nil, fmt.Errorf("logs encoder: %w", err)
 	}
 	comp, err := encoding.NewCompressor(cfg.Compression)
 	if err != nil {
@@ -59,6 +65,7 @@ func newExporter(ctx context.Context, cfg *Config, set exporter.Settings) (*kine
 		client:     client,
 		tracesEnc:  tEnc,
 		metricsEnc: mEnc,
+		logsEnc:    lEnc,
 		comp:       comp,
 		logger:     set.Logger,
 		tel:        tel,
@@ -77,6 +84,10 @@ func (e *kinesisExporter) ConsumeTraces(ctx context.Context, td ptrace.Traces) e
 
 func (e *kinesisExporter) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) error {
 	return emit(ctx, e, md, metricsCodec(e.metricsEnc))
+}
+
+func (e *kinesisExporter) ConsumeLogs(ctx context.Context, ld plog.Logs) error {
+	return emit(ctx, e, ld, logsCodec(e.logsEnc))
 }
 
 // classifyPutRecordsError marks errors the Collector's retry helper has no
