@@ -21,6 +21,7 @@ func NewFactory() receiver.Factory {
 		createDefaultConfig,
 		receiver.WithTraces(createTracesReceiver, component.StabilityLevelDevelopment),
 		receiver.WithMetrics(createMetricsReceiver, component.StabilityLevelDevelopment),
+		receiver.WithLogs(createLogsReceiver, component.StabilityLevelDevelopment),
 	)
 }
 
@@ -61,4 +62,17 @@ func createMetricsReceiver(
 		return nil, fmt.Errorf("unexpected config type %T", rawCfg)
 	}
 	return newMetricsReceiver(cfg, next, set)
+}
+
+func createLogsReceiver(
+	_ context.Context,
+	set receiver.Settings,
+	rawCfg component.Config,
+	next consumer.Logs,
+) (receiver.Logs, error) {
+	cfg, ok := rawCfg.(*Config)
+	if !ok {
+		return nil, fmt.Errorf("unexpected config type %T", rawCfg)
+	}
+	return newLogsReceiver(cfg, next, set)
 }

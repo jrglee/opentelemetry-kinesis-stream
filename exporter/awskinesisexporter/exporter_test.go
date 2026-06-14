@@ -91,6 +91,10 @@ func newTestExporterCfg(t *testing.T, cfg *Config, inject func(*kinesis.Options)
 	if err != nil {
 		t.Fatalf("metrics encoder: %v", err)
 	}
+	lEnc, err := encoding.NewLogsEncoder(cfg.Encoding)
+	if err != nil {
+		t.Fatalf("logs encoder: %v", err)
+	}
 	comp, err := encoding.NewCompressor(cfg.Compression)
 	if err != nil {
 		t.Fatalf("compressor: %v", err)
@@ -110,6 +114,7 @@ func newTestExporterCfg(t *testing.T, cfg *Config, inject func(*kinesis.Options)
 		client:     client,
 		tracesEnc:  tEnc,
 		metricsEnc: mEnc,
+		logsEnc:    lEnc,
 		comp:       comp,
 		logger:     zap.NewNop(),
 		tel:        tel,

@@ -55,6 +55,18 @@ func newMetricsReceiver(cfg *Config, next consumer.Metrics, set receiver.Setting
 	return &kinesisReceiver{cfg: cfg, sink: metricsSink{decoder: dec, consumer: next}, logger: set.Logger, tel: tel}, nil
 }
 
+func newLogsReceiver(cfg *Config, next consumer.Logs, set receiver.Settings) (*kinesisReceiver, error) {
+	dec, err := encoding.NewLogsDecoder(cfg.Encoding)
+	if err != nil {
+		return nil, fmt.Errorf("decoder: %w", err)
+	}
+	tel, err := newReceiverTelemetry(set.MeterProvider)
+	if err != nil {
+		return nil, fmt.Errorf("telemetry: %w", err)
+	}
+	return &kinesisReceiver{cfg: cfg, sink: logsSink{decoder: dec, consumer: next}, logger: set.Logger, tel: tel}, nil
+}
+
 func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
 	client, err := newKinesisClient(ctx, r.cfg.Region, r.cfg.Endpoint)
 	if err != nil {

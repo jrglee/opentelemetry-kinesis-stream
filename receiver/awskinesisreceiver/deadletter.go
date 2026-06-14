@@ -5,6 +5,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
@@ -45,4 +46,14 @@ func deadLetterMetrics(rec types.Record, failureClass, encName, codecName string
 	dp.SetIntValue(1)
 	deadLetterAttrs(func(k, v string) { dp.Attributes().PutStr(k, v) }, rec, failureClass, encName, codecName)
 	return md
+}
+
+// deadLetterLogs wraps a failed raw record as a single log record so a logs
+// pipeline can carry it.
+func deadLetterLogs(rec types.Record, failureClass, encName, codecName string) plog.Logs {
+	ld := plog.NewLogs()
+	lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	lr.Body().SetStr(deadLetterName)
+	deadLetterAttrs(func(k, v string) { lr.Attributes().PutStr(k, v) }, rec, failureClass, encName, codecName)
+	return ld
 }

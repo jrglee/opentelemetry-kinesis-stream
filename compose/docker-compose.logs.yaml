@@ -1,0 +1,82 @@
+# Logs E2E stack: telemetrygen -> producer (OTLP -> Kinesis) -> MiniStack
+# Kinesis -> consumer (Kinesis -> file).
+#
+# A separate stack from docker-compose.yaml so the traces E2E stays untouched.
+# Single consumer replica with two shards proves the logs round-trip end to
+# end; the multi-replica safety property is already covered by the traces E2E.
+#
+# Consumer output lands on a named volume (not a host bind mount, which colima
+# does not surface back to the macOS host); the test harness pulls the file
+# out with `docker compose cp`.
+name: otel-kinesis-logs
+
+services:
+  ministack:
+    image: ministackorg/ministack:1.3.63
+    ports:
+      - "4566:4566"
+
+  stream-init-logs:
+    image: amazon/aws-cli:2.31.13
+    entrypoint: ["/bin/sh", "/init/stream-init-logs.sh"]
+    volumes:
+      - ./stream-init-logs.sh:/init/stream-init-logs.sh:ro
+    depends_on:
+      ministack:
+        condition: service_started
+
+  producer-logs:
+    image: otelcol-kinesis:dev
+    build:
+      context: ..
+      dockerfile: cmd/otelcol-kinesis/Dockerfile
+    command: ["--config", "file:/etc/otelcol/config.yaml"]
+    ports:
+      - "4317:4317"
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      ENCODING: ${ENCODING:-otlp_proto}
+      COMPRESSION: ${COMPRESSION:-gzip}
+    volumes:
+      - ./producer-logs.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      stream-init-logs:
+        condition: service_completed_successfully
+
+  consumer-logs:
+    image: otelcol-kinesis:dev
+    build:
+      context: ..
+      dockerfile: cmd/otelcol-kinesis/Dockerfile
+    command: ["--config", "file:/etc/otelcol/config.yaml"]
+    environment:
+      REPLICA: a
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      ENCODING: ${ENCODING:-otlp_proto}
+      COMPRESSION: ${COMPRESSION:-gzip}
+    volumes:
+      - ./consumer-logs.yaml:/etc/otelcol/config.yaml:ro
+      - shared:/shared
+    depends_on:
+      stream-init-logs:
+        condition: service_completed_successfully
+
+  # Not started with `up`; the test invokes it via `docker compose run` once
+  # the stack is confirmed ready, so emission timing is controlled.
+  telemetrygen:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.154.0
+    profiles: ["tools"]
+    command:
+      - logs
+      - --logs=200
+      # rate=0 disables throttling; the default would slow emission to a crawl.
+      - --rate=0
+      - --otlp-endpoint=producer-logs:4317
+      - --otlp-insecure
+
+volumes:
+  shared:

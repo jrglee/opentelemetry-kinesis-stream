@@ -6,6 +6,7 @@ import (
 
 	arrowpb "github.com/open-telemetry/otel-arrow/go/api/experimental/arrow/v1" //nolint:revive // imported for protobuf type only
 	"github.com/open-telemetry/otel-arrow/go/pkg/otel/arrow_record"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/protobuf/proto"
@@ -106,6 +107,47 @@ func (otlpArrowMetrics) Unmarshal(buf []byte) (out pmetric.Metrics, err error) {
 	}
 	if len(in) != 1 {
 		return pmetric.Metrics{}, fmt.Errorf("arrow decode metrics: expected 1 batch, got %d", len(in))
+	}
+	return in[0], nil
+}
+
+// otlpArrowLogs is the logs counterpart of otlpArrowTraces. It uses the same
+// fresh-producer-per-record model, so every record is self-decodable.
+type otlpArrowLogs struct{}
+
+func (otlpArrowLogs) Marshal(ld plog.Logs) (out []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			out, err = nil, fmt.Errorf("%w: encode logs: %v", ErrArrowPanic, r)
+		}
+	}()
+	p := arrow_record.NewProducer()
+	defer func() { _ = p.Close() }()
+	bar, perr := p.BatchArrowRecordsFromLogs(ld)
+	if perr != nil {
+		return nil, fmt.Errorf("arrow encode logs: %w", perr)
+	}
+	return proto.Marshal(bar)
+}
+
+func (otlpArrowLogs) Unmarshal(buf []byte) (out plog.Logs, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			out, err = plog.Logs{}, fmt.Errorf("%w: decode logs: %v", ErrArrowPanic, r)
+		}
+	}()
+	var bar arrowpb.BatchArrowRecords
+	if perr := proto.Unmarshal(buf, &bar); perr != nil {
+		return plog.Logs{}, fmt.Errorf("arrow proto unmarshal: %w", perr)
+	}
+	c := arrow_record.NewConsumer()
+	defer func() { _ = c.Close() }()
+	in, derr := c.LogsFrom(&bar)
+	if derr != nil {
+		return plog.Logs{}, fmt.Errorf("arrow decode logs: %w", derr)
+	}
+	if len(in) != 1 {
+		return plog.Logs{}, fmt.Errorf("arrow decode logs: expected 1 batch, got %d", len(in))
 	}
 	return in[0], nil
 }

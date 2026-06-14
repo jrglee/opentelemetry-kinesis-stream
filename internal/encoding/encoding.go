@@ -3,6 +3,7 @@ package encoding
 import (
 	"fmt"
 
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
@@ -71,6 +72,18 @@ type MetricsDecoder interface {
 	Unmarshal(buf []byte) (pmetric.Metrics, error)
 }
 
+// LogsEncoder and LogsDecoder are the logs counterparts of the traces and
+// metrics pairs. The same Codec compresses any signal's bytes; only the
+// marshaling differs.
+type LogsEncoder interface {
+	Marshal(ld plog.Logs) ([]byte, error)
+}
+
+// LogsDecoder is the inverse of LogsEncoder.
+type LogsDecoder interface {
+	Unmarshal(buf []byte) (plog.Logs, error)
+}
+
 // Compressor wraps the two compression operations as a pair so call sites can
 // stay symmetric. Implementations are required to be safe for concurrent use.
 type Compressor interface {
@@ -131,6 +144,34 @@ func NewMetricsDecoder(e Encoding) (MetricsDecoder, error) {
 		return otlpJSONMetrics{}, nil
 	case EncodingOTelArrow:
 		return otlpArrowMetrics{}, nil
+	default:
+		return nil, fmt.Errorf("unknown encoding %q", e)
+	}
+}
+
+// NewLogsEncoder returns the logs encoder for the named wire encoding.
+func NewLogsEncoder(e Encoding) (LogsEncoder, error) {
+	switch e {
+	case EncodingOTLPProto:
+		return otlpProtoLogs{}, nil
+	case EncodingOTLPJSON:
+		return otlpJSONLogs{}, nil
+	case EncodingOTelArrow:
+		return otlpArrowLogs{}, nil
+	default:
+		return nil, fmt.Errorf("unknown encoding %q", e)
+	}
+}
+
+// NewLogsDecoder is the symmetric counterpart of NewLogsEncoder.
+func NewLogsDecoder(e Encoding) (LogsDecoder, error) {
+	switch e {
+	case EncodingOTLPProto:
+		return otlpProtoLogs{}, nil
+	case EncodingOTLPJSON:
+		return otlpJSONLogs{}, nil
+	case EncodingOTelArrow:
+		return otlpArrowLogs{}, nil
 	default:
 		return nil, fmt.Errorf("unknown encoding %q", e)
 	}

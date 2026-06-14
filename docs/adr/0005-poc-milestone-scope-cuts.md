@@ -4,9 +4,12 @@
   (0010-codecs-and-deferred-arrow.md)), metrics signal ([0011]
   (0011-metrics-signal-via-sink-seam.md)), tag-hash partition keys /
   microbatching / oversize repack ([0012](0012-tag-grouping-and-oversize-repack.md)),
-  dead-letter ([0013](0013-dead-letter-via-pipeline-reemit.md)), and `otlp_json`
-  ([0016](0016-add-otlp-json-encoding.md)). Still open: logs signal, `otel_arrow`
-  (the next encoding to land, see 0016), and EFO.
+  dead-letter ([0013](0013-dead-letter-via-pipeline-reemit.md)), `otlp_json`
+  ([0016](0016-add-otlp-json-encoding.md)), `otel_arrow`
+  ([0018](0018-implement-otel-arrow-encoding.md)), and the logs signal (wired
+  on the same signal-agnostic seam as metrics, see [0011]
+  (0011-metrics-signal-via-sink-seam.md)). Still open: live-AWS reshard
+  verification, and EFO.
 - **Date:** 2026-06-13
 
 ## Context
@@ -33,7 +36,9 @@ re-openable.
 - **Partition key: random (UUID) only.** No tag-hash strategy. The exporter
   writes a fresh UUID per record.
 - **Traces signal only.** Metrics and logs are not wired through either
-  component.
+  component. (Both signals were subsequently added: metrics on the
+  signal-agnostic seam from [0011](0011-metrics-signal-via-sink-seam.md),
+  logs on the same seam.)
 - **Microbatching deferred.** The exporter encodes one `ConsumeTraces` call
   into one Kinesis record and relies on the upstream `batchprocessor` for
   batching. `PutRecords` (not `PutRecord`) is used so in-exporter batching is

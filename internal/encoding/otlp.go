@@ -1,6 +1,8 @@
 package encoding
 
 import (
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -38,4 +40,20 @@ func (otlpProtoMetrics) Unmarshal(buf []byte) (pmetric.Metrics, error) {
 		return pmetric.Metrics{}, err
 	}
 	return req.Metrics(), nil
+}
+
+// otlpProtoLogs is the logs counterpart of otlpProtoTraces, using the same
+// OTLP protobuf layout so the wire stays consistent across signals.
+type otlpProtoLogs struct{}
+
+func (otlpProtoLogs) Marshal(ld plog.Logs) ([]byte, error) {
+	return plogotlp.NewExportRequestFromLogs(ld).MarshalProto()
+}
+
+func (otlpProtoLogs) Unmarshal(buf []byte) (plog.Logs, error) {
+	req := plogotlp.NewExportRequest()
+	if err := req.UnmarshalProto(buf); err != nil {
+		return plog.Logs{}, err
+	}
+	return req.Logs(), nil
 }

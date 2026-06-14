@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	noopmetric "go.opentelemetry.io/otel/metric/noop"
@@ -39,6 +40,19 @@ func tracesRecord(t *testing.T, name string) types.Record {
 	return types.Record{Data: b, SequenceNumber: aws.String("s#0001"), PartitionKey: aws.String("pk")}
 }
 
+func logsRecord(t *testing.T, body string) types.Record {
+	t.Helper()
+	enc, _ := encoding.NewLogsEncoder(encoding.EncodingOTLPProto)
+	ld := plog.NewLogs()
+	lr := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	lr.Body().SetStr(body)
+	b, err := enc.Marshal(ld)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return types.Record{Data: b, SequenceNumber: aws.String("s#0003"), PartitionKey: aws.String("pk")}
+}
+
 func metricsRecord(t *testing.T, name string) types.Record {
 	t.Helper()
 	enc, _ := encoding.NewMetricsEncoder(encoding.EncodingOTLPProto)
@@ -62,6 +76,18 @@ func (c *traceCollector) consume(_ context.Context, td ptrace.Traces) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.got = append(c.got, td)
+	return nil
+}
+
+type logCollector struct {
+	mu  sync.Mutex
+	got []plog.Logs
+}
+
+func (c *logCollector) consume(_ context.Context, ld plog.Logs) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.got = append(c.got, ld)
 	return nil
 }
 
@@ -119,6 +145,19 @@ func TestMetricsSinkDelivers(t *testing.T) {
 	}
 }
 
+func TestLogsSinkDelivers(t *testing.T) {
+	col := &logCollector{}
+	next, _ := consumer.NewLogs(col.consume)
+	p := newPoller(t, logsSink{decoder: mustLogsDecoder(t), consumer: next}, false)
+
+	if got := p.handleRecord(context.Background(), logsRecord(t, "ok-log")); got != recordOK {
+		t.Fatalf("result = %v, want recordOK", got)
+	}
+	if len(col.got) != 1 || col.got[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().AsString() != "ok-log" {
+		t.Fatalf("log not delivered: %+v", col.got)
+	}
+}
+
 func TestDeadLetterTracesOnDecodeFailure(t *testing.T) {
 	col := &traceCollector{}
 	next, _ := consumer.NewTraces(col.consume)
@@ -166,6 +205,15 @@ func mustTracesDecoder(t *testing.T) encoding.TracesDecoder {
 func mustMetricsDecoder(t *testing.T) encoding.MetricsDecoder {
 	t.Helper()
 	d, err := encoding.NewMetricsDecoder(encoding.EncodingOTLPProto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+func mustLogsDecoder(t *testing.T) encoding.LogsDecoder {
+	t.Helper()
+	d, err := encoding.NewLogsDecoder(encoding.EncodingOTLPProto)
 	if err != nil {
 		t.Fatal(err)
 	}

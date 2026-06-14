@@ -1,0 +1,37 @@
+# Logs consumer collector: Kinesis in, file out. Reads the otel-logs stream,
+# coordinating shard ownership through its own DynamoDB lease table (separate
+# from the traces and metrics E2Es). dead_letter re-emits unprocessable
+# records into the pipeline rather than dropping them silently.
+receivers:
+  awskinesis:
+    stream_name: otel-logs
+    region: us-east-1
+    endpoint: http://ministack:4566
+    encoding: ${env:ENCODING:-otlp_proto}
+    compression: ${env:COMPRESSION:-gzip}
+    poll_interval: 250ms
+    max_records: 1000
+    lease_backend: dynamodb
+    lease_table: otel-leases-logs
+    worker_id: ${env:REPLICA}
+    # Short timings so a takeover is observable within an E2E run.
+    lease_duration: 10s
+    heartbeat_interval: 2s
+    discovery_interval: 3s
+    dead_letter:
+      enabled: true
+
+exporters:
+  file:
+    path: /shared/logs-out.jsonl
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    logs:
+      receivers: [awskinesis]
+      exporters: [file, debug]
