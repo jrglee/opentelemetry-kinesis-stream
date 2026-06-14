@@ -59,7 +59,7 @@ func newTestExporter(t *testing.T, maxRecordSize int, inject func(*kinesis.Optio
 		Compression:   encoding.CodecNone,
 		MaxRecordSize: maxRecordSize,
 		PartitionKey:  PartitionKeyConfig{Strategy: partitionStrategyRandom, Hash: hashXXHash},
-		Oversize:      OversizeConfig{Policy: oversizeSplitHalf, MaxAttempts: 8},
+		Oversize:      OversizeConfig{Policies: []string{oversizeSplitHalf}, MaxAttempts: 8, MaxAttributeValueBytes: 4096},
 	}, inject)
 }
 

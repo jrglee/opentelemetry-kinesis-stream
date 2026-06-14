@@ -26,7 +26,7 @@ exporters:
       tags: [host, region]
       hash: xxhash
     oversize:
-      policy: split_half
+      policies: [split_half]
       max_attempts: 8
   debug:
     verbosity: basic

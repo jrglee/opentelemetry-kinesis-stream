@@ -49,7 +49,7 @@ type taggedBatch[T any] struct {
 
 // signalCodec is the per-signal adapter that lets the otherwise identical
 // group/compress/oversize/PutRecords pipeline stay signal-agnostic. Only the
-// four operations here touch pdata; everything else is generic.
+// operations here touch pdata; everything else is generic.
 type signalCodec[T any] struct {
 	// groupByTags partitions a batch by the ordered tag values. With no tags
 	// it returns a single batch keyed "" (random strategy).
@@ -57,9 +57,57 @@ type signalCodec[T any] struct {
 	// splitHalf divides a batch's children roughly in half. ok is false when
 	// the batch is a single indivisible leaf item.
 	splitHalf func(b T) (T, T, bool)
-	marshal   func(b T) ([]byte, error)
+	// truncateAttributes returns a clone of b with every string-valued
+	// attribute clamped to maxBytes, and the count of values touched. The
+	// caller's batch is never mutated.
+	truncateAttributes func(b T, maxBytes int) (T, int)
+	marshal            func(b T) ([]byte, error)
 	// itemCount is the span/datapoint count, used for drop accounting and logs.
 	itemCount func(b T) int
+}
+
+// dropOutcome carries a count of items not exported and the reason label that
+// names the cause.
+type dropOutcome struct {
+	count  int
+	reason string
+}
+
+// drops is a coalesced list of per-reason drop counts. The split recursion can
+// produce a mix of terminal reasons (e.g. one branch hits an irreducible leaf
+// while another hits max_attempts) and we want each to land on the metric
+// under its own label, not collapse to a single "chain_exhausted" bucket that
+// would hide the operator's real lever (raising MaxAttempts).
+type drops []dropOutcome
+
+func (d drops) total() int {
+	n := 0
+	for _, x := range d {
+		n += x.count
+	}
+	return n
+}
+
+// addReason coalesces by reason: a second drop with the same reason bumps the
+// existing entry rather than appending a duplicate.
+func (d drops) addReason(count int, reason string) drops {
+	if count == 0 {
+		return d
+	}
+	for i := range d {
+		if d[i].reason == reason {
+			d[i].count += count
+			return d
+		}
+	}
+	return append(d, dropOutcome{count: count, reason: reason})
+}
+
+func (d drops) merge(o drops) drops {
+	for _, x := range o {
+		d = d.addReason(x.count, x.reason)
+	}
+	return d
 }
 
 // emit is the shared export path for any signal: group by tags, repack each
@@ -80,10 +128,15 @@ func emit[T any](ctx context.Context, e *kinesisExporter, b T, sc signalCodec[T]
 	entries := make([]types.PutRecordsRequestEntry, 0, len(groups))
 	for _, g := range groups {
 		key := e.partitionKey(g.key)
-		payloads, dropped := pack(g.batch, sc, e.cfg, e.comp, 0)
-		if dropped > 0 {
-			e.tel.recordDrop(ctx, dropped, "oversize")
-			e.logger.Warn("dropped oversize items during repack", zap.Int("dropped", dropped))
+		payloads, ds := packChain(ctx, e, g.batch, sc)
+		for _, d := range ds {
+			e.tel.recordDrop(ctx, d.count, d.reason)
+			e.logger.Warn(
+				"dropped items during oversize recovery",
+				zap.Int("dropped", d.count),
+				zap.String("reason", d.reason),
+				zap.Strings("policies", e.cfg.Oversize.Policies),
+			)
 		}
 		for _, p := range payloads {
 			entries = append(entries, types.PutRecordsRequestEntry{Data: p, PartitionKey: aws.String(key)})
@@ -102,53 +155,152 @@ func (e *kinesisExporter) partitionKey(tagValue string) string {
 	return uuid.NewString()
 }
 
-// pack marshals a batch, compresses it, and — if the result exceeds
-// MaxRecordSize — repacks it into fitting payloads per the oversize policy.
-// depth bounds recursion at cfg.Oversize.MaxAttempts; items past the bound or
-// that cannot be reduced further are dropped and counted.
-func pack[T any](
-	batch T,
-	sc signalCodec[T],
-	cfg *Config,
-	comp interface {
-		Compress([]byte) ([]byte, error)
-	},
-	depth int,
-) (payloads [][]byte, dropped int) {
-	raw, err := sc.marshal(batch)
-	if err != nil {
-		// Marshal of a sub-batch built by CopyTo should not fail; drop and count.
-		return nil, sc.itemCount(batch)
+// packChain marshals a batch, compresses it, and — if the result exceeds
+// MaxRecordSize — runs cfg.Oversize.Policies in order against the remainder
+// until something fits or the chain is exhausted. It returns the payloads
+// that fit and the per-reason drops accumulated along the way. The
+// attributes_truncated counter is emitted at the truncate policy site so it
+// records every mutation regardless of which policy ultimately shipped the
+// data — there's no need to thread a "repaired" count up the call stack.
+//
+// Validation rejects policy lists with split_half or reject anywhere but the
+// last position (see config.go), so this dispatcher does not need to handle
+// "what if split's drops leak into a downstream policy?" — they cannot, by
+// construction.
+func packChain[T any](ctx context.Context, e *kinesisExporter, batch T, sc signalCodec[T]) ([][]byte, drops) {
+	cfg := e.cfg
+	// First try the unmodified batch. If it already fits, no policy runs.
+	payload, ok, terminal := tryEncode(e, batch, sc)
+	if terminal.count > 0 {
+		return nil, drops{}.addReason(terminal.count, terminal.reason)
 	}
-	payload, err := comp.Compress(raw)
-	if err != nil {
-		return nil, sc.itemCount(batch)
-	}
-	if len(payload) <= cfg.MaxRecordSize {
-		return [][]byte{payload}, 0
+	if ok {
+		return [][]byte{payload}, nil
 	}
 
-	// Over the ceiling. reject drops the whole batch outright.
-	if cfg.Oversize.Policy == oversizeReject {
-		return nil, sc.itemCount(batch)
+	current := batch
+	for _, policy := range cfg.Oversize.Policies {
+		switch policy {
+		case oversizeTruncateAttrs:
+			if sc.truncateAttributes == nil {
+				continue
+			}
+			trimmed, n := sc.truncateAttributes(current, cfg.Oversize.MaxAttributeValueBytes)
+			e.logger.Debug(
+				"oversize policy: truncate_attribute_values",
+				zap.Int("attributes_clamped", n),
+				zap.Int("max_attribute_value_bytes", cfg.Oversize.MaxAttributeValueBytes),
+				zap.Int("item_count", sc.itemCount(current)),
+			)
+			if n == 0 {
+				// Nothing to truncate — fall through to the next policy
+				// without crediting the metric or mutating `current`.
+				continue
+			}
+			// Credit every clamp the moment it happens, not when the chain
+			// eventually decides whether truncation alone fit the payload.
+			// Even if split_half ultimately ships these items, the data was
+			// mutated and the operator needs to see that signal.
+			e.tel.recordTruncated(ctx, n)
+			p, fit, d := tryEncode(e, trimmed, sc)
+			if d.count > 0 {
+				// Encoding the trimmed clone failed (rare: a codec that
+				// rejects the post-clamp content). Fall through to let the
+				// next policy try the still-pristine original — do not let a
+				// per-policy hiccup poison the chain.
+				e.logger.Debug(
+					"truncate produced an unencodable batch; falling through",
+					zap.String("reason", d.reason),
+				)
+				continue
+			}
+			if fit {
+				return [][]byte{p}, nil
+			}
+			// Truncation didn't fit; carry the trimmed batch into the next
+			// policy so its work is preserved (split_half operates on the
+			// slightly smaller payload).
+			current = trimmed
+
+		case oversizeSplitHalf:
+			payloads, splitDrops := packSplit(ctx, e, current, sc, 0)
+			return payloads, splitDrops
+
+		case oversizeReject:
+			return nil, drops{}.addReason(sc.itemCount(current), "reject_policy")
+		}
 	}
-	// Recursion bound: give up and drop what remains.
-	if depth >= cfg.Oversize.MaxAttempts {
-		return nil, sc.itemCount(batch)
+
+	// Chain exhausted without anything fitting.
+	e.logger.Warn(
+		"oversize recovery chain exhausted",
+		zap.Strings("policies", cfg.Oversize.Policies),
+		zap.Int("item_count", sc.itemCount(current)),
+	)
+	return nil, drops{}.addReason(sc.itemCount(current), "chain_exhausted")
+}
+
+// tryEncode marshals + compresses one batch and reports whether it fits the
+// MaxRecordSize ceiling. A marshal or compress error returns a drop with the
+// appropriate reason; this isolates terminal failures from policy decisions.
+func tryEncode[T any](e *kinesisExporter, batch T, sc signalCodec[T]) ([]byte, bool, dropOutcome) {
+	raw, err := sc.marshal(batch)
+	if err != nil {
+		e.logger.Warn("marshal failed", zap.Error(err), zap.Int("item_count", sc.itemCount(batch)))
+		return nil, false, dropOutcome{count: sc.itemCount(batch), reason: "marshal_error"}
+	}
+	payload, err := e.comp.Compress(raw)
+	if err != nil {
+		e.logger.Warn("compress failed", zap.Error(err), zap.Int("item_count", sc.itemCount(batch)))
+		return nil, false, dropOutcome{count: sc.itemCount(batch), reason: "compress_error"}
+	}
+	fit := len(payload) <= e.cfg.MaxRecordSize
+	e.logger.Debug(
+		"encode attempt",
+		zap.Int("raw_bytes", len(raw)),
+		zap.Int("compressed_bytes", len(payload)),
+		zap.Int("max_record_size", e.cfg.MaxRecordSize),
+		zap.Bool("fit", fit),
+		zap.Int("item_count", sc.itemCount(batch)),
+	)
+	if fit {
+		return payload, true, dropOutcome{}
+	}
+	return nil, false, dropOutcome{}
+}
+
+// packSplit is split_half's recursive worker. It halves a batch until each
+// piece fits or the MaxAttempts bound is hit, returning the fitting payloads
+// and a per-reason drop list. Distinct terminal reasons (irreducible vs
+// max_attempts) are kept separate so the operator's telemetry shows which
+// lever to pull — collapsing both into a single label would hide max_attempts
+// behind "irreducible" or vice versa.
+func packSplit[T any](ctx context.Context, e *kinesisExporter, batch T, sc signalCodec[T], depth int) ([][]byte, drops) {
+	payload, ok, terminal := tryEncode(e, batch, sc)
+	if terminal.count > 0 {
+		return nil, drops{}.addReason(terminal.count, terminal.reason)
+	}
+	if ok {
+		return [][]byte{payload}, nil
+	}
+
+	if depth >= e.cfg.Oversize.MaxAttempts {
+		return nil, drops{}.addReason(sc.itemCount(batch), "max_attempts")
 	}
 
 	a, b, ok := sc.splitHalf(batch)
 	if !ok {
-		// A single leaf item still too large cannot be reduced further. Both
-		// split_half and drop_largest converge here: drop this leaf. (Real
-		// drop_largest would remove only the largest top-level resource of a
-		// multi-resource batch; that case is already handled by the split
-		// recursion below, so the only remaining drop is this atomic leaf.)
-		return nil, sc.itemCount(batch)
+		return nil, drops{}.addReason(sc.itemCount(batch), "irreducible")
 	}
-	pa, da := pack(a, sc, cfg, comp, depth+1)
-	pb, db := pack(b, sc, cfg, comp, depth+1)
-	return append(pa, pb...), da + db
+	e.logger.Debug(
+		"oversize policy: split_half",
+		zap.Int("depth", depth),
+		zap.Int("left_items", sc.itemCount(a)),
+		zap.Int("right_items", sc.itemCount(b)),
+	)
+	pa, da := packSplit(ctx, e, a, sc, depth+1)
+	pb, db := packSplit(ctx, e, b, sc, depth+1)
+	return append(pa, pb...), da.merge(db)
 }
 
 // flush sends entries via PutRecords, chunking so each call stays within the

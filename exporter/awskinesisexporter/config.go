@@ -69,13 +69,43 @@ type PartitionKeyConfig struct {
 	Hash string `mapstructure:"hash"`
 }
 
-// OversizeConfig is the repack policy for a payload that exceeds MaxRecordSize.
+// OversizeConfig is the recovery chain for a payload that exceeds MaxRecordSize.
+//
+// Policies are tried in order against the still-oversize compressed payload;
+// the first that produces a fitting result wins. If the chain is exhausted
+// the remainder is dropped and counted with a specific reason (see
+// telemetry.go). The chain shape lets attribute-bloat strategies run before
+// wasteful recursive splits, which is the common real-world failure mode.
 type OversizeConfig struct {
-	// Policy is "split_half" (default), "drop_largest", or "reject".
-	Policy string `mapstructure:"policy"`
-	// MaxAttempts bounds repack recursion so a pathological input cannot loop;
-	// remaining items past the bound are dropped and counted. Default 8.
+	// LegacyPolicy is a tombstone for the removed singular "policy" field.
+	// Validation errors if it is set so an upgraded config that still uses
+	// the old key fails loud with a migration message rather than silently
+	// reverting to the default.
+	LegacyPolicy *string `mapstructure:"policy"`
+	// Policies is the ordered recovery chain. Valid entries:
+	//   - "truncate_attribute_values": clone the batch and clamp any string
+	//     attribute value longer than MaxAttributeValueBytes. Targets the
+	//     "single long tag value" failure mode that split_half cannot recover.
+	//     Safe in any position because it always returns a (possibly
+	//     unmodified) batch for the next policy to try.
+	//   - "split_half": recursively halve resources, then spans/datapoints
+	//     within a resource, until each piece fits or MaxAttempts is reached.
+	//     Terminal — must appear last because its drops are not re-presentable
+	//     to subsequent policies.
+	//   - "reject": stop here; drop the remainder and count as reject_policy.
+	//     Terminal — must appear last.
+	// Default: ["split_half"].
+	Policies []string `mapstructure:"policies"`
+	// MaxAttempts bounds split_half recursion depth per chain step so a
+	// pathological input cannot loop; an irreducible leaf falls through to the
+	// next policy (or is dropped at chain exhaustion). Default 8.
 	MaxAttempts int `mapstructure:"max_attempts"`
+	// MaxAttributeValueBytes is the per-attribute UTF-8 byte ceiling enforced
+	// by truncate_attribute_values. Values strictly longer than this are
+	// truncated to a codepoint boundary at or before this length; values at
+	// or under it are left alone. Non-string attribute kinds are never
+	// touched. Default 4096.
+	MaxAttributeValueBytes int `mapstructure:"max_attribute_value_bytes"`
 }
 
 const (
@@ -83,7 +113,7 @@ const (
 	partitionStrategyTagHash = "tag_hash"
 	hashXXHash               = "xxhash"
 	oversizeSplitHalf        = "split_half"
-	oversizeDropLargest      = "drop_largest"
+	oversizeTruncateAttrs    = "truncate_attribute_values"
 	oversizeReject           = "reject"
 )
 
@@ -127,13 +157,39 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("unknown partition_key.hash %q", c.PartitionKey.Hash)
 	}
-	switch c.Oversize.Policy {
-	case "", oversizeSplitHalf, oversizeDropLargest, oversizeReject:
-	default:
-		return fmt.Errorf("unknown oversize.policy %q", c.Oversize.Policy)
+	if c.Oversize.LegacyPolicy != nil {
+		return fmt.Errorf(
+			"oversize.policy is removed; rename it to oversize.policies (a list). Migration: oversize.policies: [%q]",
+			*c.Oversize.LegacyPolicy,
+		)
+	}
+	if len(c.Oversize.Policies) == 0 {
+		return errors.New("oversize.policies must contain at least one policy")
+	}
+	for i, p := range c.Oversize.Policies {
+		switch p {
+		case oversizeTruncateAttrs:
+			// truncate is the only safely-chainable policy: it returns a
+			// (possibly unmodified) batch the next policy operates on.
+		case oversizeSplitHalf, oversizeReject:
+			// Terminal policies: their drops cannot be retried by a
+			// subsequent policy, so listing anything after them is a
+			// configuration trap.
+			if i != len(c.Oversize.Policies)-1 {
+				return fmt.Errorf(
+					"oversize.policies[%d]=%q terminates the chain; policies listed after it would never run (move %q to the end or drop the trailing entries)",
+					i, p, p,
+				)
+			}
+		default:
+			return fmt.Errorf("unknown oversize.policies entry %q", p)
+		}
 	}
 	if c.Oversize.MaxAttempts <= 0 {
 		return errors.New("oversize.max_attempts must be positive")
+	}
+	if c.Oversize.MaxAttributeValueBytes <= 0 {
+		return errors.New("oversize.max_attribute_value_bytes must be positive")
 	}
 	return nil
 }

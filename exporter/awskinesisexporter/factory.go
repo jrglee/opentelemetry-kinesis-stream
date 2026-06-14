@@ -32,8 +32,9 @@ func createDefaultConfig() component.Config {
 			Hash:     hashXXHash,
 		},
 		Oversize: OversizeConfig{
-			Policy:      oversizeSplitHalf,
-			MaxAttempts: 8,
+			Policies:               []string{oversizeSplitHalf},
+			MaxAttempts:            8,
+			MaxAttributeValueBytes: 4096,
 		},
 		PutRecords: PutRecordsConfig{
 			MaxRecords: 500,     // conservative per-call record count

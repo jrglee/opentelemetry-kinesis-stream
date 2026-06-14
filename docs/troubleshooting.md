@@ -76,11 +76,29 @@ climbing alongside these.
 
 ## Exporter drops or rejects records
 
-- **`dropped oversize items during repack`** + `kinesis.exporter.records_dropped`
-  with `reason=oversize`. A single item compressed larger than `max_record_size`
-  and could not be split further. Raise `max_record_size` (up to the Kinesis
-  ceiling) or check the oversize policy. See
-  [oversize records](user-guide.md#oversize-records).
+- **`dropped items during oversize recovery`** + `kinesis.exporter.records_dropped`.
+  The `reason` label names what failed:
+  - `irreducible` — a single span/datapoint, alone, still does not fit. Either
+    raise `max_record_size`, or add `truncate_attribute_values` to the
+    `oversize.policies` chain to attack attribute bloat (the usual root cause).
+  - `max_attempts` — `split_half` hit `oversize.max_attempts` before the
+    halved batch fit. Raise `max_attempts`, or chain truncation in first.
+  - `reject_policy` — `reject` was the active policy. Expected; the operator
+    asked for hard failure.
+  - `chain_exhausted` — multiple terminal reasons mixed across the batch.
+    Open the debug logs (`encode attempt`, `oversize policy: …`) to see which
+    policy was the last to run on which sub-batch.
+  - `marshal_error` / `compress_error` — encoder or codec returned an error.
+    Almost always a misconfiguration (e.g. a codec disabled at build time).
+  See [oversize records](user-guide.md#oversize-records).
+- **`kinesis.exporter.attributes_truncated`** counts every attribute value
+  the `truncate_attribute_values` policy clamped, whether truncation alone
+  fit the record or `split_half` ultimately shipped it. A short spike is
+  healthy proof that recovery is working; a sustained non-zero rate means
+  something upstream is generating attribute values longer than
+  `oversize.max_attribute_value_bytes`. Find the source (often an
+  instrumented HTTP body or stack trace) rather than just raising the
+  threshold.
 - **`kinesis record rejected`** + `records_dropped` with `reason=rejected`. A
   record failed for a non-throttling reason (e.g. a validation error) and would
   fail identically on retry, so it is dropped to avoid head-of-line blocking.

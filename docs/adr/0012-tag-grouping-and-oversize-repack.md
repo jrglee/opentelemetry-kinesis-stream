@@ -1,6 +1,7 @@
 # 0012. Tag-hash partition keys, group-by-tag microbatching, oversize repack
 
-- **Status:** Accepted
+- **Status:** Accepted (oversize policy section superseded in part by
+  [ADR-0019](0019-oversize-recovery-chain.md))
 - **Date:** 2026-06-13
 
 ## Context
@@ -24,12 +25,13 @@ made to fit rather than lost.
   incoming batch into one record per distinct tag tuple (resources sharing a
   tuple are coalesced into a single record). Under `random` the whole batch is
   one record, as before.
-- **Oversize repack**: a record over `max_record_size` after compression is
-  repacked per `oversize.policy` — `split_half` (default; recursively halve the
-  resources, then the leaf items within a single resource), `drop_largest`, or
-  `reject` — bounded by `oversize.max_attempts`. A single leaf item that is
-  still too big is dropped and counted on a `kinesis.exporter.records_dropped`
-  meter rather than silently lost.
+- **Oversize repack** (this part is superseded by
+  [ADR-0019](0019-oversize-recovery-chain.md)): the original decision was a
+  single `oversize.policy` field with `split_half` (default), `drop_largest`,
+  or `reject`, bounded by `oversize.max_attempts`. ADR-0019 replaces this
+  with the `oversize.policies` ordered chain, drops `drop_largest`, and adds
+  `truncate_attribute_values`. The drop-counter rationale (one meter rather
+  than silent loss) stands; reason labels broadened in ADR-0019.
 
 The grouping/repack logic is signal-agnostic; only the pdata operations differ
 between traces and metrics.
@@ -42,9 +44,8 @@ between traces and metrics.
 - Oversize records are made to fit by splitting, so large batches survive
   instead of being dropped. The bound on attempts plus the drop-and-count
   fallback keep a pathological single huge item from looping.
-- `drop_largest` is implemented as a thin variant of the split recursion; the
-  irreducible case (one oversize leaf) drops that leaf. A dedicated
-  "remove the single largest top-level resource" pass was not needed because the
-  split recursion already resolves multi-resource oversize.
+- ~~`drop_largest` is implemented as a thin variant of the split recursion~~
+  (removed in ADR-0019: the alias was indistinguishable from `split_half` in
+  practice and was misleading users about what knob they had).
 - Random partitioning remains the default, so existing deployments and the
   traces E2E are unaffected.

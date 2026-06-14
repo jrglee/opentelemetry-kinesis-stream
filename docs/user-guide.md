@@ -7,10 +7,11 @@ the runtime behaviors that matter operationally — round trip, shard
 rebalancing, graceful handoff, crash recovery, and resharding. You can treat
 the components as a black box; nothing here requires reading the source.
 
-> **Status:** proof of concept. Traces and metrics, `otlp_proto`/`otlp_json`
-> encodings, `none`/`gzip`/`zstd`/`snappy` compression. Known gaps and
-> follow-ups (logs, `otel_arrow`, live-reshard verification) are in
-> [Limitations](#limitations).
+> **Status:** proof of concept. Traces and metrics,
+> `otlp_proto`/`otlp_json`/`otel_arrow` encodings,
+> `none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`
+> compression. Known gaps and follow-ups (logs, live-reshard verification)
+> are in [Limitations](#limitations).
 
 ## Contents
 
@@ -284,9 +285,10 @@ a stable key (see [Tag-grouped microbatching](#tag-grouped-microbatching)).
 | `partition_key.strategy`  | string | `random`     | no       | `random` (one key per record, spreads across shards) or `tag_hash` (stable key per resource-attribute tuple, co-locates by tag and groups the batch). |
 | `partition_key.tags`      | list   | —            | if tag_hash | Ordered list of resource attribute keys forming the tag tuple. Records sharing a tuple get the same key and land on the same shard. |
 | `partition_key.hash`      | string | `xxhash`     | no       | Hash function for the partition key. Only `xxhash` is implemented. |
-| `oversize.policy`         | string | `split_half` | no       | What to do when a record still exceeds `max_record_size` after compression. `split_half` repacks by halving, `drop_largest` drops the biggest item, `reject` fails the batch. See [Oversize records](#oversize-records). |
-| `oversize.max_attempts`   | int    | `8`          | no       | Maximum repack rounds before giving up under `split_half`. |
-| `max_record_size`         | int    | `1048576`    | no       | Byte ceiling on the bytes handed to Kinesis — i.e. after compression, since Kinesis treats each record as opaque bytes. A larger payload is repacked per `oversize.policy`. An **operator-owned limit** the exporter enforces verbatim; it does not track the stream's actual ceiling, which varies by account/region/stream config. The default (1 MiB) is the conservative floor every stream accepts; raise it if your stream is configured for larger records (Kinesis [supports up to 10 MiB](https://aws.amazon.com/blogs/big-data/amazon-kinesis-data-streams-now-supports-10x-larger-record-sizes-simplifying-real-time-data-processing) per record, opt-in via the stream's `maxRecordSize`). |
+| `oversize.policies`       | list   | `[split_half]` | no     | Ordered recovery chain tried against a payload that exceeds `max_record_size`. Entries: `truncate_attribute_values`, `split_half`, `reject`. The first policy whose output fits wins; chain exhaustion drops the remainder. See [Oversize records](#oversize-records). |
+| `oversize.max_attempts`   | int    | `8`          | no       | Maximum recursion depth per `split_half` chain step before falling through to the next policy (or dropping). |
+| `oversize.max_attribute_value_bytes` | int | `4096` | no       | UTF-8 byte ceiling for `truncate_attribute_values`. String attribute values longer than this are clamped to this length. Non-string kinds are never touched. |
+| `max_record_size`         | int    | `1048576`    | no       | Byte ceiling on the bytes handed to Kinesis — i.e. after compression, since Kinesis treats each record as opaque bytes. A larger payload is repacked per `oversize.policies`. An **operator-owned limit** the exporter enforces verbatim; it does not track the stream's actual ceiling, which varies by account/region/stream config. The default (1 MiB) is the conservative floor every stream accepts; raise it if your stream is configured for larger records (Kinesis [supports up to 10 MiB](https://aws.amazon.com/blogs/big-data/amazon-kinesis-data-streams-now-supports-10x-larger-record-sizes-simplifying-real-time-data-processing) per record, opt-in via the stream's `maxRecordSize`). |
 | `put_records.max_records` | int    | `500`        | no       | Maximum records per `PutRecords` call. Operator-owned limit; raise to match a stream configured for larger requests. |
 | `put_records.max_bytes`   | int    | `5242880`    | no       | Maximum aggregate record-data bytes per `PutRecords` call (default 5 MiB). Operator-owned limit; must be ≥ `max_record_size`. |
 
@@ -428,7 +430,7 @@ exporters:
       tags: [service.name, region]
       hash: xxhash
     oversize:
-      policy: split_half
+      policies: [split_half]
 ```
 
 ```mermaid
@@ -449,18 +451,43 @@ sequenceDiagram
 ### Oversize records
 
 After compression a record may still exceed `max_record_size` (an operator knob;
-set it within whatever ceiling your stream and account actually allow).
-`oversize.policy` decides what happens:
+set it within whatever ceiling your stream and account actually allow). The
+real-world causes split into two shapes: too many items in one record (a wide
+microbatch), or one item with bloated attributes (too many tags, or a single
+long tag value). The exporter handles both via an ordered chain of recovery
+strategies — `oversize.policies` — applied to the still-oversize payload until
+one fits or the chain is exhausted:
 
-- **`split_half`** (default) repacks the record: it recursively halves the
-  resource list, then halves the leaf items within a resource, until each piece
-  fits or `oversize.max_attempts` rounds are spent. A single leaf item that is
-  still too large on its own cannot be split — it is dropped and counted on the
-  `kinesis.exporter.records_dropped` metric.
-- **`drop_largest`** drops the biggest item and retries, trading data for
-  forward progress without recursive repacking.
-- **`reject`** fails the batch so the pipeline surfaces the error rather than
-  silently shedding data.
+- **`split_half`** (default) recursively halves the resource list, then the
+  leaf items within a resource, until each piece fits or `oversize.max_attempts`
+  rounds are spent. Lossless when the bloat is item count. Does **not** help
+  when the bloat lives inside a single span's attributes — the recursion
+  terminates on an irreducible leaf that is dropped and counted on
+  `kinesis.exporter.records_dropped` with `reason=irreducible`.
+- **`truncate_attribute_values`** clones the batch and clamps any string
+  attribute value strictly longer than `oversize.max_attribute_value_bytes` to
+  that length, walking resource, scope, and span/datapoint attributes (plus
+  span events, links, and exemplars on the metrics side). Non-string attribute
+  kinds are never touched. Items that survive are counted on the new
+  `kinesis.exporter.attributes_truncated` counter — incremented every time a
+  value is clamped, whether truncation alone fit the payload or `split_half`
+  shipped it afterward (the mutation happened either way). A non-zero rate is
+  the canary that something upstream is generating long attribute values.
+  Lossy on string attributes, but the only policy that recovers single-item
+  attribute bloat. Truncation backsteps to a UTF-8 codepoint boundary so the
+  output stays valid for strict downstream encoders.
+- **`reject`** stops the chain here: the remainder is dropped and counted with
+  `reason=reject_policy`, surfacing the failure rather than silently splitting
+  it.
+
+`policies` is ordered: each strategy is applied to whatever the previous one
+produced, and the first whose output fits wins. For high-cardinality
+attribute workloads, `[truncate_attribute_values, split_half]` is the
+recommended chain — truncation runs first and prevents wasted split work on a
+payload whose bloat lives in one attribute. If every policy fails to produce
+a fitting payload, the remainder is dropped with the most specific terminal
+reason (`irreducible`, `max_attempts`, `reject_policy`) or `chain_exhausted`
+when reasons mix.
 
 ```mermaid
 sequenceDiagram
@@ -470,13 +497,16 @@ sequenceDiagram
     EX->>EX: compress record
     alt fits max_record_size
         EX->>K: PutRecords(record)
-    else too big, split_half
-        Note over EX: split resources into two halves
-        Note over EX: each half still too big splits its leaf items
-        alt half now fits
-            EX->>K: PutRecords(half)
-        else single leaf still too big
-            Note over EX: drop leaf, count records_dropped
+    else too big, run oversize.policies in order
+        alt truncate_attribute_values fits
+            Note over EX: clamp string attrs > max_attribute_value_bytes
+            EX->>K: PutRecords(record)
+            Note over EX: count attributes_truncated per clamp
+        else split_half fits
+            Note over EX: recursively halve resources, then leaf items
+            EX->>K: PutRecords(parts)
+        else chain exhausted
+            Note over EX: drop remainder, count records_dropped{reason=…}
         end
     end
 ```
@@ -943,7 +973,8 @@ Emitted instruments (scope `awskinesisexporter` / `awskinesisreceiver`):
 | `kinesis.exporter.batch.records` | histogram | `{record}` | records per `PutRecords` call |
 | `kinesis.exporter.batch.bytes` | histogram | `By` | aggregate payload bytes per call |
 | `kinesis.exporter.flush.duration_ms` | histogram | `ms` | `PutRecords` latency |
-| `kinesis.exporter.records_dropped` | counter | `{item}` | `reason` = `oversize` \| `rejected` |
+| `kinesis.exporter.records_dropped` | counter | `{item}` | `reason` = `marshal_error` \| `compress_error` \| `max_attempts` \| `irreducible` \| `reject_policy` \| `chain_exhausted` \| `rejected` |
+| `kinesis.exporter.attributes_truncated` | counter | `{attribute}` | attribute values clamped by `truncate_attribute_values`. Emitted on every mutation regardless of whether truncation alone fit the record — a non-zero sustained rate means something upstream is generating long values. |
 | `kinesis.receiver.poll.records` | histogram | `{record}` | records per `GetRecords` call |
 | `kinesis.receiver.poll.bytes` | histogram | `By` | aggregate record bytes per call |
 | `kinesis.receiver.poll.duration_ms` | histogram | `ms` | `GetRecords` latency |

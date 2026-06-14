@@ -32,7 +32,41 @@ Instruments (scope `awskinesisexporter`):
 - `kinesis.exporter.batch.records` (histogram) — records per `PutRecords` call.
 - `kinesis.exporter.batch.bytes` (histogram) — aggregate payload bytes per call.
 - `kinesis.exporter.flush.duration_ms` (histogram) — `PutRecords` latency.
-- `kinesis.exporter.records_dropped` (counter, `reason` = `oversize` |
-  `rejected`) — items dropped rather than retried forever.
+- `kinesis.exporter.records_dropped` (counter, `reason` = `marshal_error` |
+  `compress_error` | `max_attempts` | `irreducible` | `reject_policy` |
+  `chain_exhausted` | `rejected`) — items dropped rather than retried forever.
+  The reason names the failure mode so silent data loss stays observable; see
+  the [user guide](../../docs/user-guide.md#oversize-records) for the policy
+  semantics behind each label.
+- `kinesis.exporter.attributes_truncated` (counter, unit `{attribute}`) —
+  attribute values clamped by `truncate_attribute_values`, regardless of
+  whether truncation alone fit the record. A non-zero sustained rate is the
+  canary that something upstream is generating values longer than
+  `oversize.max_attribute_value_bytes`.
 
-Set the Collector log level to `debug` to log each `emit` and `put_records`.
+Set the Collector log level to `debug` to log each `emit`, `put_records`, and
+oversize-recovery decision (`encode attempt`, `oversize policy: …`).
+
+## Oversize recovery
+
+`oversize.policies` is an ordered chain of recovery strategies tried against
+a payload that compressed larger than `max_record_size`:
+
+- **`split_half`** (default) — recursively halve resources, then leaf items
+  within a resource, until each piece fits or `oversize.max_attempts` is
+  reached. Lossless when the bloat is in item count.
+- **`truncate_attribute_values`** — clone the batch and clamp any string
+  attribute value longer than `oversize.max_attribute_value_bytes`, backing
+  off to a UTF-8 codepoint boundary so the output stays valid. Targets the
+  "single long tag value" failure mode that `split_half` cannot recover.
+  Lossy on string attributes only; every clamp increments
+  `kinesis.exporter.attributes_truncated`.
+- **`reject`** — stop here; drop the remainder and count as `reject_policy`.
+
+Strategies are applied in order to the still-oversize remainder; the first
+that fits wins. `split_half` and `reject` terminate the chain by
+construction and validation enforces that they appear only as the last
+entry. If every policy fails the items are dropped with the specific
+terminal reason (`irreducible`, `max_attempts`, `reject_policy`) or
+`chain_exhausted`. For high-cardinality attribute workloads,
+`[truncate_attribute_values, split_half]` is the typical chain.

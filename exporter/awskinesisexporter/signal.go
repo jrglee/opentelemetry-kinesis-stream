@@ -2,6 +2,7 @@ package awskinesisexporter
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -30,11 +31,86 @@ func tagKey(attrs pcommon.Map, tags []string) string {
 // tracesCodec adapts ptrace.Traces to the generic record pipeline.
 func tracesCodec(enc encoding.TracesEncoder) signalCodec[ptrace.Traces] {
 	return signalCodec[ptrace.Traces]{
-		groupByTags: groupTracesByTags,
-		splitHalf:   splitTracesHalf,
-		marshal:     enc.Marshal,
-		itemCount:   func(td ptrace.Traces) int { return td.SpanCount() },
+		groupByTags:        groupTracesByTags,
+		splitHalf:          splitTracesHalf,
+		truncateAttributes: truncateTracesAttributes,
+		marshal:            enc.Marshal,
+		itemCount:          func(td ptrace.Traces) int { return td.SpanCount() },
 	}
+}
+
+// clampStringAttrs truncates every string-valued attribute in m whose UTF-8
+// byte length exceeds maxBytes, in place. Returns the number of values changed.
+// Non-string kinds (bool, int, double, bytes, slice, map) are never touched —
+// numeric values do not bloat records, and mutating structured kinds would
+// rewrite semantics rather than trim them. The truncation backsteps to a
+// codepoint boundary so the output remains valid UTF-8; encoders downstream
+// (notably otel_arrow) reject invalid sequences, and otlp_json silently
+// substitutes the replacement character, both of which are worse than
+// emitting a few fewer bytes than maxBytes.
+func clampStringAttrs(m pcommon.Map, maxBytes int) int {
+	changed := 0
+	m.Range(func(_ string, v pcommon.Value) bool {
+		if v.Type() != pcommon.ValueTypeStr {
+			return true
+		}
+		s := v.Str()
+		if len(s) <= maxBytes {
+			return true
+		}
+		v.SetStr(s[:utf8SafeCut(s, maxBytes)])
+		changed++
+		return true
+	})
+	return changed
+}
+
+// utf8SafeCut returns the largest n <= maxBytes such that s[:n] ends on a
+// UTF-8 codepoint boundary. A mid-codepoint cut produces invalid UTF-8 that
+// strict encoders reject; we'd rather drop a few bytes than ship garbage.
+// Caller has already established len(s) > maxBytes.
+func utf8SafeCut(s string, maxBytes int) int {
+	// Scan backward at most 3 bytes — UTF-8 codepoints are 1-4 bytes, so the
+	// cut is at most 3 bytes before maxBytes.
+	for n := maxBytes; n > maxBytes-4 && n > 0; n-- {
+		if utf8.RuneStart(s[n]) {
+			return n
+		}
+	}
+	return maxBytes
+}
+
+// truncateTracesAttributes returns a clone of td with every string attribute
+// (resource, scope, span, event, link) clamped to maxBytes. The caller's td is
+// not mutated — the clone is what gets re-marshaled.
+func truncateTracesAttributes(td ptrace.Traces, maxBytes int) (ptrace.Traces, int) {
+	out := ptrace.NewTraces()
+	td.CopyTo(out)
+	changed := 0
+	rss := out.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		rs := rss.At(i)
+		changed += clampStringAttrs(rs.Resource().Attributes(), maxBytes)
+		sss := rs.ScopeSpans()
+		for j := 0; j < sss.Len(); j++ {
+			ss := sss.At(j)
+			changed += clampStringAttrs(ss.Scope().Attributes(), maxBytes)
+			spans := ss.Spans()
+			for k := 0; k < spans.Len(); k++ {
+				sp := spans.At(k)
+				changed += clampStringAttrs(sp.Attributes(), maxBytes)
+				events := sp.Events()
+				for e := 0; e < events.Len(); e++ {
+					changed += clampStringAttrs(events.At(e).Attributes(), maxBytes)
+				}
+				links := sp.Links()
+				for l := 0; l < links.Len(); l++ {
+					changed += clampStringAttrs(links.At(l).Attributes(), maxBytes)
+				}
+			}
+		}
+	}
+	return out, changed
 }
 
 func groupTracesByTags(td ptrace.Traces, tags []string) []taggedBatch[ptrace.Traces] {
@@ -124,11 +200,88 @@ func splitTracesHalf(td ptrace.Traces) (ptrace.Traces, ptrace.Traces, bool) {
 // metricsCodec adapts pmetric.Metrics to the generic record pipeline.
 func metricsCodec(enc encoding.MetricsEncoder) signalCodec[pmetric.Metrics] {
 	return signalCodec[pmetric.Metrics]{
-		groupByTags: groupMetricsByTags,
-		splitHalf:   splitMetricsHalf,
-		marshal:     enc.Marshal,
-		itemCount:   func(md pmetric.Metrics) int { return md.DataPointCount() },
+		groupByTags:        groupMetricsByTags,
+		splitHalf:          splitMetricsHalf,
+		truncateAttributes: truncateMetricsAttributes,
+		marshal:            enc.Marshal,
+		itemCount:          func(md pmetric.Metrics) int { return md.DataPointCount() },
 	}
+}
+
+// truncateMetricsAttributes returns a clone of md with every string attribute
+// (resource, scope, and every datapoint across gauge/sum/histogram/exp-histogram/
+// summary) clamped to maxBytes. Exemplar attributes are also walked because they
+// are arbitrary user-supplied dimensions that can drive the same bloat.
+func truncateMetricsAttributes(md pmetric.Metrics, maxBytes int) (pmetric.Metrics, int) {
+	out := pmetric.NewMetrics()
+	md.CopyTo(out)
+	changed := 0
+	rms := out.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		rm := rms.At(i)
+		changed += clampStringAttrs(rm.Resource().Attributes(), maxBytes)
+		sms := rm.ScopeMetrics()
+		for j := 0; j < sms.Len(); j++ {
+			sm := sms.At(j)
+			changed += clampStringAttrs(sm.Scope().Attributes(), maxBytes)
+			ms := sm.Metrics()
+			for k := 0; k < ms.Len(); k++ {
+				changed += clampMetricDataPoints(ms.At(k), maxBytes)
+			}
+		}
+	}
+	return out, changed
+}
+
+// clampMetricDataPoints walks all datapoint kinds in m and clamps their
+// attribute strings. Each metric kind exposes datapoints under a different
+// type-discriminated field, so the switch is unavoidable.
+func clampMetricDataPoints(m pmetric.Metric, maxBytes int) int {
+	changed := 0
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		dps := m.Gauge().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			dp := dps.At(i)
+			changed += clampStringAttrs(dp.Attributes(), maxBytes)
+			changed += clampNumberExemplars(dp.Exemplars(), maxBytes)
+		}
+	case pmetric.MetricTypeSum:
+		dps := m.Sum().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			dp := dps.At(i)
+			changed += clampStringAttrs(dp.Attributes(), maxBytes)
+			changed += clampNumberExemplars(dp.Exemplars(), maxBytes)
+		}
+	case pmetric.MetricTypeHistogram:
+		dps := m.Histogram().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			dp := dps.At(i)
+			changed += clampStringAttrs(dp.Attributes(), maxBytes)
+			changed += clampNumberExemplars(dp.Exemplars(), maxBytes)
+		}
+	case pmetric.MetricTypeExponentialHistogram:
+		dps := m.ExponentialHistogram().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			dp := dps.At(i)
+			changed += clampStringAttrs(dp.Attributes(), maxBytes)
+			changed += clampNumberExemplars(dp.Exemplars(), maxBytes)
+		}
+	case pmetric.MetricTypeSummary:
+		dps := m.Summary().DataPoints()
+		for i := 0; i < dps.Len(); i++ {
+			changed += clampStringAttrs(dps.At(i).Attributes(), maxBytes)
+		}
+	}
+	return changed
+}
+
+func clampNumberExemplars(exs pmetric.ExemplarSlice, maxBytes int) int {
+	changed := 0
+	for i := 0; i < exs.Len(); i++ {
+		changed += clampStringAttrs(exs.At(i).FilteredAttributes(), maxBytes)
+	}
+	return changed
 }
 
 func groupMetricsByTags(md pmetric.Metrics, tags []string) []taggedBatch[pmetric.Metrics] {
