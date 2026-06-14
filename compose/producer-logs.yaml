@@ -1,0 +1,36 @@
+# Logs producer collector: OTLP in, Kinesis out. Used by the logs E2E stack.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    # One log record per Kinesis record so each record gets its own random
+    # partition key, spreading load across shards. send_batch_max_size is the
+    # lever that splits incoming batches; send_batch_size alone would coalesce.
+    timeout: 200ms
+    send_batch_size: 1
+    send_batch_max_size: 1
+
+exporters:
+  awskinesis:
+    stream_name: otel-logs
+    region: us-east-1
+    endpoint: http://ministack:4566
+    encoding: ${env:ENCODING:-otlp_proto}
+    compression: ${env:COMPRESSION:-gzip}
+    max_record_size: 1048576
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [awskinesis, debug]
