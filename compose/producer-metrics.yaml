@@ -1,17 +1,20 @@
 # Metrics producer collector: InfluxDB line protocol in, Kinesis out.
 #
-# InfluxDB tags arrive as datapoint attributes. groupbyattrs PROMOTES the
-# selected tag keys to resource attributes so the exporter's tag_hash
-# partition key (which hashes resource attributes) co-locates every datapoint
-# sharing the same (host, region) tuple onto one stable partition key. The
-# groupbyattrs keys MUST match the exporter's partition_key.tags exactly.
+# InfluxDB tags arrive as datapoint attributes (not resource attributes).
+# The exporter derives the partition key DIRECTLY from the datapoint:
+#   - device_id  — a datapoint attribute set by the linegen tag (the InfluxDB
+#                  receiver drops dotted tag keys, so this path uses device_id;
+#                  a real OTLP producer would use device.id — the exporter reads
+#                  whatever key the producer emits)
+#   - subsystem  — extracted from the metric name via ^([a-z]+)_ regex
+#                  and also PROMOTED onto each datapoint as attribute "subsystem"
+#                  (only when absent, so the payload is otherwise unchanged)
+#
+# This replaces the previous groupbyattrs processor. Tags stay on the datapoint;
+# no resource promotion occurs; the round-trip payload is unmodified.
 receivers:
   influxdb:
     endpoint: 0.0.0.0:8086
-
-processors:
-  groupbyattrs:
-    keys: [host, region]
 
 exporters:
   awskinesis:
@@ -23,7 +26,9 @@ exporters:
     max_record_size: 1048576
     partition_key:
       strategy: tag_hash
-      tags: [host, region]
+      keys:
+        - { source: datapoint, name: device_id }
+        - { source: metric_name, regex: "^([a-z]+)_", promote: subsystem }
       hash: xxhash
     oversize:
       policies: [split_half]
@@ -38,5 +43,4 @@ service:
   pipelines:
     metrics:
       receivers: [influxdb]
-      processors: [groupbyattrs]
       exporters: [awskinesis, debug]

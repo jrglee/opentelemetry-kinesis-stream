@@ -1,9 +1,17 @@
 // Command linegen is a tiny deterministic InfluxDB line-protocol load
 // generator for the metrics E2E. It cycles through a fixed (host, region,
-// service) tag space, POSTing batches of line-protocol measurements to an
-// InfluxDB v1 /write endpoint, then prints the total sent and the number of
-// distinct (host, region) tuples so the test can assert no loss and tag
-// locality. It depends on nothing outside the standard library.
+// device_id) tag space, POSTing batches of line-protocol measurements to an
+// InfluxDB v1 /write endpoint. Measurement names each begin with a lowercase
+// subsystem prefix separated by "_" (e.g. "charging_load", "network_rx"),
+// so the exporter's ^([a-z]+)_ regex can extract a stable subsystem label.
+//
+// Stdout contract (parsed by the E2E test):
+//
+//	LINEGEN_SENT              <total>
+//	LINEGEN_DISTINCT_DEVICES  <n>
+//	LINEGEN_DISTINCT_SUBSYSTEMS <n>
+//
+// It depends on nothing outside the standard library.
 package main
 
 import (
@@ -15,6 +23,9 @@ import (
 	"strings"
 	"time"
 )
+
+// measurements cycles across two distinct subsystems (charging, network).
+var measurements = []string{"charging_load", "charging_temp", "network_rx"}
 
 func main() {
 	if err := run(); err != nil {
@@ -28,19 +39,18 @@ func run() error {
 	total := envInt("TOTAL", 2000)
 	hosts := envInt("HOSTS", 8)
 	regions := envInt("REGIONS", 3)
-	services := envInt("SERVICES", 4)
+	devices := envInt("DEVICES", 4)
 	batch := envInt("BATCH", 200)
-	if total <= 0 || hosts <= 0 || regions <= 0 || services <= 0 || batch <= 0 {
-		return fmt.Errorf("TOTAL/HOSTS/REGIONS/SERVICES/BATCH must all be positive")
+	if total <= 0 || hosts <= 0 || regions <= 0 || devices <= 0 || batch <= 0 {
+		return fmt.Errorf("TOTAL/HOSTS/REGIONS/DEVICES/BATCH must all be positive")
 	}
 
 	writeURL := strings.TrimRight(endpoint, "/") + "/write"
 	regionNames := []string{"us-east", "us-west", "eu-west", "eu-central", "ap-south"}
 
-	// Distinct (host, region) tuples actually emitted: the tag space cycles
-	// deterministically, so after `total` measurements the reached set is the
-	// smaller of total and the full host*region grid.
-	distinct := map[[2]int]struct{}{}
+	// Track distinct device indices and subsystems actually emitted.
+	distinctDevices := map[int]struct{}{}
+	distinctSubsystems := map[string]struct{}{}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	base := time.Now().UnixNano()
@@ -62,16 +72,26 @@ func run() error {
 	for i := 0; i < total; i++ {
 		h := i % hosts
 		r := (i / hosts) % regions
-		s := (i / (hosts * regions)) % services
-		distinct[[2]int{h, r}] = struct{}{}
+		d := i % devices
+		measurement := measurements[i%len(measurements)]
+
+		// Extract the subsystem prefix (everything before the first "_").
+		subsystem := subsystemOf(measurement)
+
+		distinctDevices[d] = struct{}{}
+		distinctSubsystems[subsystem] = struct{}{}
 
 		region := regionNames[r%len(regionNames)]
 		// Spread timestamps by 1ms so points are distinct in time.
 		ts := base + int64(i)*int64(time.Millisecond)
 		value := float64(i%100) / 100.0
 
-		fmt.Fprintf(&buf, "system.cpu,host=h%d,region=%s,service=api%d value=%s %d\n",
-			h, region, s, strconv.FormatFloat(value, 'f', 2, 64), ts)
+		// The InfluxDB receiver drops tag keys containing dots, so the per-producer
+		// key is device_id here. The exporter's datapoint source reads whatever
+		// attribute key the producer emits (a real OTLP producer would send
+		// device.id); only this ingestion path constrains the spelling.
+		fmt.Fprintf(&buf, "%s,host=h%d,region=%s,device_id=dev%d value=%s %d\n",
+			measurement, h, region, d, strconv.FormatFloat(value, 'f', 2, 64), ts)
 		inBatch++
 
 		if inBatch >= batch {
@@ -84,10 +104,20 @@ func run() error {
 		return err
 	}
 
-	// stdout contract consumed by the E2E: two prefixed lines it can parse.
+	// stdout contract consumed by the E2E: three prefixed lines it can parse.
 	fmt.Printf("LINEGEN_SENT %d\n", total)
-	fmt.Printf("LINEGEN_DISTINCT_TUPLES %d\n", len(distinct))
+	fmt.Printf("LINEGEN_DISTINCT_DEVICES %d\n", len(distinctDevices))
+	fmt.Printf("LINEGEN_DISTINCT_SUBSYSTEMS %d\n", len(distinctSubsystems))
 	return nil
+}
+
+// subsystemOf returns the portion of name before the first "_", which is the
+// subsystem prefix by convention (e.g. "charging" from "charging_load").
+func subsystemOf(name string) string {
+	if idx := strings.IndexByte(name, '_'); idx > 0 {
+		return name[:idx]
+	}
+	return name
 }
 
 func post(client *http.Client, url string, body []byte) error {

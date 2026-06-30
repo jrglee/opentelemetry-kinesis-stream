@@ -3,6 +3,7 @@ package awskinesisexporter
 import (
 	"errors"
 	"fmt"
+	"regexp"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
 )
@@ -57,16 +58,44 @@ type PutRecordsConfig struct {
 
 // PartitionKeyConfig selects the partition-key strategy. "random" spreads
 // records uniformly across shards; "tag_hash" co-locates records that share
-// the same ordered resource-attribute tuple onto a stable key so a downstream
-// consumer sees them in order and so per-tuple microbatching is possible.
+// the same ordered attribute tuple onto a stable key so a downstream consumer
+// sees them in order and so per-tuple microbatching is possible.
 type PartitionKeyConfig struct {
 	// Strategy is "random" (default) or "tag_hash".
 	Strategy string `mapstructure:"strategy"`
-	// Tags is the ordered list of resource attribute keys hashed into the
-	// partition key. Required and non-empty when Strategy is "tag_hash".
+	// Tags is a shorthand for "tag_hash" key sources where every component is a
+	// resource attribute. Mutually exclusive with Keys; required and non-empty
+	// when Strategy is "tag_hash" and Keys is empty.
 	Tags []string `mapstructure:"tags"`
+	// Keys is the ordered list of heterogeneous sources hashed into the partition
+	// key. Use this instead of Tags when you need datapoint attributes or the
+	// metric name in the key. Mutually exclusive with Tags; required and
+	// non-empty when Strategy is "tag_hash" and Tags is empty.
+	Keys []PartitionKeySource `mapstructure:"keys"`
 	// Hash names the hash function for "tag_hash"; only "xxhash" (default).
 	Hash string `mapstructure:"hash"`
+}
+
+// PartitionKeySource is one ordered component of a tag_hash key.
+type PartitionKeySource struct {
+	// Source selects where the value is read from: "resource" (a resource
+	// attribute), "datapoint" (a metric datapoint / span / log-record attribute),
+	// or "metric_name" (the metric's name; empty for traces and logs). Empty
+	// defaults to "resource".
+	Source string `mapstructure:"source"`
+	// Name is the attribute key read for "resource" and "datapoint". Must be empty
+	// for "metric_name".
+	Name string `mapstructure:"name"`
+	// Regex optionally reduces the resolved value to the first capture group of the
+	// first match (or the whole match when the pattern has no group); a non-match
+	// contributes an empty segment. Must compile.
+	Regex string `mapstructure:"regex"`
+	// Promote, when non-empty, names an attribute under which the resolved
+	// (post-regex) value is additively written on the outgoing record — at the
+	// source-native level (resource source -> resource attribute; datapoint /
+	// metric_name -> the record leaf), only when that attribute is absent. Empty
+	// means no promotion and a byte-identical payload.
+	Promote string `mapstructure:"promote"`
 }
 
 // OversizeConfig is the recovery chain for a payload that exceeds MaxRecordSize.
@@ -112,6 +141,9 @@ const (
 	partitionStrategyRandom  = "random"
 	partitionStrategyTagHash = "tag_hash"
 	hashXXHash               = "xxhash"
+	keySourceResource        = "resource"
+	keySourceDatapoint       = "datapoint"
+	keySourceMetricName      = "metric_name"
 	oversizeSplitHalf        = "split_half"
 	oversizeTruncateAttrs    = "truncate_attribute_values"
 	oversizeReject           = "reject"
@@ -146,8 +178,36 @@ func (c *Config) Validate() error {
 	switch c.PartitionKey.Strategy {
 	case "", partitionStrategyRandom:
 	case partitionStrategyTagHash:
-		if len(c.PartitionKey.Tags) == 0 {
-			return errors.New("partition_key.tags is required for strategy tag_hash")
+		hasTags := len(c.PartitionKey.Tags) > 0
+		hasKeys := len(c.PartitionKey.Keys) > 0
+		if hasTags && hasKeys {
+			return errors.New("partition_key.tags and partition_key.keys are mutually exclusive")
+		}
+		if !hasTags && !hasKeys {
+			return errors.New("partition_key.tags or partition_key.keys is required for strategy tag_hash")
+		}
+		for i, ks := range c.PartitionKey.Keys {
+			src := ks.Source
+			if src == "" {
+				src = keySourceResource
+			}
+			switch src {
+			case keySourceResource, keySourceDatapoint:
+				if ks.Name == "" {
+					return fmt.Errorf("partition_key.keys[%d]: name is required for source %q", i, src)
+				}
+			case keySourceMetricName:
+				if ks.Name != "" {
+					return fmt.Errorf("partition_key.keys[%d]: name must be empty for source %q", i, src)
+				}
+			default:
+				return fmt.Errorf("partition_key.keys[%d]: unknown source %q", i, src)
+			}
+			if ks.Regex != "" {
+				if _, err := regexp.Compile(ks.Regex); err != nil {
+					return fmt.Errorf("partition_key.keys[%d]: invalid regex: %w", i, err)
+				}
+			}
 		}
 	default:
 		return fmt.Errorf("unknown partition_key.strategy %q", c.PartitionKey.Strategy)

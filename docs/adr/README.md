@@ -32,6 +32,7 @@ implementing it.
 - [0018 — Implement `otel_arrow` encoding with per-record self-contained batches](0018-implement-otel-arrow-encoding.md) (superseded by 0020)
 - [0019 — Oversize recovery is a chain of policies, not a single mode](0019-oversize-recovery-chain.md)
 - [0020 — Remove `otel_arrow` encoding from the PoC](0020-remove-otel-arrow-encoding.md)
+- [0021 — Partition keys from sub-resource dimensions](0021-partition-keys-from-sub-resource-dimensions.md)
 
 ## How to add an ADR
 

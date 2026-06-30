@@ -51,9 +51,9 @@ type taggedBatch[T any] struct {
 // group/compress/oversize/PutRecords pipeline stay signal-agnostic. Only the
 // operations here touch pdata; everything else is generic.
 type signalCodec[T any] struct {
-	// groupByTags partitions a batch by the ordered tag values. With no tags
-	// it returns a single batch keyed "" (random strategy).
-	groupByTags func(b T, tags []string) []taggedBatch[T]
+	// groupByTags partitions a batch by the compiled key plan. With an empty
+	// plan it returns a single batch keyed "" (random strategy).
+	groupByTags func(b T, plan keyPlan) []taggedBatch[T]
 	// splitHalf divides a batch's children roughly in half. ok is false when
 	// the batch is a single indivisible leaf item.
 	splitHalf func(b T) (T, T, bool)
@@ -110,14 +110,10 @@ func (d drops) merge(o drops) drops {
 	return d
 }
 
-// emit is the shared export path for any signal: group by tags, repack each
-// group into fitting payloads, and flush them as bounded PutRecords calls.
+// emit is the shared export path for any signal: group by key plan, repack
+// each group into fitting payloads, and flush them as bounded PutRecords calls.
 func emit[T any](ctx context.Context, e *kinesisExporter, b T, sc signalCodec[T]) error {
-	var tags []string
-	if e.cfg.tagHash() {
-		tags = e.cfg.PartitionKey.Tags
-	}
-	groups := sc.groupByTags(b, tags)
+	groups := sc.groupByTags(b, e.keyPlan)
 
 	strategy := partitionStrategyRandom
 	if e.cfg.tagHash() {

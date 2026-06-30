@@ -1,7 +1,6 @@
 package awskinesisexporter
 
 import (
-	"strings"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -16,18 +15,6 @@ import (
 // separator) cannot appear in attribute keys and is vanishingly unlikely in
 // values, so it avoids "a"+"bc" colliding with "ab"+"c".
 const tagSep = "\x1f"
-
-// tagKey reads the ordered tags from a resource's attributes and joins them.
-// A missing attribute contributes an empty segment so position is preserved.
-func tagKey(attrs pcommon.Map, tags []string) string {
-	parts := make([]string, len(tags))
-	for i, t := range tags {
-		if v, ok := attrs.Get(t); ok {
-			parts[i] = v.AsString()
-		}
-	}
-	return strings.Join(parts, tagSep)
-}
 
 // tracesCodec adapts ptrace.Traces to the generic record pipeline.
 func tracesCodec(enc encoding.TracesEncoder) signalCodec[ptrace.Traces] {
@@ -113,23 +100,35 @@ func truncateTracesAttributes(td ptrace.Traces, maxBytes int) (ptrace.Traces, in
 	return out, changed
 }
 
-func groupTracesByTags(td ptrace.Traces, tags []string) []taggedBatch[ptrace.Traces] {
-	if len(tags) == 0 {
+func groupTracesByTags(td ptrace.Traces, plan keyPlan) []taggedBatch[ptrace.Traces] {
+	if len(plan) == 0 {
 		return []taggedBatch[ptrace.Traces]{{key: "", batch: td}}
 	}
+	if !plan.resourceOnly() {
+		return groupTracesByLeaf(td, plan)
+	}
+	return groupTracesByResource(td, plan)
+}
+
+func groupTracesByResource(td ptrace.Traces, plan keyPlan) []taggedBatch[ptrace.Traces] {
 	byKey := map[string]ptrace.Traces{}
 	var order []string
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
 		rs := rss.At(i)
-		key := tagKey(rs.Resource().Attributes(), tags)
+		parts := resolveParts(plan, rs.Resource().Attributes(), "", emptyAttrs)
+		key := joinParts(parts)
 		dst, ok := byKey[key]
 		if !ok {
 			dst = ptrace.NewTraces()
 			byKey[key] = dst
 			order = append(order, key)
 		}
-		rs.CopyTo(dst.ResourceSpans().AppendEmpty())
+		appended := dst.ResourceSpans().AppendEmpty()
+		rs.CopyTo(appended)
+		if plan.hasPromotion() {
+			applyPromotions(plan, parts, appended.Resource().Attributes(), emptyAttrs)
+		}
 	}
 	out := make([]taggedBatch[ptrace.Traces], 0, len(order))
 	for _, k := range order {
@@ -284,23 +283,35 @@ func clampNumberExemplars(exs pmetric.ExemplarSlice, maxBytes int) int {
 	return changed
 }
 
-func groupMetricsByTags(md pmetric.Metrics, tags []string) []taggedBatch[pmetric.Metrics] {
-	if len(tags) == 0 {
+func groupMetricsByTags(md pmetric.Metrics, plan keyPlan) []taggedBatch[pmetric.Metrics] {
+	if len(plan) == 0 {
 		return []taggedBatch[pmetric.Metrics]{{key: "", batch: md}}
 	}
+	if !plan.resourceOnly() {
+		return groupMetricsByLeaf(md, plan)
+	}
+	return groupMetricsByResource(md, plan)
+}
+
+func groupMetricsByResource(md pmetric.Metrics, plan keyPlan) []taggedBatch[pmetric.Metrics] {
 	byKey := map[string]pmetric.Metrics{}
 	var order []string
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
 		rm := rms.At(i)
-		key := tagKey(rm.Resource().Attributes(), tags)
+		parts := resolveParts(plan, rm.Resource().Attributes(), "", emptyAttrs)
+		key := joinParts(parts)
 		dst, ok := byKey[key]
 		if !ok {
 			dst = pmetric.NewMetrics()
 			byKey[key] = dst
 			order = append(order, key)
 		}
-		rm.CopyTo(dst.ResourceMetrics().AppendEmpty())
+		appended := dst.ResourceMetrics().AppendEmpty()
+		rm.CopyTo(appended)
+		if plan.hasPromotion() {
+			applyPromotions(plan, parts, appended.Resource().Attributes(), emptyAttrs)
+		}
 	}
 	out := make([]taggedBatch[pmetric.Metrics], 0, len(order))
 	for _, k := range order {
@@ -419,23 +430,35 @@ func truncateLogsAttributes(ld plog.Logs, maxBytes int) (plog.Logs, int) {
 	return out, changed
 }
 
-func groupLogsByTags(ld plog.Logs, tags []string) []taggedBatch[plog.Logs] {
-	if len(tags) == 0 {
+func groupLogsByTags(ld plog.Logs, plan keyPlan) []taggedBatch[plog.Logs] {
+	if len(plan) == 0 {
 		return []taggedBatch[plog.Logs]{{key: "", batch: ld}}
 	}
+	if !plan.resourceOnly() {
+		return groupLogsByLeaf(ld, plan)
+	}
+	return groupLogsByResource(ld, plan)
+}
+
+func groupLogsByResource(ld plog.Logs, plan keyPlan) []taggedBatch[plog.Logs] {
 	byKey := map[string]plog.Logs{}
 	var order []string
 	rls := ld.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
 		rl := rls.At(i)
-		key := tagKey(rl.Resource().Attributes(), tags)
+		parts := resolveParts(plan, rl.Resource().Attributes(), "", emptyAttrs)
+		key := joinParts(parts)
 		dst, ok := byKey[key]
 		if !ok {
 			dst = plog.NewLogs()
 			byKey[key] = dst
 			order = append(order, key)
 		}
-		rl.CopyTo(dst.ResourceLogs().AppendEmpty())
+		appended := dst.ResourceLogs().AppendEmpty()
+		rl.CopyTo(appended)
+		if plan.hasPromotion() {
+			applyPromotions(plan, parts, appended.Resource().Attributes(), emptyAttrs)
+		}
 	}
 	out := make([]taggedBatch[plog.Logs], 0, len(order))
 	for _, k := range order {

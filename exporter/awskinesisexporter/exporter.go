@@ -26,6 +26,7 @@ import (
 // used throughout so tag-grouped microbatches ride one call.
 type kinesisExporter struct {
 	cfg        *Config
+	keyPlan    keyPlan
 	client     *kinesis.Client
 	tracesEnc  encoding.TracesEncoder
 	metricsEnc encoding.MetricsEncoder
@@ -60,8 +61,13 @@ func newExporter(ctx context.Context, cfg *Config, set exporter.Settings) (*kine
 	if err != nil {
 		return nil, fmt.Errorf("telemetry: %w", err)
 	}
+	plan, err := cfg.resolveKeyPlan()
+	if err != nil {
+		return nil, fmt.Errorf("partition key plan: %w", err)
+	}
 	return &kinesisExporter{
 		cfg:        cfg,
+		keyPlan:    plan,
 		client:     client,
 		tracesEnc:  tEnc,
 		metricsEnc: mEnc,
