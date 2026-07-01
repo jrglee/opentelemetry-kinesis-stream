@@ -343,8 +343,15 @@ func splitMetricsHalf(md pmetric.Metrics) (pmetric.Metrics, pmetric.Metrics, boo
 	}
 	rm := rms.At(0)
 	total := metricCount(rm)
-	if total <= 1 {
+	if total == 0 {
 		return pmetric.Metrics{}, pmetric.Metrics{}, false
+	}
+	if total == 1 {
+		// A single metric: the only remaining axis is its datapoints. Split those
+		// in half so an oversize single-metric record (the common shape when
+		// partitioning by a datapoint attribute) stays recoverable instead of
+		// being dropped as irreducible.
+		return splitSingleMetricDatapoints(rm)
 	}
 	mid := total / 2
 	a, b := pmetric.NewMetrics(), pmetric.NewMetrics()
@@ -389,6 +396,59 @@ func metricCount(rm pmetric.ResourceMetrics) int {
 		n += sms.At(i).Metrics().Len()
 	}
 	return n
+}
+
+// splitSingleMetricDatapoints splits the datapoints of a resource holding
+// exactly one metric into two halves, preserving resource/scope/metric identity
+// and the metric shell on both sides. ok is false only when the metric has a
+// single (indivisible) datapoint. The input is never mutated.
+func splitSingleMetricDatapoints(rm pmetric.ResourceMetrics) (pmetric.Metrics, pmetric.Metrics, bool) {
+	var srcSM pmetric.ScopeMetrics
+	var srcM pmetric.Metric
+	sms := rm.ScopeMetrics()
+	for i := 0; i < sms.Len(); i++ {
+		if sms.At(i).Metrics().Len() > 0 {
+			srcSM = sms.At(i)
+			srcM = srcSM.Metrics().At(0)
+			break
+		}
+	}
+
+	n := 0
+	eachMetricDataPoint(srcM, func(pcommon.Map, func(pmetric.Metric) pcommon.Map) { n++ })
+	if n <= 1 {
+		return pmetric.Metrics{}, pmetric.Metrics{}, false
+	}
+
+	mid := n / 2
+	a, b := pmetric.NewMetrics(), pmetric.NewMetrics()
+	ma := buildMetricShell(a, rm, srcSM, srcM)
+	mb := buildMetricShell(b, rm, srcSM, srcM)
+	seen := 0
+	eachMetricDataPoint(srcM, func(_ pcommon.Map, appendInto func(dst pmetric.Metric) pcommon.Map) {
+		if seen < mid {
+			appendInto(ma)
+		} else {
+			appendInto(mb)
+		}
+		seen++
+	})
+	return a, b, true
+}
+
+// buildMetricShell appends a ResourceMetrics/ScopeMetrics/Metric skeleton into
+// dst — copying resource, scope, schema URLs, and the metric shell (no
+// datapoints) — and returns the empty dest Metric for datapoints to append into.
+func buildMetricShell(dst pmetric.Metrics, srcRM pmetric.ResourceMetrics, srcSM pmetric.ScopeMetrics, srcM pmetric.Metric) pmetric.Metric {
+	drm := dst.ResourceMetrics().AppendEmpty()
+	srcRM.Resource().CopyTo(drm.Resource())
+	drm.SetSchemaUrl(srcRM.SchemaUrl())
+	dsm := drm.ScopeMetrics().AppendEmpty()
+	srcSM.Scope().CopyTo(dsm.Scope())
+	dsm.SetSchemaUrl(srcSM.SchemaUrl())
+	dm := dsm.Metrics().AppendEmpty()
+	copyMetricShell(srcM, dm)
+	return dm
 }
 
 // logsCodec adapts plog.Logs to the generic record pipeline.

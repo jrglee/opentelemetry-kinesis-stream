@@ -158,8 +158,13 @@ func putIfAbsent(m pcommon.Map, k, v string) {
 	}
 }
 
-// emptyAttrs is a shared read-only empty map used as the leaf argument on the
-// resource-only fast path. It must never be written to.
+// emptyAttrs is a shared empty map used as the leaf argument on paths that have
+// no record leaf (the resource-only fast path and the zero-datapoint metric
+// branch). It is READ-ONLY: every use only reads it via resolveParts' Get, and
+// applyPromotions is never reached with emptyAttrs as its write target (those
+// paths are resource-only, so promotion writes to the resource map, never the
+// leaf). It must never be written to — doing so would corrupt shared state
+// across concurrent Consume calls.
 var emptyAttrs = pcommon.NewMap()
 
 // joinParts joins resolved parts with the standard tag separator. Extracted so

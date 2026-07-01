@@ -159,6 +159,18 @@ func eachMetricDataPoint(
 func groupMetricsByLeaf(md pmetric.Metrics, plan keyPlan) []taggedBatch[pmetric.Metrics] {
 	byKey := map[string]*metricBucket{}
 	var order []string
+	promoting := plan.hasPromotion()
+
+	// bucketFor find-or-creates the bucket for a key, tracking first-seen order.
+	bucketFor := func(key string) *metricBucket {
+		b, ok := byKey[key]
+		if !ok {
+			b = newMetricBucket()
+			byKey[key] = b
+			order = append(order, key)
+		}
+		return b
+	}
 
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
@@ -172,23 +184,28 @@ func groupMetricsByLeaf(md pmetric.Metrics, plan keyPlan) []taggedBatch[pmetric.
 			for k := 0; k < ms.Len(); k++ {
 				srcM := ms.At(k)
 
+				seen := false
 				eachMetricDataPoint(srcM, func(dpAttrs pcommon.Map, appendInto func(dst pmetric.Metric) pcommon.Map) {
+					seen = true
 					parts := resolveParts(plan, resAttrs, srcM.Name(), dpAttrs)
-					key := joinParts(parts)
+					bucket := bucketFor(joinParts(parts))
+					destDPAttrs := appendInto(bucket.ensureMetric(i, j, k, srcRM, srcSM, srcM))
 
-					if _, ok := byKey[key]; !ok {
-						byKey[key] = newMetricBucket()
-						order = append(order, key)
-					}
-					bucket := byKey[key]
-					dstM := bucket.ensureMetric(i, j, k, srcRM, srcSM, srcM)
-					destDPAttrs := appendInto(dstM)
-
-					if plan.hasPromotion() {
-						destResAttrs := bucket.rm[i].Resource().Attributes()
-						applyPromotions(plan, parts, destResAttrs, destDPAttrs)
+					if promoting {
+						applyPromotions(plan, parts, bucket.rm[i].Resource().Attributes(), destDPAttrs)
 					}
 				})
+
+				// A metric with no datapoints carries no leaf to key on, but its
+				// shell (name/type/temporality/monotonicity) still matters — the
+				// resource fast path preserves it via CopyTo, so the leaf path must
+				// too. Route it by the leaf-less key (datapoint segments empty). No
+				// promotion runs: there is no datapoint to enrich, and metric_name
+				// promotion targets the leaf, which does not exist here.
+				if !seen {
+					parts := resolveParts(plan, resAttrs, srcM.Name(), emptyAttrs)
+					bucketFor(joinParts(parts)).ensureMetric(i, j, k, srcRM, srcSM, srcM)
+				}
 			}
 		}
 	}
@@ -246,6 +263,7 @@ func (b *traceBucket) ensureScope(i, j int, srcRS ptrace.ResourceSpans, srcSS pt
 func groupTracesByLeaf(td ptrace.Traces, plan keyPlan) []taggedBatch[ptrace.Traces] {
 	byKey := map[string]*traceBucket{}
 	var order []string
+	promoting := plan.hasPromotion()
 
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
@@ -271,7 +289,7 @@ func groupTracesByLeaf(td ptrace.Traces, plan keyPlan) []taggedBatch[ptrace.Trac
 				dstSpan := dstSS.Spans().AppendEmpty()
 				srcSpan.CopyTo(dstSpan)
 
-				if plan.hasPromotion() {
+				if promoting {
 					destResAttrs := bucket.rs[i].Resource().Attributes()
 					applyPromotions(plan, parts, destResAttrs, dstSpan.Attributes())
 				}
@@ -331,6 +349,7 @@ func (b *logBucket) ensureScope(i, j int, srcRL plog.ResourceLogs, srcSL plog.Sc
 func groupLogsByLeaf(ld plog.Logs, plan keyPlan) []taggedBatch[plog.Logs] {
 	byKey := map[string]*logBucket{}
 	var order []string
+	promoting := plan.hasPromotion()
 
 	rls := ld.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
@@ -356,7 +375,7 @@ func groupLogsByLeaf(ld plog.Logs, plan keyPlan) []taggedBatch[plog.Logs] {
 				dstLR := dstSL.LogRecords().AppendEmpty()
 				srcLR.CopyTo(dstLR)
 
-				if plan.hasPromotion() {
+				if promoting {
 					destResAttrs := bucket.rl[i].Resource().Attributes()
 					applyPromotions(plan, parts, destResAttrs, dstLR.Attributes())
 				}

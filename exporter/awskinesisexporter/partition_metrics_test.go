@@ -725,6 +725,72 @@ func totalDatapointsInMetric(m pmetric.Metric) int {
 	return 0
 }
 
+// TestGroupMetricsByLeaf_ZeroDatapointMetricPreserved guards that a metric with
+// no datapoints keeps its shell on the leaf path — the resource fast path
+// preserves it via CopyTo, so the leaf path must not silently drop it.
+func TestGroupMetricsByLeaf_ZeroDatapointMetricPreserved(t *testing.T) {
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", "svc")
+	sm := rm.ScopeMetrics().AppendEmpty()
+
+	// A monotonic cumulative Sum with ZERO datapoints (a legal pdata shape).
+	mEmpty := sm.Metrics().AppendEmpty()
+	mEmpty.SetName("empty.sum")
+	es := mEmpty.SetEmptySum()
+	es.SetIsMonotonic(true)
+	es.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+
+	// A gauge with one datapoint, so the batch is otherwise non-empty.
+	mGauge := sm.Metrics().AppendEmpty()
+	mGauge.SetName("g")
+	dp := mGauge.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.Attributes().PutStr("instance", "i1")
+	dp.SetIntValue(1)
+
+	plan := resolveTestPlan(t, []PartitionKeySource{
+		{Source: keySourceDatapoint, Name: "instance"},
+	})
+
+	batches := groupMetricsByLeaf(md, plan)
+
+	// Locate the empty Sum across every emitted batch.
+	var found pmetric.Metric
+	dpTotal := 0
+	for _, b := range batches {
+		rms := b.batch.ResourceMetrics()
+		for i := 0; i < rms.Len(); i++ {
+			sms := rms.At(i).ScopeMetrics()
+			for j := 0; j < sms.Len(); j++ {
+				ms := sms.At(j).Metrics()
+				for k := 0; k < ms.Len(); k++ {
+					m := ms.At(k)
+					dpTotal += totalDatapointsInMetric(m)
+					if m.Name() == "empty.sum" {
+						found = m
+					}
+				}
+			}
+		}
+	}
+
+	if found == (pmetric.Metric{}) {
+		t.Fatal("empty.sum metric was dropped by the leaf path")
+	}
+	if found.Type() != pmetric.MetricTypeSum {
+		t.Fatalf("empty.sum type: got %v want Sum", found.Type())
+	}
+	if !found.Sum().IsMonotonic() || found.Sum().AggregationTemporality() != pmetric.AggregationTemporalityCumulative {
+		t.Error("empty.sum shell settings (monotonic/cumulative) not preserved")
+	}
+	if n := found.Sum().DataPoints().Len(); n != 0 {
+		t.Errorf("empty.sum should have 0 datapoints, got %d", n)
+	}
+	if dpTotal != 1 {
+		t.Errorf("total datapoints across batches: got %d want 1 (the gauge)", dpTotal)
+	}
+}
+
 // Silence the unused-function linter for totalDatapointsInMetric in case
 // some tests use it via inline assertions.
 var _ = totalDatapointsInMetric
