@@ -1,10 +1,10 @@
-# Metrics E2E stack: InfluxDB line protocol -> producer (influxdb ->
-# groupbyattrs -> Kinesis) -> MiniStack Kinesis -> consumer (Kinesis -> file).
+# Metrics E2E stack: InfluxDB line protocol -> producer (influxdb -> Kinesis)
+# -> MiniStack Kinesis -> consumer (Kinesis -> file).
 #
 # A separate stack from docker-compose.yaml so the traces E2E stays untouched.
-# It exercises tag-hash partition keys: groupbyattrs promotes the host/region
-# InfluxDB tags to resource attributes, and the exporter hashes that tuple into
-# a stable partition key, co-locating each tuple's datapoints.
+# The producer derives partition keys directly from datapoint attributes: the
+# instance tag and a namespace prefix extracted from the metric name via regex.
+# No groupbyattrs processor is used; InfluxDB tags stay on the datapoint.
 #
 # Consumer output lands on a named volume (not a host bind mount, which colima
 # does not surface back to the macOS host); the test harness pulls the file out
@@ -79,7 +79,7 @@ services:
       TOTAL: "2000"
       HOSTS: "8"
       REGIONS: "3"
-      SERVICES: "4"
+      INSTANCES: "4"
       BATCH: "200"
     depends_on:
       producer-metrics:

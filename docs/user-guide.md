@@ -282,7 +282,8 @@ a stable key (see [Tag-grouped microbatching](#tag-grouped-microbatching)).
 | `encoding`                | string | `otlp_proto` | no       | Wire format: `otlp_proto` (compact, recommended) or `otlp_json` (interoperable/debuggable) — see [Encodings](#encodings). |
 | `compression`             | string | `none`       | no       | Payload codec: `none`, `gzip`, `zstd`, `snappy`, `x-snappy-framed`, `zlib`, or `deflate` (the collector's full set). See [Choosing compression](#choosing-compression). |
 | `partition_key.strategy`  | string | `random`     | no       | `random` (one key per record, spreads across shards) or `tag_hash` (stable key per resource-attribute tuple, co-locates by tag and groups the batch). |
-| `partition_key.tags`      | list   | —            | if tag_hash | Ordered list of resource attribute keys forming the tag tuple. Records sharing a tuple get the same key and land on the same shard. |
+| `partition_key.tags`      | list   | —            | if tag_hash | Shorthand for an ordered list of **resource** attribute keys forming the tag tuple. Records sharing a tuple get the same key and land on the same shard. Mutually exclusive with `keys`. |
+| `partition_key.keys`      | list   | —            | if tag_hash | Ordered list of heterogeneous key sources (`source`: `resource`/`datapoint`/`metric_name`, plus `name`, optional `regex`, optional `promote`). Lets the key include dimensions below the resource. See [Sub-resource dimensions](#sub-resource-dimensions-keys). Mutually exclusive with `tags`. |
 | `partition_key.hash`      | string | `xxhash`     | no       | Hash function for the partition key. Only `xxhash` is implemented. |
 | `oversize.policies`       | list   | `[split_half]` | no     | Ordered recovery chain tried against a payload that exceeds `max_record_size`. Entries: `truncate_attribute_values`, `split_half`, `reject`. The first policy whose output fits wins; chain exhaustion drops the remainder. See [Oversize records](#oversize-records). |
 | `oversize.max_attempts`   | int    | `8`          | no       | Maximum recursion depth per `split_half` chain step before falling through to the next policy (or dropping). |
@@ -416,20 +417,25 @@ By default each export becomes one record with a random partition key, so
 records spread evenly across shards but related telemetry can land anywhere.
 Under `partition_key.strategy: tag_hash` the exporter instead:
 
-1. **Groups** the incoming batch by the tuple of resource attributes named in
-   `partition_key.tags`, emitting **one record per distinct tuple**.
+1. **Groups** the incoming batch by the configured key tuple, emitting **one
+   record per distinct tuple**.
 2. Derives a **stable partition key** from each tuple (hashed with
    `partition_key.hash`), so every record for a given tuple routes to the same
    shard — giving you per-tuple locality and ordering on the consumer.
 
 Use it when a downstream consumer benefits from all data for, say, one service
 or region arriving on one shard in order. The trade-off is distribution: if one
-tuple dominates traffic, its shard runs hot. Pick tag keys with enough
+tuple dominates traffic, its shard runs hot. Pick dimensions with enough
 cardinality to spread load but enough coarseness to keep locality useful.
 
 Note that tag→shard locality is **not stable across a reshard**: Kinesis maps the
 partition key onto hash-key ranges, and a split or merge changes those ranges, so
 a given tag tuple can land on a different shard after resharding.
+
+#### Resource-only grouping (`tags` shorthand)
+
+The simplest form lists resource attribute keys in `tags`. Every record for a
+`(service.name, region)` tuple lands on the same shard in order:
 
 ```yaml
 exporters:
@@ -460,6 +466,70 @@ sequenceDiagram
     EX->>K: PutRecords(record B, key=hash(svc2, us-west-2))
     Note over K: each tuple always routes to the same shard
 ```
+
+#### Sub-resource dimensions (`keys`)
+
+`tags` is shorthand for resource attributes. The `keys` list lets each
+component of the key read from a different telemetry level:
+
+| `source`      | Reads from | Notes |
+|---------------|------------|-------|
+| `resource`    | Resource attribute | Default. Groups at resource granularity. |
+| `datapoint`   | Record-leaf attribute — metric datapoint, span, or log-record attribute | Groups below the resource; see fan-out below. |
+| `metric_name` | The metric's name | Contributes an empty segment for traces and logs. |
+
+`regex` (optional on any source) reduces the resolved value to the first
+capture group of the first match, or the whole match if the pattern has no
+group. A non-match contributes an empty segment (a deterministic catch-all
+bucket). A coarse-prefix regex on a metric name (`^([a-z]+)_`) turns the raw
+name into a bounded set of buckets.
+
+**Fan a high-volume service across shards** by `instance`, further grouped by
+metric-name namespace (e.g. `http_server_duration` → `http`):
+
+```yaml
+exporters:
+  awskinesis:
+    stream_name: otel-metrics
+    region: us-east-1
+    encoding: otlp_proto
+    compression: zstd
+    partition_key:
+      strategy: tag_hash
+      keys:
+        - { source: datapoint, name: instance }
+        - { source: metric_name, regex: "^([a-z]+)_", promote: namespace }
+```
+
+The `tags` shorthand and the explicit `keys` form with `source: resource` are
+identical — existing resource-only configs continue to work unchanged.
+
+#### Record fan-out
+
+A `datapoint` or `metric_name` source groups below the resource, so one input
+batch can become many records — one per distinct key tuple. This is the point
+(it spreads a high-volume producer across shards), but choose dimensions coarse
+enough to keep records usefully sized. Using the raw metric name as a key
+element approaches one record per series; a regex-derived prefix bounds the
+fan-out.
+
+#### Payload and `promote`
+
+Without `promote`, the OTLP payload is **byte-identical** end to end — the key
+is derived from the data but nothing in the wire record is touched. This is the
+advantage over hoisting via `groupbyattrs` + `transform` processors, which (a)
+may not be bundled in a minimal collector build and (b) mutate the wire: for
+example, promoting a per-series label to the resource level turns it into a
+Prometheus `target_info` attribute and breaks queries that filter on that
+label.
+
+`promote` (optional, on any `keys` entry) is the one case where an attribute is
+**added**. When set, the resolved post-regex value is written under the given
+name at the source-native level (`resource` source → resource attribute;
+`datapoint`/`metric_name` → the record leaf), **only if that attribute is
+absent** — never overwrites. This lets a partition dimension (e.g. a namespace
+derived from the metric name) also exist downstream as a real queryable label
+without relocating or destroying any existing data.
 
 ### Oversize records
 
@@ -685,14 +755,10 @@ Kinesis with tag-grouped microbatching, and decodes it on the far side. This
 worked example pairs the `influxdbreceiver` with the Kinesis exporter on the
 producer, and the Kinesis receiver with your backend on the consumer.
 
-**Why `groupbyattrs` is required.** InfluxDB tags arrive on the
-`influxdbreceiver` as **datapoint attributes**, but the exporter's `tag_hash`
-strategy groups and keys records by **resource attributes**. The
-`groupbyattrs` processor promotes the chosen attribute keys from the datapoint
-level up to the resource level, so the exporter can group by them and derive a
-stable partition key. Keep `groupbyattrs` `keys` **equal** to the exporter's
-`partition_key.tags` — if they diverge, the exporter groups on keys that are not
-present at the resource level and locality is lost.
+InfluxDB tags arrive on the `influxdbreceiver` as **datapoint attributes**. The
+exporter can read them directly with `source: datapoint` — no extra processor
+needed, and the OTLP payload on the wire is byte-identical (the tags stay at
+the datapoint level, as InfluxDB put them):
 
 Producer — InfluxDB in, Kinesis out:
 
@@ -701,8 +767,6 @@ receivers:
   influxdb:
     endpoint: 0.0.0.0:8086    # accepts POST /write
 processors:
-  groupbyattrs:
-    keys: [host, region]      # equal to exporter partition_key.tags
   batch:
 exporters:
   awskinesis:
@@ -712,13 +776,15 @@ exporters:
     compression: zstd
     partition_key:
       strategy: tag_hash
-      tags: [host, region]    # equal to groupbyattrs keys
+      keys:
+        - { source: datapoint, name: host }
+        - { source: datapoint, name: region }
       hash: xxhash
 service:
   pipelines:
     metrics:
       receivers: [influxdb]
-      processors: [groupbyattrs, batch]
+      processors: [batch]
       exporters: [awskinesis]
 ```
 
@@ -749,6 +815,16 @@ service:
 With this layout every metric for a given `(host, region)` tuple lands on one
 shard in order, and any record that fails to decode on the consumer surfaces as
 a `kinesis.dead_letter` gauge instead of being silently dropped.
+
+> **Alternative: `groupbyattrs` + `tags`.** If your collector build includes
+> `groupbyattrs` and you want the tags promoted to the resource level (so a
+> downstream Prometheus remote-write sees them as `target_info` resource
+> attributes), run `groupbyattrs` before the exporter and use `tags` instead of
+> `keys`. The two approaches differ only in where the attribute lives on the
+> wire: `datapoint` sources leave it at the datapoint level; `groupbyattrs`
+> relocates it to the resource. The wire mutation from `groupbyattrs` can break
+> downstream label filters that expect a per-series label, so prefer the
+> `datapoint` source unless you specifically need the resource-level location.
 
 ## Behavior
 

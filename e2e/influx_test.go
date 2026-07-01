@@ -1,12 +1,18 @@
 //go:build e2e
 
 // This file drives the metrics E2E: a load generator emits InfluxDB line
-// protocol to a producer collector (influxdb -> groupbyattrs -> Kinesis),
+// protocol to a producer collector (influxdb -> awskinesis, no processors),
 // MiniStack emulates Kinesis/DynamoDB, and a consumer collector
-// (Kinesis -> file) writes OTLP-JSON metrics back out. The test asserts no
-// datapoint loss and tag locality: every datapoint of a given (host, region)
-// tuple is grouped under a resource carrying that exact tuple, proving the
-// groupbyattrs promotion + exporter tag_hash grouping worked end to end.
+// (Kinesis -> file) writes OTLP-JSON metrics back out.
+//
+// The test asserts:
+//   - no datapoint loss (count == total sent)
+//   - every datapoint carries instance as a datapoint attribute (groupbyattrs
+//     is gone, so tags must survive on the datapoint, not be hoisted to resource)
+//   - every datapoint carries a promoted "namespace" attribute whose value
+//     matches the ^([a-z]+)_ prefix of the metric name
+//   - the set of distinct instance values seen equals the count linegen reports
+//   - the set of distinct namespace values seen equals the count linegen reports
 package e2e
 
 import (
@@ -16,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,6 +37,9 @@ import (
 
 // attrMap aliases the pdata attribute map type returned by datapoint accessors.
 type attrMap = pcommon.Map
+
+// namespaceRe is compiled once and reused by regexNamespace.
+var namespaceRe = regexp.MustCompile(`^([a-z]+)_`)
 
 const (
 	metricsLeaseTable = "otel-leases-metrics"
@@ -91,14 +101,15 @@ func TestInfluxMetricsRoundTrip(t *testing.T) {
 	// shard count.
 	waitForMetricsOwnership(t)
 
-	// Run the load generator and parse its stdout contract for the expected
-	// total and the distinct (host, region) tuple count.
+	// Run the load generator and parse its stdout contract for the expected total,
+	// distinct instance count, and distinct namespace count.
 	out, err := composeInflux(t, env, 90*time.Second, "run", "--rm", "linegen")
 	if err != nil {
 		t.Fatalf("linegen: %v\n%s", err, out)
 	}
-	total, distinct := parseLinegen(t, out)
-	t.Logf("linegen sent %d measurements across %d distinct (host,region) tuples", total, distinct)
+	total, instances, namespaces := parseLinegen(t, out)
+	t.Logf("linegen sent %d measurements, %d distinct instances, %d distinct namespaces",
+		total, instances, namespaces)
 
 	// Poll the consumer output until the datapoint count reaches the emitted
 	// total (no loss), tolerating partial mid-write lines.
@@ -110,22 +121,21 @@ func TestInfluxMetricsRoundTrip(t *testing.T) {
 	// Settle: keep reading past first reaching the target so a late duplicate or
 	// straggler surfaces before asserting.
 	time.Sleep(metricsSettle)
-	count, perTuple, violations := readDatapoints(t, env, shared)
+	count, instanceSet, namespaceSet, violations := readDatapoints(t, env, shared)
 	if count != total {
 		t.Fatalf("after settle, datapoint count = %d, want %d", count, total)
 	}
-
-	// Tag locality: every resource block must carry a consistent (host, region)
-	// pair on its resource attributes (promoted by groupbyattrs). A datapoint
-	// whose own attributes disagree with its resource — or a resource missing
-	// the promoted keys — means the grouping did not hold.
 	if len(violations) > 0 {
-		t.Fatalf("tag locality violated for %d datapoint(s); sample: %s", len(violations), violations[0])
+		t.Fatalf("attribute violations for %d datapoint(s); sample: %s", len(violations), violations[0])
 	}
-	if len(perTuple) != distinct {
-		t.Fatalf("observed %d distinct (host,region) tuples, want %d", len(perTuple), distinct)
+	if len(instanceSet) != instances {
+		t.Fatalf("observed %d distinct instance values, want %d", len(instanceSet), instances)
 	}
-	t.Logf("metrics round-trip OK: %d datapoints, %d tuples, tag locality held", count, len(perTuple))
+	if len(namespaceSet) != namespaces {
+		t.Fatalf("observed %d distinct namespace values, want %d", len(namespaceSet), namespaces)
+	}
+	t.Logf("metrics round-trip OK: %d datapoints, %d instances, %d namespaces, no violations",
+		count, len(instanceSet), len(namespaceSet))
 }
 
 // waitForMetricsOwnership polls the metrics lease table until at least one shard
@@ -166,9 +176,12 @@ func scanOwnersTable(t *testing.T, client *dynamodb.Client, table string) (owner
 	return owners, owned, len(out.Items)
 }
 
-// parseLinegen reads linegen's stdout contract: lines "LINEGEN_SENT <n>" and
-// "LINEGEN_DISTINCT_TUPLES <n>".
-func parseLinegen(t *testing.T, out string) (total, distinct int) {
+// parseLinegen reads linegen's stdout contract:
+//
+//	LINEGEN_SENT <n>
+//	LINEGEN_DISTINCT_INSTANCES <n>
+//	LINEGEN_DISTINCT_NAMESPACES <n>
+func parseLinegen(t *testing.T, out string) (total, instances, namespaces int) {
 	t.Helper()
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))
@@ -178,14 +191,17 @@ func parseLinegen(t *testing.T, out string) (total, distinct int) {
 		switch fields[0] {
 		case "LINEGEN_SENT":
 			total = mustAtoi(t, fields[1])
-		case "LINEGEN_DISTINCT_TUPLES":
-			distinct = mustAtoi(t, fields[1])
+		case "LINEGEN_DISTINCT_INSTANCES":
+			instances = mustAtoi(t, fields[1])
+		case "LINEGEN_DISTINCT_NAMESPACES":
+			namespaces = mustAtoi(t, fields[1])
 		}
 	}
-	if total == 0 || distinct == 0 {
-		t.Fatalf("could not parse linegen output (total=%d distinct=%d):\n%s", total, distinct, out)
+	if total == 0 || instances == 0 || namespaces == 0 {
+		t.Fatalf("could not parse linegen output (total=%d instances=%d namespaces=%d):\n%s",
+			total, instances, namespaces, out)
 	}
-	return total, distinct
+	return total, instances, namespaces
 }
 
 func mustAtoi(t *testing.T, s string) int {
@@ -204,7 +220,7 @@ func waitForDatapoints(t *testing.T, env []string, shared string, want int) int 
 	deadline := time.Now().Add(metricsDeliver)
 	var count int
 	for time.Now().Before(deadline) {
-		count, _, _ = readDatapoints(t, env, shared)
+		count, _, _, _ = readDatapoints(t, env, shared)
 		if count >= want {
 			return count
 		}
@@ -215,17 +231,19 @@ func waitForDatapoints(t *testing.T, env []string, shared string, want int) int 
 }
 
 // readDatapoints copies the consumer output off the shared volume and parses
-// each OTLP-JSON line, returning the total datapoint count, a per-(host,region)
-// tally, and any tag-locality violation descriptions.
-func readDatapoints(t *testing.T, env []string, shared string) (count int, perTuple map[string]int, violations []string) {
+// each OTLP-JSON line, returning the total datapoint count, the set of distinct
+// instance values, the set of distinct promoted namespace values, and any
+// attribute violations found.
+func readDatapoints(t *testing.T, env []string, shared string) (count int, instanceSet, namespaceSet map[string]struct{}, violations []string) {
 	t.Helper()
 	copySharedFrom(t, env, "consumer-metrics", shared)
-	perTuple = map[string]int{}
+	instanceSet = map[string]struct{}{}
+	namespaceSet = map[string]struct{}{}
 
 	path := filepath.Join(shared, metricsOutFile)
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, perTuple, nil // not created yet
+		return 0, instanceSet, namespaceSet, nil // not created yet
 	}
 	defer f.Close()
 
@@ -243,53 +261,71 @@ func readDatapoints(t *testing.T, env []string, shared string) (count int, perTu
 			// final line; the caller re-polls until the count stabilizes, so skip.
 			continue
 		}
-		count += tallyDatapoints(md, perTuple, &violations)
+		count += tallyDatapoints(md, instanceSet, namespaceSet, &violations)
 	}
-	return count, perTuple, violations
+	return count, instanceSet, namespaceSet, violations
 }
 
-// tallyDatapoints walks every datapoint, keying by the resource's promoted
-// (host, region) attributes. It records a violation when a resource lacks the
-// promoted keys or when a datapoint's own host/region attributes disagree with
-// its resource — either means the groupbyattrs+exporter grouping did not hold.
-func tallyDatapoints(md pmetric.Metrics, perTuple map[string]int, violations *[]string) int {
+// tallyDatapoints walks every datapoint and asserts the attribute contract:
+//   - instance must be present as a datapoint attribute (groupbyattrs is gone,
+//     so the InfluxDB tag must survive on the datapoint, not be hoisted away)
+//   - namespace must be present as a promoted datapoint attribute
+//   - namespace must equal regexNamespace(m.Name()), proving the promotion
+//     derived from the actual received metric name (e.g. "http" from "http_requests_value")
+//
+// It collects the distinct instance and namespace values into the caller's sets.
+func tallyDatapoints(md pmetric.Metrics, instanceSet, namespaceSet map[string]struct{}, violations *[]string) int {
 	count := 0
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
 		rm := rms.At(i)
-		rattrs := rm.Resource().Attributes()
-		host, hasHost := rattrs.Get("host")
-		region, hasRegion := rattrs.Get("region")
-
 		sms := rm.ScopeMetrics()
 		for j := 0; j < sms.Len(); j++ {
 			metrics := sms.At(j).Metrics()
 			for k := 0; k < metrics.Len(); k++ {
 				m := metrics.At(k)
+				expectedNamespace := regexNamespace(m.Name())
 				for _, dpAttrs := range datapointAttrs(m) {
 					count++
-					if !hasHost || !hasRegion {
+
+					// instance must survive as a datapoint attribute.
+					if inst, ok := dpAttrs.Get("instance"); ok {
+						instanceSet[inst.AsString()] = struct{}{}
+					} else {
 						*violations = append(*violations,
-							fmt.Sprintf("resource missing promoted host/region (host=%v region=%v)", hasHost, hasRegion))
-						continue
+							fmt.Sprintf("metric %q datapoint missing instance attribute", m.Name()))
 					}
-					tuple := host.AsString() + "|" + region.AsString()
-					perTuple[tuple]++
-					// If host/region also remain on the datapoint, they must match
-					// the resource they were grouped under.
-					if dh, ok := dpAttrs.Get("host"); ok && dh.AsString() != host.AsString() {
+
+					// namespace must be promoted onto the datapoint and must match
+					// the regex-extracted prefix of the metric name.
+					if ns, ok := dpAttrs.Get("namespace"); ok {
+						namespaceSet[ns.AsString()] = struct{}{}
+						if expectedNamespace != "" && ns.AsString() != expectedNamespace {
+							*violations = append(*violations,
+								fmt.Sprintf("metric %q: promoted namespace %q != expected %q",
+									m.Name(), ns.AsString(), expectedNamespace))
+						}
+					} else {
 						*violations = append(*violations,
-							fmt.Sprintf("datapoint host %q under resource host %q", dh.AsString(), host.AsString()))
-					}
-					if dr, ok := dpAttrs.Get("region"); ok && dr.AsString() != region.AsString() {
-						*violations = append(*violations,
-							fmt.Sprintf("datapoint region %q under resource region %q", dr.AsString(), region.AsString()))
+							fmt.Sprintf("metric %q datapoint missing promoted namespace attribute", m.Name()))
 					}
 				}
 			}
 		}
 	}
 	return count
+}
+
+// regexNamespace applies the ^([a-z]+)_ pattern to name and returns the first
+// capture group (the namespace prefix), or "" if there is no match.
+// The InfluxDB receiver appends _value to metric names (e.g. "http_requests_value"),
+// so ^([a-z]+)_ still captures "http" correctly.
+func regexNamespace(name string) string {
+	m := namespaceRe.FindStringSubmatch(name)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
 }
 
 // datapointAttrs returns the per-datapoint attribute maps for a metric across

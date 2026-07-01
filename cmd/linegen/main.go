@@ -1,9 +1,17 @@
 // Command linegen is a tiny deterministic InfluxDB line-protocol load
 // generator for the metrics E2E. It cycles through a fixed (host, region,
-// service) tag space, POSTing batches of line-protocol measurements to an
-// InfluxDB v1 /write endpoint, then prints the total sent and the number of
-// distinct (host, region) tuples so the test can assert no loss and tag
-// locality. It depends on nothing outside the standard library.
+// instance) tag space, POSTing batches of line-protocol measurements to an
+// InfluxDB v1 /write endpoint. Measurement names each begin with a lowercase
+// namespace prefix separated by "_" (e.g. "http_requests", "system_cpu"),
+// so the exporter's ^([a-z]+)_ regex can extract a stable namespace label.
+//
+// Stdout contract (parsed by the E2E test):
+//
+//	LINEGEN_SENT               <total>
+//	LINEGEN_DISTINCT_INSTANCES <n>
+//	LINEGEN_DISTINCT_NAMESPACES <n>
+//
+// It depends on nothing outside the standard library.
 package main
 
 import (
@@ -15,6 +23,9 @@ import (
 	"strings"
 	"time"
 )
+
+// measurements cycles across two distinct namespaces (http, system).
+var measurements = []string{"http_requests", "http_latency", "system_cpu"}
 
 func main() {
 	if err := run(); err != nil {
@@ -28,19 +39,18 @@ func run() error {
 	total := envInt("TOTAL", 2000)
 	hosts := envInt("HOSTS", 8)
 	regions := envInt("REGIONS", 3)
-	services := envInt("SERVICES", 4)
+	instances := envInt("INSTANCES", 4)
 	batch := envInt("BATCH", 200)
-	if total <= 0 || hosts <= 0 || regions <= 0 || services <= 0 || batch <= 0 {
-		return fmt.Errorf("TOTAL/HOSTS/REGIONS/SERVICES/BATCH must all be positive")
+	if total <= 0 || hosts <= 0 || regions <= 0 || instances <= 0 || batch <= 0 {
+		return fmt.Errorf("TOTAL/HOSTS/REGIONS/INSTANCES/BATCH must all be positive")
 	}
 
 	writeURL := strings.TrimRight(endpoint, "/") + "/write"
 	regionNames := []string{"us-east", "us-west", "eu-west", "eu-central", "ap-south"}
 
-	// Distinct (host, region) tuples actually emitted: the tag space cycles
-	// deterministically, so after `total` measurements the reached set is the
-	// smaller of total and the full host*region grid.
-	distinct := map[[2]int]struct{}{}
+	// Track distinct instance indices and namespaces actually emitted.
+	distinctInstances := map[int]struct{}{}
+	distinctNamespaces := map[string]struct{}{}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	base := time.Now().UnixNano()
@@ -62,16 +72,22 @@ func run() error {
 	for i := 0; i < total; i++ {
 		h := i % hosts
 		r := (i / hosts) % regions
-		s := (i / (hosts * regions)) % services
-		distinct[[2]int{h, r}] = struct{}{}
+		d := i % instances
+		measurement := measurements[i%len(measurements)]
+
+		// Extract the namespace prefix (everything before the first "_").
+		namespace := namespaceOf(measurement)
+
+		distinctInstances[d] = struct{}{}
+		distinctNamespaces[namespace] = struct{}{}
 
 		region := regionNames[r%len(regionNames)]
 		// Spread timestamps by 1ms so points are distinct in time.
 		ts := base + int64(i)*int64(time.Millisecond)
 		value := float64(i%100) / 100.0
 
-		fmt.Fprintf(&buf, "system.cpu,host=h%d,region=%s,service=api%d value=%s %d\n",
-			h, region, s, strconv.FormatFloat(value, 'f', 2, 64), ts)
+		fmt.Fprintf(&buf, "%s,host=h%d,region=%s,instance=inst%d value=%s %d\n",
+			measurement, h, region, d, strconv.FormatFloat(value, 'f', 2, 64), ts)
 		inBatch++
 
 		if inBatch >= batch {
@@ -84,10 +100,20 @@ func run() error {
 		return err
 	}
 
-	// stdout contract consumed by the E2E: two prefixed lines it can parse.
+	// stdout contract consumed by the E2E: three prefixed lines it can parse.
 	fmt.Printf("LINEGEN_SENT %d\n", total)
-	fmt.Printf("LINEGEN_DISTINCT_TUPLES %d\n", len(distinct))
+	fmt.Printf("LINEGEN_DISTINCT_INSTANCES %d\n", len(distinctInstances))
+	fmt.Printf("LINEGEN_DISTINCT_NAMESPACES %d\n", len(distinctNamespaces))
 	return nil
+}
+
+// namespaceOf returns the portion of name before the first "_", which is the
+// namespace prefix by convention (e.g. "http" from "http_requests").
+func namespaceOf(name string) string {
+	if idx := strings.IndexByte(name, '_'); idx > 0 {
+		return name[:idx]
+	}
+	return name
 }
 
 func post(client *http.Client, url string, body []byte) error {

@@ -109,8 +109,13 @@ func newTestExporterCfg(t *testing.T, cfg *Config, inject func(*kinesis.Options)
 	if err != nil {
 		t.Fatalf("telemetry: %v", err)
 	}
+	plan, err := cfg.resolveKeyPlan()
+	if err != nil {
+		t.Fatalf("partition key plan: %v", err)
+	}
 	return &kinesisExporter{
 		cfg:        cfg,
+		keyPlan:    plan,
 		client:     client,
 		tracesEnc:  tEnc,
 		metricsEnc: mEnc,
