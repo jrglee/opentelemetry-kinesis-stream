@@ -43,6 +43,10 @@ type coordinator struct {
 	mu       sync.Mutex
 	active   map[string]*activePoller
 	observed map[string]observation
+	// stopped is set once drainAndStop begins, under mu, in the same critical
+	// section that snapshots active. startPoller checks it before installing so a
+	// poller acquired in the shutdown window cannot escape the drain snapshot.
+	stopped bool
 	// liveShards is the shard-id set from the most recent successful
 	// ListShards. nil until the first discovery succeeds. Used to garbage-
 	// collect leases for shards Kinesis has trimmed past retention.
@@ -92,6 +96,7 @@ func (c *coordinator) drainAndStop() {
 		c.stopDiscovery()
 	}
 	c.mu.Lock()
+	c.stopped = true
 	pollers := make([]*activePoller, 0, len(c.active))
 	for _, ap := range c.active {
 		pollers = append(pollers, ap)
@@ -391,6 +396,17 @@ func (c *coordinator) startPoller(_ context.Context, l lease.Lease) {
 	ap := &activePoller{cancel: cancel, drain: p.drain}
 
 	c.mu.Lock()
+	if c.stopped {
+		// Shutdown began (drainAndStop set stopped under this same lock) between
+		// our Acquire and this install, so drainAndStop's snapshot has already
+		// missed us. Do not start a poller that would never be drained: cancel the
+		// context and abandon the just-taken lease. It expires after lease_duration
+		// and a surviving replica (or this worker's next start) reclaims it from
+		// the last checkpoint — at-least-once, no stuck shard.
+		c.mu.Unlock()
+		cancel()
+		return
+	}
 	c.active[l.ShardID] = ap
 	c.mu.Unlock()
 	c.tel.addOwnedShards(c.baseCtx, 1)

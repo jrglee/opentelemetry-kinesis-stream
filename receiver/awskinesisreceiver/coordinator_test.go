@@ -198,3 +198,36 @@ func mustList(t *testing.T, s lease.Store) []lease.Lease {
 	}
 	return ls
 }
+
+// TestStartPollerAbortsAfterStop guards the shutdown TOCTOU: a poller acquired in
+// the shutdown window must not install itself after drainAndStop has already
+// snapshotted the active set, or it would poll on undrained and skip its graceful
+// final checkpoint/release. drainAndStop sets stopped under the same lock that
+// snapshots active, so startPoller reaching its install after that must abort.
+func TestStartPollerAbortsAfterStop(t *testing.T) {
+	ctx := context.Background()
+	c := &coordinator{
+		baseCtx: ctx,
+		store:   lease.NewMemoryStore(),
+		logger:  zaptest.NewLogger(t),
+		tel:     testTelemetry(t),
+		cfg:     &Config{LeaseDuration: time.Second},
+		active:  map[string]*activePoller{},
+	}
+
+	// Simulate drainAndStop having begun.
+	c.mu.Lock()
+	c.stopped = true
+	c.mu.Unlock()
+
+	c.startPoller(ctx, lease.Lease{ShardID: "s1"})
+
+	c.mu.Lock()
+	_, installed := c.active["s1"]
+	c.mu.Unlock()
+	if installed {
+		t.Fatal("startPoller installed a poller after stop; drainAndStop's drain would miss it")
+	}
+	// No poller goroutine should have started, so wait returns immediately.
+	c.wait()
+}

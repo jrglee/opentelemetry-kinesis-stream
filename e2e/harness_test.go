@@ -199,3 +199,16 @@ func keys(m map[string]int) []string {
 	}
 	return out
 }
+
+// atLeastOnceDupTolerance bounds the duplicate deliveries a multi-replica test
+// accepts. The receiver is at-least-once: a bootstrap steal during fair-share
+// rebalance re-delivers the stolen shard's in-flight window (records since its
+// last checkpoint), so a small overage is correct, not a bug. The bound stays
+// well under a whole shard's worth (~half the records here) so gross double
+// delivery — a shard delivered to two replicas for its whole life — still fails.
+func atLeastOnceDupTolerance(expected int) int {
+	if t := expected / 10; t > 5 {
+		return t
+	}
+	return 5
+}
