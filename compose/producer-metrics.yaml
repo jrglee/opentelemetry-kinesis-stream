@@ -2,13 +2,10 @@
 #
 # InfluxDB tags arrive as datapoint attributes (not resource attributes).
 # The exporter derives the partition key DIRECTLY from the datapoint:
-#   - device_id  — a datapoint attribute set by the linegen tag (the InfluxDB
-#                  receiver drops dotted tag keys, so this path uses device_id;
-#                  a real OTLP producer would use device.id — the exporter reads
-#                  whatever key the producer emits)
-#   - subsystem  — extracted from the metric name via ^([a-z]+)_ regex
-#                  and also PROMOTED onto each datapoint as attribute "subsystem"
-#                  (only when absent, so the payload is otherwise unchanged)
+#   - instance  — a datapoint attribute set by the linegen tag
+#   - namespace — extracted from the metric name via ^([a-z]+)_ regex
+#                 and also PROMOTED onto each datapoint as attribute "namespace"
+#                 (only when absent, so the payload is otherwise unchanged)
 #
 # This replaces the previous groupbyattrs processor. Tags stay on the datapoint;
 # no resource promotion occurs; the round-trip payload is unmodified.
@@ -27,8 +24,8 @@ exporters:
     partition_key:
       strategy: tag_hash
       keys:
-        - { source: datapoint, name: device_id }
-        - { source: metric_name, regex: "^([a-z]+)_", promote: subsystem }
+        - { source: datapoint, name: instance }
+        - { source: metric_name, regex: "^([a-z]+)_", promote: namespace }
       hash: xxhash
     oversize:
       policies: [split_half]

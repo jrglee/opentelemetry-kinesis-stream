@@ -7,12 +7,12 @@
 //
 // The test asserts:
 //   - no datapoint loss (count == total sent)
-//   - every datapoint carries device_id as a datapoint attribute (groupbyattrs
+//   - every datapoint carries instance as a datapoint attribute (groupbyattrs
 //     is gone, so tags must survive on the datapoint, not be hoisted to resource)
-//   - every datapoint carries a promoted "subsystem" attribute whose value
+//   - every datapoint carries a promoted "namespace" attribute whose value
 //     matches the ^([a-z]+)_ prefix of the metric name
-//   - the set of distinct device_id values seen equals the count linegen reports
-//   - the set of distinct subsystem values seen equals the count linegen reports
+//   - the set of distinct instance values seen equals the count linegen reports
+//   - the set of distinct namespace values seen equals the count linegen reports
 package e2e
 
 import (
@@ -38,8 +38,8 @@ import (
 // attrMap aliases the pdata attribute map type returned by datapoint accessors.
 type attrMap = pcommon.Map
 
-// subsystemRe is compiled once and reused by regexSubsystem.
-var subsystemRe = regexp.MustCompile(`^([a-z]+)_`)
+// namespaceRe is compiled once and reused by regexNamespace.
+var namespaceRe = regexp.MustCompile(`^([a-z]+)_`)
 
 const (
 	metricsLeaseTable = "otel-leases-metrics"
@@ -102,14 +102,14 @@ func TestInfluxMetricsRoundTrip(t *testing.T) {
 	waitForMetricsOwnership(t)
 
 	// Run the load generator and parse its stdout contract for the expected total,
-	// distinct device count, and distinct subsystem count.
+	// distinct instance count, and distinct namespace count.
 	out, err := composeInflux(t, env, 90*time.Second, "run", "--rm", "linegen")
 	if err != nil {
 		t.Fatalf("linegen: %v\n%s", err, out)
 	}
-	total, devices, subsystems := parseLinegen(t, out)
-	t.Logf("linegen sent %d measurements, %d distinct devices, %d distinct subsystems",
-		total, devices, subsystems)
+	total, instances, namespaces := parseLinegen(t, out)
+	t.Logf("linegen sent %d measurements, %d distinct instances, %d distinct namespaces",
+		total, instances, namespaces)
 
 	// Poll the consumer output until the datapoint count reaches the emitted
 	// total (no loss), tolerating partial mid-write lines.
@@ -121,21 +121,21 @@ func TestInfluxMetricsRoundTrip(t *testing.T) {
 	// Settle: keep reading past first reaching the target so a late duplicate or
 	// straggler surfaces before asserting.
 	time.Sleep(metricsSettle)
-	count, deviceSet, subsystemSet, violations := readDatapoints(t, env, shared)
+	count, instanceSet, namespaceSet, violations := readDatapoints(t, env, shared)
 	if count != total {
 		t.Fatalf("after settle, datapoint count = %d, want %d", count, total)
 	}
 	if len(violations) > 0 {
 		t.Fatalf("attribute violations for %d datapoint(s); sample: %s", len(violations), violations[0])
 	}
-	if len(deviceSet) != devices {
-		t.Fatalf("observed %d distinct device_id values, want %d", len(deviceSet), devices)
+	if len(instanceSet) != instances {
+		t.Fatalf("observed %d distinct instance values, want %d", len(instanceSet), instances)
 	}
-	if len(subsystemSet) != subsystems {
-		t.Fatalf("observed %d distinct subsystem values, want %d", len(subsystemSet), subsystems)
+	if len(namespaceSet) != namespaces {
+		t.Fatalf("observed %d distinct namespace values, want %d", len(namespaceSet), namespaces)
 	}
-	t.Logf("metrics round-trip OK: %d datapoints, %d devices, %d subsystems, no violations",
-		count, len(deviceSet), len(subsystemSet))
+	t.Logf("metrics round-trip OK: %d datapoints, %d instances, %d namespaces, no violations",
+		count, len(instanceSet), len(namespaceSet))
 }
 
 // waitForMetricsOwnership polls the metrics lease table until at least one shard
@@ -179,9 +179,9 @@ func scanOwnersTable(t *testing.T, client *dynamodb.Client, table string) (owner
 // parseLinegen reads linegen's stdout contract:
 //
 //	LINEGEN_SENT <n>
-//	LINEGEN_DISTINCT_DEVICES <n>
-//	LINEGEN_DISTINCT_SUBSYSTEMS <n>
-func parseLinegen(t *testing.T, out string) (total, devices, subsystems int) {
+//	LINEGEN_DISTINCT_INSTANCES <n>
+//	LINEGEN_DISTINCT_NAMESPACES <n>
+func parseLinegen(t *testing.T, out string) (total, instances, namespaces int) {
 	t.Helper()
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))
@@ -191,17 +191,17 @@ func parseLinegen(t *testing.T, out string) (total, devices, subsystems int) {
 		switch fields[0] {
 		case "LINEGEN_SENT":
 			total = mustAtoi(t, fields[1])
-		case "LINEGEN_DISTINCT_DEVICES":
-			devices = mustAtoi(t, fields[1])
-		case "LINEGEN_DISTINCT_SUBSYSTEMS":
-			subsystems = mustAtoi(t, fields[1])
+		case "LINEGEN_DISTINCT_INSTANCES":
+			instances = mustAtoi(t, fields[1])
+		case "LINEGEN_DISTINCT_NAMESPACES":
+			namespaces = mustAtoi(t, fields[1])
 		}
 	}
-	if total == 0 || devices == 0 || subsystems == 0 {
-		t.Fatalf("could not parse linegen output (total=%d devices=%d subsystems=%d):\n%s",
-			total, devices, subsystems, out)
+	if total == 0 || instances == 0 || namespaces == 0 {
+		t.Fatalf("could not parse linegen output (total=%d instances=%d namespaces=%d):\n%s",
+			total, instances, namespaces, out)
 	}
-	return total, devices, subsystems
+	return total, instances, namespaces
 }
 
 func mustAtoi(t *testing.T, s string) int {
@@ -232,18 +232,18 @@ func waitForDatapoints(t *testing.T, env []string, shared string, want int) int 
 
 // readDatapoints copies the consumer output off the shared volume and parses
 // each OTLP-JSON line, returning the total datapoint count, the set of distinct
-// device_id values, the set of distinct promoted subsystem values, and any
+// instance values, the set of distinct promoted namespace values, and any
 // attribute violations found.
-func readDatapoints(t *testing.T, env []string, shared string) (count int, deviceSet, subsystemSet map[string]struct{}, violations []string) {
+func readDatapoints(t *testing.T, env []string, shared string) (count int, instanceSet, namespaceSet map[string]struct{}, violations []string) {
 	t.Helper()
 	copySharedFrom(t, env, "consumer-metrics", shared)
-	deviceSet = map[string]struct{}{}
-	subsystemSet = map[string]struct{}{}
+	instanceSet = map[string]struct{}{}
+	namespaceSet = map[string]struct{}{}
 
 	path := filepath.Join(shared, metricsOutFile)
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, deviceSet, subsystemSet, nil // not created yet
+		return 0, instanceSet, namespaceSet, nil // not created yet
 	}
 	defer f.Close()
 
@@ -261,20 +261,20 @@ func readDatapoints(t *testing.T, env []string, shared string) (count int, devic
 			// final line; the caller re-polls until the count stabilizes, so skip.
 			continue
 		}
-		count += tallyDatapoints(md, deviceSet, subsystemSet, &violations)
+		count += tallyDatapoints(md, instanceSet, namespaceSet, &violations)
 	}
-	return count, deviceSet, subsystemSet, violations
+	return count, instanceSet, namespaceSet, violations
 }
 
-// tallyDatapoints walks every datapoint and asserts the new attribute contract:
-//   - device_id must be present as a datapoint attribute (groupbyattrs is gone,
+// tallyDatapoints walks every datapoint and asserts the attribute contract:
+//   - instance must be present as a datapoint attribute (groupbyattrs is gone,
 //     so the InfluxDB tag must survive on the datapoint, not be hoisted away)
-//   - subsystem must be present as a promoted datapoint attribute
-//   - subsystem must equal regexSubsystem(m.Name()), proving the promotion
-//     derived from the actual received metric name
+//   - namespace must be present as a promoted datapoint attribute
+//   - namespace must equal regexNamespace(m.Name()), proving the promotion
+//     derived from the actual received metric name (e.g. "http" from "http_requests_value")
 //
-// It collects the distinct device_id and subsystem values into the caller's sets.
-func tallyDatapoints(md pmetric.Metrics, deviceSet, subsystemSet map[string]struct{}, violations *[]string) int {
+// It collects the distinct instance and namespace values into the caller's sets.
+func tallyDatapoints(md pmetric.Metrics, instanceSet, namespaceSet map[string]struct{}, violations *[]string) int {
 	count := 0
 	rms := md.ResourceMetrics()
 	for i := 0; i < rms.Len(); i++ {
@@ -284,30 +284,30 @@ func tallyDatapoints(md pmetric.Metrics, deviceSet, subsystemSet map[string]stru
 			metrics := sms.At(j).Metrics()
 			for k := 0; k < metrics.Len(); k++ {
 				m := metrics.At(k)
-				expectedSubsystem := regexSubsystem(m.Name())
+				expectedNamespace := regexNamespace(m.Name())
 				for _, dpAttrs := range datapointAttrs(m) {
 					count++
 
-					// device_id must survive as a datapoint attribute.
-					if dev, ok := dpAttrs.Get("device_id"); ok {
-						deviceSet[dev.AsString()] = struct{}{}
+					// instance must survive as a datapoint attribute.
+					if inst, ok := dpAttrs.Get("instance"); ok {
+						instanceSet[inst.AsString()] = struct{}{}
 					} else {
 						*violations = append(*violations,
-							fmt.Sprintf("metric %q datapoint missing device_id attribute", m.Name()))
+							fmt.Sprintf("metric %q datapoint missing instance attribute", m.Name()))
 					}
 
-					// subsystem must be promoted onto the datapoint and must match
+					// namespace must be promoted onto the datapoint and must match
 					// the regex-extracted prefix of the metric name.
-					if sub, ok := dpAttrs.Get("subsystem"); ok {
-						subsystemSet[sub.AsString()] = struct{}{}
-						if expectedSubsystem != "" && sub.AsString() != expectedSubsystem {
+					if ns, ok := dpAttrs.Get("namespace"); ok {
+						namespaceSet[ns.AsString()] = struct{}{}
+						if expectedNamespace != "" && ns.AsString() != expectedNamespace {
 							*violations = append(*violations,
-								fmt.Sprintf("metric %q: promoted subsystem %q != expected %q",
-									m.Name(), sub.AsString(), expectedSubsystem))
+								fmt.Sprintf("metric %q: promoted namespace %q != expected %q",
+									m.Name(), ns.AsString(), expectedNamespace))
 						}
 					} else {
 						*violations = append(*violations,
-							fmt.Sprintf("metric %q datapoint missing promoted subsystem attribute", m.Name()))
+							fmt.Sprintf("metric %q datapoint missing promoted namespace attribute", m.Name()))
 					}
 				}
 			}
@@ -316,10 +316,12 @@ func tallyDatapoints(md pmetric.Metrics, deviceSet, subsystemSet map[string]stru
 	return count
 }
 
-// regexSubsystem applies the ^([a-z]+)_ pattern to name and returns the first
-// capture group (the subsystem prefix), or "" if there is no match.
-func regexSubsystem(name string) string {
-	m := subsystemRe.FindStringSubmatch(name)
+// regexNamespace applies the ^([a-z]+)_ pattern to name and returns the first
+// capture group (the namespace prefix), or "" if there is no match.
+// The InfluxDB receiver appends _value to metric names (e.g. "http_requests_value"),
+// so ^([a-z]+)_ still captures "http" correctly.
+func regexNamespace(name string) string {
+	m := namespaceRe.FindStringSubmatch(name)
 	if len(m) < 2 {
 		return ""
 	}

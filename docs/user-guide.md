@@ -484,8 +484,8 @@ group. A non-match contributes an empty segment (a deterministic catch-all
 bucket). A coarse-prefix regex on a metric name (`^([a-z]+)_`) turns the raw
 name into a bounded set of buckets.
 
-**Fan a high-volume producer across shards** by `device.id`, further
-grouped by metric-name subsystem:
+**Fan a high-volume service across shards** by `instance`, further grouped by
+metric-name namespace (e.g. `http_server_duration` → `http`):
 
 ```yaml
 exporters:
@@ -497,8 +497,8 @@ exporters:
     partition_key:
       strategy: tag_hash
       keys:
-        - { source: datapoint, name: device.id }
-        - { source: metric_name, regex: "^([a-z]+)_", promote: subsystem }
+        - { source: datapoint, name: instance }
+        - { source: metric_name, regex: "^([a-z]+)_", promote: namespace }
 ```
 
 The `tags` shorthand and the explicit `keys` form with `source: resource` are
@@ -527,7 +527,7 @@ label.
 **added**. When set, the resolved post-regex value is written under the given
 name at the source-native level (`resource` source → resource attribute;
 `datapoint`/`metric_name` → the record leaf), **only if that attribute is
-absent** — never overwrites. This lets a partition dimension (e.g. a subsystem
+absent** — never overwrites. This lets a partition dimension (e.g. a namespace
 derived from the metric name) also exist downstream as a real queryable label
 without relocating or destroying any existing data.
 

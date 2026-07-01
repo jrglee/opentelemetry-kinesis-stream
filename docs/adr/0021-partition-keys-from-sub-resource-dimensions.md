@@ -19,7 +19,7 @@ Real deployments hit two gaps:
   the same shard, preserving per-producer ordering.
 - A single dimension is too coarse for a producer that needs to fan across
   shards. A natural second dimension is a grouping derived from the **metric
-  name** (e.g. a subsystem prefix extracted by a regex). Traces and logs have no
+  name** (e.g. a namespace prefix extracted by a regex). Traces and logs have no
   metric name, so the field must contribute an empty segment for them rather than
   failing at config time.
 
@@ -59,7 +59,7 @@ contributes an empty segment. A single capture group is the deliberate ceiling
 resolved post-regex value is written as an attribute under the given name at the
 source-native level (`resource` → resource attribute; `datapoint`/`metric_name`
 → the record leaf), **only if that attribute is absent**. This lets a derived
-partition dimension (e.g. a subsystem extracted from the metric name) also exist
+partition dimension (e.g. a namespace extracted from the metric name) also exist
 downstream as a real queryable label without the relocate/destroy semantics of a
 transform processor.
 
@@ -89,6 +89,6 @@ configs are unaffected.
   therefore the same shard, in order. Tag→shard locality is not stable across a
   reshard, as before.
 - The metrics E2E now demonstrates sub-resource keys directly (using a
-  `datapoint` source for `device.id`), replacing the earlier `groupbyattrs`
+  `datapoint` source for `instance`), replacing the earlier `groupbyattrs`
   processor step. The `groupbyattrs` approach remains valid for builds that
   include the processor and need the resource-level attribute location.

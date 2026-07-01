@@ -1,15 +1,15 @@
 // Command linegen is a tiny deterministic InfluxDB line-protocol load
 // generator for the metrics E2E. It cycles through a fixed (host, region,
-// device_id) tag space, POSTing batches of line-protocol measurements to an
+// instance) tag space, POSTing batches of line-protocol measurements to an
 // InfluxDB v1 /write endpoint. Measurement names each begin with a lowercase
-// subsystem prefix separated by "_" (e.g. "charging_load", "network_rx"),
-// so the exporter's ^([a-z]+)_ regex can extract a stable subsystem label.
+// namespace prefix separated by "_" (e.g. "http_requests", "system_cpu"),
+// so the exporter's ^([a-z]+)_ regex can extract a stable namespace label.
 //
 // Stdout contract (parsed by the E2E test):
 //
-//	LINEGEN_SENT              <total>
-//	LINEGEN_DISTINCT_DEVICES  <n>
-//	LINEGEN_DISTINCT_SUBSYSTEMS <n>
+//	LINEGEN_SENT               <total>
+//	LINEGEN_DISTINCT_INSTANCES <n>
+//	LINEGEN_DISTINCT_NAMESPACES <n>
 //
 // It depends on nothing outside the standard library.
 package main
@@ -24,8 +24,8 @@ import (
 	"time"
 )
 
-// measurements cycles across two distinct subsystems (charging, network).
-var measurements = []string{"charging_load", "charging_temp", "network_rx"}
+// measurements cycles across two distinct namespaces (http, system).
+var measurements = []string{"http_requests", "http_latency", "system_cpu"}
 
 func main() {
 	if err := run(); err != nil {
@@ -39,18 +39,18 @@ func run() error {
 	total := envInt("TOTAL", 2000)
 	hosts := envInt("HOSTS", 8)
 	regions := envInt("REGIONS", 3)
-	devices := envInt("DEVICES", 4)
+	instances := envInt("INSTANCES", 4)
 	batch := envInt("BATCH", 200)
-	if total <= 0 || hosts <= 0 || regions <= 0 || devices <= 0 || batch <= 0 {
-		return fmt.Errorf("TOTAL/HOSTS/REGIONS/DEVICES/BATCH must all be positive")
+	if total <= 0 || hosts <= 0 || regions <= 0 || instances <= 0 || batch <= 0 {
+		return fmt.Errorf("TOTAL/HOSTS/REGIONS/INSTANCES/BATCH must all be positive")
 	}
 
 	writeURL := strings.TrimRight(endpoint, "/") + "/write"
 	regionNames := []string{"us-east", "us-west", "eu-west", "eu-central", "ap-south"}
 
-	// Track distinct device indices and subsystems actually emitted.
-	distinctDevices := map[int]struct{}{}
-	distinctSubsystems := map[string]struct{}{}
+	// Track distinct instance indices and namespaces actually emitted.
+	distinctInstances := map[int]struct{}{}
+	distinctNamespaces := map[string]struct{}{}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	base := time.Now().UnixNano()
@@ -72,25 +72,21 @@ func run() error {
 	for i := 0; i < total; i++ {
 		h := i % hosts
 		r := (i / hosts) % regions
-		d := i % devices
+		d := i % instances
 		measurement := measurements[i%len(measurements)]
 
-		// Extract the subsystem prefix (everything before the first "_").
-		subsystem := subsystemOf(measurement)
+		// Extract the namespace prefix (everything before the first "_").
+		namespace := namespaceOf(measurement)
 
-		distinctDevices[d] = struct{}{}
-		distinctSubsystems[subsystem] = struct{}{}
+		distinctInstances[d] = struct{}{}
+		distinctNamespaces[namespace] = struct{}{}
 
 		region := regionNames[r%len(regionNames)]
 		// Spread timestamps by 1ms so points are distinct in time.
 		ts := base + int64(i)*int64(time.Millisecond)
 		value := float64(i%100) / 100.0
 
-		// The InfluxDB receiver drops tag keys containing dots, so the per-producer
-		// key is device_id here. The exporter's datapoint source reads whatever
-		// attribute key the producer emits (a real OTLP producer would send
-		// device.id); only this ingestion path constrains the spelling.
-		fmt.Fprintf(&buf, "%s,host=h%d,region=%s,device_id=dev%d value=%s %d\n",
+		fmt.Fprintf(&buf, "%s,host=h%d,region=%s,instance=inst%d value=%s %d\n",
 			measurement, h, region, d, strconv.FormatFloat(value, 'f', 2, 64), ts)
 		inBatch++
 
@@ -106,14 +102,14 @@ func run() error {
 
 	// stdout contract consumed by the E2E: three prefixed lines it can parse.
 	fmt.Printf("LINEGEN_SENT %d\n", total)
-	fmt.Printf("LINEGEN_DISTINCT_DEVICES %d\n", len(distinctDevices))
-	fmt.Printf("LINEGEN_DISTINCT_SUBSYSTEMS %d\n", len(distinctSubsystems))
+	fmt.Printf("LINEGEN_DISTINCT_INSTANCES %d\n", len(distinctInstances))
+	fmt.Printf("LINEGEN_DISTINCT_NAMESPACES %d\n", len(distinctNamespaces))
 	return nil
 }
 
-// subsystemOf returns the portion of name before the first "_", which is the
-// subsystem prefix by convention (e.g. "charging" from "charging_load").
-func subsystemOf(name string) string {
+// namespaceOf returns the portion of name before the first "_", which is the
+// namespace prefix by convention (e.g. "http" from "http_requests").
+func namespaceOf(name string) string {
 	if idx := strings.IndexByte(name, '_'); idx > 0 {
 		return name[:idx]
 	}

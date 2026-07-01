@@ -139,27 +139,27 @@ func metricNamePromotePlan(promote string) keyPlan {
 
 // ---- TestGroupTracesByLeaf ----
 
-// TestTracesByLeafDatapointSource: one resource, N spans with mixed device.id
-// span attributes → N batches, each holding only its device's spans.
+// TestTracesByLeafDatapointSource: one resource, N spans with mixed instance
+// span attributes → N batches, each holding only its instance's spans.
 func TestTracesByLeafDatapointSource(t *testing.T) {
 	td := makeTraces(
 		map[string]string{"service.name": "svc"},
 		[]spanSpec{
-			{name: "s1", attrs: map[string]string{"device.id": "d1"}},
-			{name: "s2", attrs: map[string]string{"device.id": "d2"}},
-			{name: "s3", attrs: map[string]string{"device.id": "d1"}},
-			{name: "s4", attrs: map[string]string{"device.id": "d3"}},
+			{name: "s1", attrs: map[string]string{"instance": "i1"}},
+			{name: "s2", attrs: map[string]string{"instance": "i2"}},
+			{name: "s3", attrs: map[string]string{"instance": "i1"}},
+			{name: "s4", attrs: map[string]string{"instance": "i3"}},
 		},
 	)
-	plan := leafPlan("device.id")
+	plan := leafPlan("instance")
 	batches := groupTracesByLeaf(td, plan)
 
 	if len(batches) != 3 {
-		t.Fatalf("expected 3 batches (d1, d2, d3), got %d", len(batches))
+		t.Fatalf("expected 3 batches (i1, i2, i3), got %d", len(batches))
 	}
 
-	// First-seen order: d1, d2, d3.
-	wantKeys := []string{"d1", "d2", "d3"}
+	// First-seen order: i1, i2, i3.
+	wantKeys := []string{"i1", "i2", "i3"}
 	for i, want := range wantKeys {
 		if batches[i].key != want {
 			t.Errorf("batch[%d].key = %q, want %q", i, batches[i].key, want)
@@ -175,8 +175,8 @@ func TestTracesByLeafDatapointSource(t *testing.T) {
 		t.Fatalf("total spans: got %d want 4", total)
 	}
 
-	// d1 has 2 spans; d2 and d3 each have 1.
-	counts := map[string]int{"d1": 2, "d2": 1, "d3": 1}
+	// i1 has 2 spans; i2 and i3 each have 1.
+	counts := map[string]int{"i1": 2, "i2": 1, "i3": 1}
 	for _, b := range batches {
 		key := b.key
 		got := b.batch.SpanCount()
@@ -191,17 +191,17 @@ func TestTracesByLeafDatapointSource(t *testing.T) {
 func TestTracesByLeafResourceSourceViaLeafPath(t *testing.T) {
 	td := makeMultiScopeTraces(
 		map[string]string{"service.name": "web"},
-		spanSpec{name: "scope0-span", attrs: map[string]string{"device.id": "d1"}},
-		spanSpec{name: "scope1-span", attrs: map[string]string{"device.id": "d2"}},
+		spanSpec{name: "scope0-span", attrs: map[string]string{"instance": "i1"}},
+		spanSpec{name: "scope1-span", attrs: map[string]string{"instance": "i2"}},
 	)
-	plan := resourceAndLeafPlan("service.name", "device.id")
+	plan := resourceAndLeafPlan("service.name", "instance")
 	batches := groupTracesByLeaf(td, plan)
 
 	if len(batches) != 2 {
 		t.Fatalf("expected 2 batches, got %d", len(batches))
 	}
 
-	wantKeys := []string{"web\x1fd1", "web\x1fd2"}
+	wantKeys := []string{"web\x1fi1", "web\x1fi2"}
 	for i, want := range wantKeys {
 		if batches[i].key != want {
 			t.Errorf("batch[%d].key = %q, want %q", i, batches[i].key, want)
@@ -238,21 +238,21 @@ func TestTracesByLeafPromotion(t *testing.T) {
 		td := makeTraces(
 			map[string]string{"service.name": "svc"},
 			[]spanSpec{
-				{name: "span", attrs: map[string]string{"device.id": "d1"}},
+				{name: "span", attrs: map[string]string{"instance": "i1"}},
 			},
 		)
-		plan := leafPromotePlan("device.id", "promoted.device")
+		plan := leafPromotePlan("instance", "promoted.instance")
 		batches := groupTracesByLeaf(td, plan)
 		if len(batches) != 1 {
 			t.Fatalf("expected 1 batch, got %d", len(batches))
 		}
 		span := batches[0].batch.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
-		v, ok := span.Attributes().Get("promoted.device")
+		v, ok := span.Attributes().Get("promoted.instance")
 		if !ok {
-			t.Fatal("promoted.device attribute missing from span")
+			t.Fatal("promoted.instance attribute missing from span")
 		}
-		if v.AsString() != "d1" {
-			t.Errorf("promoted.device = %q, want %q", v.AsString(), "d1")
+		if v.AsString() != "i1" {
+			t.Errorf("promoted.instance = %q, want %q", v.AsString(), "i1")
 		}
 	})
 
@@ -260,15 +260,15 @@ func TestTracesByLeafPromotion(t *testing.T) {
 		td := makeTraces(
 			map[string]string{"service.name": "svc"},
 			[]spanSpec{
-				{name: "span", attrs: map[string]string{"device.id": "d1", "promoted.device": "existing"}},
+				{name: "span", attrs: map[string]string{"instance": "i1", "promoted.instance": "existing"}},
 			},
 		)
-		plan := leafPromotePlan("device.id", "promoted.device")
+		plan := leafPromotePlan("instance", "promoted.instance")
 		batches := groupTracesByLeaf(td, plan)
 		span := batches[0].batch.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
-		v, ok := span.Attributes().Get("promoted.device")
+		v, ok := span.Attributes().Get("promoted.instance")
 		if !ok {
-			t.Fatal("promoted.device attribute missing")
+			t.Fatal("promoted.instance attribute missing")
 		}
 		if v.AsString() != "existing" {
 			t.Errorf("absent-only violated: got %q, want %q (existing)", v.AsString(), "existing")
@@ -279,14 +279,14 @@ func TestTracesByLeafPromotion(t *testing.T) {
 		td := makeTraces(
 			map[string]string{"service.name": "svc"},
 			[]spanSpec{
-				{name: "span", attrs: map[string]string{}}, // no device.id
+				{name: "span", attrs: map[string]string{}}, // no instance
 			},
 		)
-		plan := leafPromotePlan("device.id", "promoted.device")
+		plan := leafPromotePlan("instance", "promoted.instance")
 		batches := groupTracesByLeaf(td, plan)
 		span := batches[0].batch.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
-		if _, ok := span.Attributes().Get("promoted.device"); ok {
-			t.Error("promoted.device should NOT be written when source is missing")
+		if _, ok := span.Attributes().Get("promoted.instance"); ok {
+			t.Error("promoted.instance should NOT be written when source is missing")
 		}
 	})
 
@@ -294,7 +294,7 @@ func TestTracesByLeafPromotion(t *testing.T) {
 		td := makeTraces(
 			map[string]string{"service.name": "svc"},
 			[]spanSpec{
-				{name: "span", attrs: map[string]string{"device.id": "d1"}},
+				{name: "span", attrs: map[string]string{"instance": "i1"}},
 			},
 		)
 		plan := keyPlan{
@@ -318,8 +318,8 @@ func TestTracesByLeafInputNotMutated(t *testing.T) {
 	td := makeTraces(
 		map[string]string{"service.name": "svc"},
 		[]spanSpec{
-			{name: "span1", attrs: map[string]string{"device.id": "d1"}},
-			{name: "span2", attrs: map[string]string{"device.id": "d2"}},
+			{name: "span1", attrs: map[string]string{"instance": "i1"}},
+			{name: "span2", attrs: map[string]string{"instance": "i2"}},
 		},
 	)
 	// Snapshot span count before.
@@ -327,7 +327,7 @@ func TestTracesByLeafInputNotMutated(t *testing.T) {
 	// Snapshot first span's attribute count.
 	beforeAttrs := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes().Len()
 
-	plan := leafPromotePlan("device.id", "promoted.device")
+	plan := leafPromotePlan("instance", "promoted.instance")
 	_ = groupTracesByLeaf(td, plan)
 
 	if td.SpanCount() != before {
@@ -345,10 +345,10 @@ func TestTracesByLeafMetricNameSourceInert(t *testing.T) {
 	td := makeTraces(
 		map[string]string{"service.name": "svc"},
 		[]spanSpec{
-			{name: "span", attrs: map[string]string{"device.id": "d1"}},
+			{name: "span", attrs: map[string]string{"instance": "i1"}},
 		},
 	)
-	plan := metricNamePromotePlan("subsystem")
+	plan := metricNamePromotePlan("namespace")
 	batches := groupTracesByLeaf(td, plan)
 
 	// One batch with empty key (metric_name resolves to "" for traces).
@@ -360,8 +360,8 @@ func TestTracesByLeafMetricNameSourceInert(t *testing.T) {
 	}
 	// Promote target must not be written (resolved to "").
 	span := batches[0].batch.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
-	if _, ok := span.Attributes().Get("subsystem"); ok {
-		t.Error("subsystem should NOT be promoted (source resolved to empty string)")
+	if _, ok := span.Attributes().Get("namespace"); ok {
+		t.Error("namespace should NOT be promoted (source resolved to empty string)")
 	}
 }
 
@@ -371,11 +371,11 @@ func TestTracesByLeafRoundTrip(t *testing.T) {
 	td := makeTraces(
 		map[string]string{"service.name": "svc"},
 		[]spanSpec{
-			{name: "span-a", attrs: map[string]string{"device.id": "d1"}},
-			{name: "span-b", attrs: map[string]string{"device.id": "d2"}},
+			{name: "span-a", attrs: map[string]string{"instance": "i1"}},
+			{name: "span-b", attrs: map[string]string{"instance": "i2"}},
 		},
 	)
-	plan := leafPlan("device.id")
+	plan := leafPlan("instance")
 	batches := groupTracesByLeaf(td, plan)
 	if len(batches) != 2 {
 		t.Fatalf("expected 2 batches, got %d", len(batches))
@@ -390,7 +390,7 @@ func TestTracesByLeafRoundTrip(t *testing.T) {
 		t.Fatalf("NewTracesDecoder: %v", err)
 	}
 
-	wantNames := map[string]string{"d1": "span-a", "d2": "span-b"}
+	wantNames := map[string]string{"i1": "span-a", "i2": "span-b"}
 	for _, b := range batches {
 		raw, err := enc.Marshal(b.batch)
 		if err != nil {
@@ -413,26 +413,26 @@ func TestTracesByLeafRoundTrip(t *testing.T) {
 // ---- TestGroupLogsByLeaf ----
 
 // TestLogsByLeafDatapointSource: one resource, N log records with mixed
-// device.id attributes → N batches, each holding only its device's records.
+// instance attributes → N batches, each holding only its instance's records.
 func TestLogsByLeafDatapointSource(t *testing.T) {
 	ld := makeLogs(
 		map[string]string{"service.name": "svc"},
 		[]logSpec{
-			{body: "r1", attrs: map[string]string{"device.id": "d1"}},
-			{body: "r2", attrs: map[string]string{"device.id": "d2"}},
-			{body: "r3", attrs: map[string]string{"device.id": "d1"}},
-			{body: "r4", attrs: map[string]string{"device.id": "d3"}},
+			{body: "r1", attrs: map[string]string{"instance": "i1"}},
+			{body: "r2", attrs: map[string]string{"instance": "i2"}},
+			{body: "r3", attrs: map[string]string{"instance": "i1"}},
+			{body: "r4", attrs: map[string]string{"instance": "i3"}},
 		},
 	)
-	plan := leafPlan("device.id")
+	plan := leafPlan("instance")
 	batches := groupLogsByLeaf(ld, plan)
 
 	if len(batches) != 3 {
 		t.Fatalf("expected 3 batches, got %d", len(batches))
 	}
 
-	// First-seen order: d1, d2, d3.
-	wantKeys := []string{"d1", "d2", "d3"}
+	// First-seen order: i1, i2, i3.
+	wantKeys := []string{"i1", "i2", "i3"}
 	for i, want := range wantKeys {
 		if batches[i].key != want {
 			t.Errorf("batch[%d].key = %q, want %q", i, batches[i].key, want)
@@ -447,7 +447,7 @@ func TestLogsByLeafDatapointSource(t *testing.T) {
 		t.Fatalf("total log records: got %d want 4", total)
 	}
 
-	counts := map[string]int{"d1": 2, "d2": 1, "d3": 1}
+	counts := map[string]int{"i1": 2, "i2": 1, "i3": 1}
 	for _, b := range batches {
 		got := b.batch.LogRecordCount()
 		if got != counts[b.key] {
@@ -460,17 +460,17 @@ func TestLogsByLeafDatapointSource(t *testing.T) {
 func TestLogsByLeafResourceSourceViaLeafPath(t *testing.T) {
 	ld := makeMultiScopeLogs(
 		map[string]string{"service.name": "web"},
-		logSpec{body: "scope0-log", attrs: map[string]string{"device.id": "d1"}},
-		logSpec{body: "scope1-log", attrs: map[string]string{"device.id": "d2"}},
+		logSpec{body: "scope0-log", attrs: map[string]string{"instance": "i1"}},
+		logSpec{body: "scope1-log", attrs: map[string]string{"instance": "i2"}},
 	)
-	plan := resourceAndLeafPlan("service.name", "device.id")
+	plan := resourceAndLeafPlan("service.name", "instance")
 	batches := groupLogsByLeaf(ld, plan)
 
 	if len(batches) != 2 {
 		t.Fatalf("expected 2 batches, got %d", len(batches))
 	}
 
-	wantKeys := []string{"web\x1fd1", "web\x1fd2"}
+	wantKeys := []string{"web\x1fi1", "web\x1fi2"}
 	for i, want := range wantKeys {
 		if batches[i].key != want {
 			t.Errorf("batch[%d].key = %q, want %q", i, batches[i].key, want)
@@ -498,18 +498,18 @@ func TestLogsByLeafPromotion(t *testing.T) {
 		ld := makeLogs(
 			map[string]string{"service.name": "svc"},
 			[]logSpec{
-				{body: "r", attrs: map[string]string{"device.id": "d1"}},
+				{body: "r", attrs: map[string]string{"instance": "i1"}},
 			},
 		)
-		plan := leafPromotePlan("device.id", "promoted.device")
+		plan := leafPromotePlan("instance", "promoted.instance")
 		batches := groupLogsByLeaf(ld, plan)
 		lr := batches[0].batch.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
-		v, ok := lr.Attributes().Get("promoted.device")
+		v, ok := lr.Attributes().Get("promoted.instance")
 		if !ok {
-			t.Fatal("promoted.device attribute missing from log record")
+			t.Fatal("promoted.instance attribute missing from log record")
 		}
-		if v.AsString() != "d1" {
-			t.Errorf("promoted.device = %q, want %q", v.AsString(), "d1")
+		if v.AsString() != "i1" {
+			t.Errorf("promoted.instance = %q, want %q", v.AsString(), "i1")
 		}
 	})
 
@@ -517,15 +517,15 @@ func TestLogsByLeafPromotion(t *testing.T) {
 		ld := makeLogs(
 			map[string]string{"service.name": "svc"},
 			[]logSpec{
-				{body: "r", attrs: map[string]string{"device.id": "d1", "promoted.device": "existing"}},
+				{body: "r", attrs: map[string]string{"instance": "i1", "promoted.instance": "existing"}},
 			},
 		)
-		plan := leafPromotePlan("device.id", "promoted.device")
+		plan := leafPromotePlan("instance", "promoted.instance")
 		batches := groupLogsByLeaf(ld, plan)
 		lr := batches[0].batch.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
-		v, ok := lr.Attributes().Get("promoted.device")
+		v, ok := lr.Attributes().Get("promoted.instance")
 		if !ok {
-			t.Fatal("promoted.device attribute missing")
+			t.Fatal("promoted.instance attribute missing")
 		}
 		if v.AsString() != "existing" {
 			t.Errorf("absent-only violated: got %q want %q", v.AsString(), "existing")
@@ -536,14 +536,14 @@ func TestLogsByLeafPromotion(t *testing.T) {
 		ld := makeLogs(
 			map[string]string{"service.name": "svc"},
 			[]logSpec{
-				{body: "r", attrs: map[string]string{}}, // no device.id
+				{body: "r", attrs: map[string]string{}}, // no instance
 			},
 		)
-		plan := leafPromotePlan("device.id", "promoted.device")
+		plan := leafPromotePlan("instance", "promoted.instance")
 		batches := groupLogsByLeaf(ld, plan)
 		lr := batches[0].batch.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
-		if _, ok := lr.Attributes().Get("promoted.device"); ok {
-			t.Error("promoted.device should NOT be written when source is missing")
+		if _, ok := lr.Attributes().Get("promoted.instance"); ok {
+			t.Error("promoted.instance should NOT be written when source is missing")
 		}
 	})
 
@@ -551,7 +551,7 @@ func TestLogsByLeafPromotion(t *testing.T) {
 		ld := makeLogs(
 			map[string]string{"service.name": "svc"},
 			[]logSpec{
-				{body: "r", attrs: map[string]string{"device.id": "d1"}},
+				{body: "r", attrs: map[string]string{"instance": "i1"}},
 			},
 		)
 		plan := resourcePromotePlan("service.name", "promoted.svc")
@@ -572,14 +572,14 @@ func TestLogsByLeafInputNotMutated(t *testing.T) {
 	ld := makeLogs(
 		map[string]string{"service.name": "svc"},
 		[]logSpec{
-			{body: "r1", attrs: map[string]string{"device.id": "d1"}},
-			{body: "r2", attrs: map[string]string{"device.id": "d2"}},
+			{body: "r1", attrs: map[string]string{"instance": "i1"}},
+			{body: "r2", attrs: map[string]string{"instance": "i2"}},
 		},
 	)
 	before := ld.LogRecordCount()
 	beforeAttrs := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Attributes().Len()
 
-	plan := leafPromotePlan("device.id", "promoted.device")
+	plan := leafPromotePlan("instance", "promoted.instance")
 	_ = groupLogsByLeaf(ld, plan)
 
 	if ld.LogRecordCount() != before {
@@ -596,10 +596,10 @@ func TestLogsByLeafMetricNameSourceInert(t *testing.T) {
 	ld := makeLogs(
 		map[string]string{"service.name": "svc"},
 		[]logSpec{
-			{body: "r", attrs: map[string]string{"device.id": "d1"}},
+			{body: "r", attrs: map[string]string{"instance": "i1"}},
 		},
 	)
-	plan := metricNamePromotePlan("subsystem")
+	plan := metricNamePromotePlan("namespace")
 	batches := groupLogsByLeaf(ld, plan)
 
 	if len(batches) != 1 {
@@ -609,8 +609,8 @@ func TestLogsByLeafMetricNameSourceInert(t *testing.T) {
 		t.Errorf("key = %q, want empty (metric_name is inert for logs)", batches[0].key)
 	}
 	lr := batches[0].batch.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
-	if _, ok := lr.Attributes().Get("subsystem"); ok {
-		t.Error("subsystem should NOT be promoted (source resolved to empty string)")
+	if _, ok := lr.Attributes().Get("namespace"); ok {
+		t.Error("namespace should NOT be promoted (source resolved to empty string)")
 	}
 }
 
@@ -619,11 +619,11 @@ func TestLogsByLeafRoundTrip(t *testing.T) {
 	ld := makeLogs(
 		map[string]string{"service.name": "svc"},
 		[]logSpec{
-			{body: "log-a", attrs: map[string]string{"device.id": "d1"}},
-			{body: "log-b", attrs: map[string]string{"device.id": "d2"}},
+			{body: "log-a", attrs: map[string]string{"instance": "i1"}},
+			{body: "log-b", attrs: map[string]string{"instance": "i2"}},
 		},
 	)
-	plan := leafPlan("device.id")
+	plan := leafPlan("instance")
 	batches := groupLogsByLeaf(ld, plan)
 	if len(batches) != 2 {
 		t.Fatalf("expected 2 batches, got %d", len(batches))
@@ -638,7 +638,7 @@ func TestLogsByLeafRoundTrip(t *testing.T) {
 		t.Fatalf("NewLogsDecoder: %v", err)
 	}
 
-	wantBodies := map[string]string{"d1": "log-a", "d2": "log-b"}
+	wantBodies := map[string]string{"i1": "log-a", "i2": "log-b"}
 	for _, b := range batches {
 		raw, err := enc.Marshal(b.batch)
 		if err != nil {
@@ -663,10 +663,10 @@ func TestLogsByLeafRoundTrip(t *testing.T) {
 func TestTracesByLeafScopeIdentityPreserved(t *testing.T) {
 	td := makeMultiScopeTraces(
 		map[string]string{"service.name": "web"},
-		spanSpec{name: "s0", attrs: map[string]string{"device.id": "d1"}},
-		spanSpec{name: "s1", attrs: map[string]string{"device.id": "d2"}},
+		spanSpec{name: "s0", attrs: map[string]string{"instance": "i1"}},
+		spanSpec{name: "s1", attrs: map[string]string{"instance": "i2"}},
 	)
-	plan := leafPlan("device.id")
+	plan := leafPlan("instance")
 	batches := groupTracesByLeaf(td, plan)
 
 	for _, b := range batches {
@@ -677,19 +677,19 @@ func TestTracesByLeafScopeIdentityPreserved(t *testing.T) {
 		}
 		ss := rs.ScopeSpans().At(0)
 		switch b.key {
-		case "d1":
+		case "i1":
 			if ss.Scope().Name() != "scope-0" {
-				t.Errorf("batch d1: scope name %q want scope-0", ss.Scope().Name())
+				t.Errorf("batch i1: scope name %q want scope-0", ss.Scope().Name())
 			}
 			if ss.SchemaUrl() != "https://schema/0" {
-				t.Errorf("batch d1: schema URL %q want https://schema/0", ss.SchemaUrl())
+				t.Errorf("batch i1: schema URL %q want https://schema/0", ss.SchemaUrl())
 			}
-		case "d2":
+		case "i2":
 			if ss.Scope().Name() != "scope-1" {
-				t.Errorf("batch d2: scope name %q want scope-1", ss.Scope().Name())
+				t.Errorf("batch i2: scope name %q want scope-1", ss.Scope().Name())
 			}
 			if ss.SchemaUrl() != "https://schema/1" {
-				t.Errorf("batch d2: schema URL %q want https://schema/1", ss.SchemaUrl())
+				t.Errorf("batch i2: schema URL %q want https://schema/1", ss.SchemaUrl())
 			}
 		}
 	}
@@ -699,10 +699,10 @@ func TestTracesByLeafScopeIdentityPreserved(t *testing.T) {
 func TestLogsByLeafScopeIdentityPreserved(t *testing.T) {
 	ld := makeMultiScopeLogs(
 		map[string]string{"service.name": "web"},
-		logSpec{body: "l0", attrs: map[string]string{"device.id": "d1"}},
-		logSpec{body: "l1", attrs: map[string]string{"device.id": "d2"}},
+		logSpec{body: "l0", attrs: map[string]string{"instance": "i1"}},
+		logSpec{body: "l1", attrs: map[string]string{"instance": "i2"}},
 	)
-	plan := leafPlan("device.id")
+	plan := leafPlan("instance")
 	batches := groupLogsByLeaf(ld, plan)
 
 	for _, b := range batches {
@@ -713,34 +713,34 @@ func TestLogsByLeafScopeIdentityPreserved(t *testing.T) {
 		}
 		sl := rl.ScopeLogs().At(0)
 		switch b.key {
-		case "d1":
+		case "i1":
 			if sl.Scope().Name() != "scope-0" {
-				t.Errorf("batch d1: scope name %q want scope-0", sl.Scope().Name())
+				t.Errorf("batch i1: scope name %q want scope-0", sl.Scope().Name())
 			}
 			if sl.SchemaUrl() != "https://schema/0" {
-				t.Errorf("batch d1: schema URL %q want https://schema/0", sl.SchemaUrl())
+				t.Errorf("batch i1: schema URL %q want https://schema/0", sl.SchemaUrl())
 			}
-		case "d2":
+		case "i2":
 			if sl.Scope().Name() != "scope-1" {
-				t.Errorf("batch d2: scope name %q want scope-1", sl.Scope().Name())
+				t.Errorf("batch i2: scope name %q want scope-1", sl.Scope().Name())
 			}
 			if sl.SchemaUrl() != "https://schema/1" {
-				t.Errorf("batch d2: schema URL %q want https://schema/1", sl.SchemaUrl())
+				t.Errorf("batch i2: schema URL %q want https://schema/1", sl.SchemaUrl())
 			}
 		}
 	}
 }
 
-// TestTracesByLeafStableKeysPerDevice verifies key stability for repeat calls
-// (same device → same key string each time).
-func TestTracesByLeafStableKeysPerDevice(t *testing.T) {
+// TestTracesByLeafStableKeysPerInstance verifies key stability for repeat calls
+// (same instance → same key string each time).
+func TestTracesByLeafStableKeysPerInstance(t *testing.T) {
 	td := makeTraces(
 		map[string]string{"service.name": "svc"},
 		[]spanSpec{
-			{name: "s", attrs: map[string]string{"device.id": "d1"}},
+			{name: "s", attrs: map[string]string{"instance": "i1"}},
 		},
 	)
-	plan := leafPlan("device.id")
+	plan := leafPlan("instance")
 	b1 := groupTracesByLeaf(td, plan)
 	b2 := groupTracesByLeaf(td, plan)
 

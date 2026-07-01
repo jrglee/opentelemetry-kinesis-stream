@@ -13,8 +13,8 @@ import (
 // TestKeysBasedPlanWiredThroughConsumeMetrics exercises the full
 // resolveKeyPlan → newExporter → emit → groupByTags → leaf path, proving
 // that a Keys-based (non-Tags) tag_hash config fans out datapoints by
-// device.id, applies a regex-derived promoted attribute (subsystem), and
-// produces stable per-device partition keys.
+// instance, applies a regex-derived promoted attribute (namespace), and
+// produces stable per-instance partition keys.
 func TestKeysBasedPlanWiredThroughConsumeMetrics(t *testing.T) {
 	cfg := &Config{
 		StreamName:    "test-stream",
@@ -26,8 +26,8 @@ func TestKeysBasedPlanWiredThroughConsumeMetrics(t *testing.T) {
 			Strategy: partitionStrategyTagHash,
 			Hash:     hashXXHash,
 			Keys: []PartitionKeySource{
-				{Source: keySourceDatapoint, Name: "device.id"},
-				{Source: keySourceMetricName, Regex: "^([a-z]+)_", Promote: "subsystem"},
+				{Source: keySourceDatapoint, Name: "instance"},
+				{Source: keySourceMetricName, Regex: "^([a-z]+)_", Promote: "namespace"},
 			},
 		},
 		Oversize: OversizeConfig{Policies: []string{oversizeSplitHalf}, MaxAttempts: 8, MaxAttributeValueBytes: 4096},
@@ -36,35 +36,35 @@ func TestKeysBasedPlanWiredThroughConsumeMetrics(t *testing.T) {
 	capt := &capture{}
 	exp := newTestExporterCfg(t, cfg, capt.injectSerialize())
 
-	// One ResourceMetrics, one metric named "charging_state", three datapoints:
-	// two for device d1 and one for device d2.
+	// One ResourceMetrics, one metric named "http_requests", three datapoints:
+	// two for instance i1 and one for instance i2.
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
 	sm := rm.ScopeMetrics().AppendEmpty()
 	m := sm.Metrics().AppendEmpty()
-	m.SetName("charging_state")
+	m.SetName("http_requests")
 	g := m.SetEmptyGauge()
 
-	d1a := g.DataPoints().AppendEmpty()
-	d1a.Attributes().PutStr("device.id", "d1")
-	d1a.SetIntValue(10)
+	i1a := g.DataPoints().AppendEmpty()
+	i1a.Attributes().PutStr("instance", "i1")
+	i1a.SetIntValue(10)
 
-	d1b := g.DataPoints().AppendEmpty()
-	d1b.Attributes().PutStr("device.id", "d1")
-	d1b.SetIntValue(11)
+	i1b := g.DataPoints().AppendEmpty()
+	i1b.Attributes().PutStr("instance", "i1")
+	i1b.SetIntValue(11)
 
-	d2 := g.DataPoints().AppendEmpty()
-	d2.Attributes().PutStr("device.id", "d2")
-	d2.SetIntValue(20)
+	i2 := g.DataPoints().AppendEmpty()
+	i2.Attributes().PutStr("instance", "i2")
+	i2.SetIntValue(20)
 
 	if err := exp.ConsumeMetrics(context.Background(), md); err != nil {
 		t.Fatalf("ConsumeMetrics: %v", err)
 	}
 
 	recs := capt.all()
-	// Expect exactly two records: one per distinct device.id.
+	// Expect exactly two records: one per distinct instance.
 	if len(recs) != 2 {
-		t.Fatalf("records: got %d want 2 (one per device)", len(recs))
+		t.Fatalf("records: got %d want 2 (one per instance)", len(recs))
 	}
 
 	dec, err := encoding.NewMetricsDecoder(encoding.EncodingOTLPProto)
@@ -73,7 +73,7 @@ func TestKeysBasedPlanWiredThroughConsumeMetrics(t *testing.T) {
 	}
 
 	totalDP := 0
-	keyByDevice := map[string]string{} // device.id → partition key
+	keyByInstance := map[string]string{} // instance → partition key
 	for _, r := range recs {
 		decoded, err := dec.Unmarshal(r.Data)
 		if err != nil {
@@ -93,29 +93,29 @@ func TestKeysBasedPlanWiredThroughConsumeMetrics(t *testing.T) {
 						dp := dps.At(l)
 						totalDP++
 
-						devID, ok := dp.Attributes().Get("device.id")
+						instID, ok := dp.Attributes().Get("instance")
 						if !ok {
-							t.Fatalf("datapoint missing device.id")
+							t.Fatalf("datapoint missing instance")
 						}
-						dev := devID.AsString()
+						inst := instID.AsString()
 
-						// All datapoints in one record must share the same device.id.
+						// All datapoints in one record must share the same instance.
 						pkey := aws.ToString(r.PartitionKey)
-						if prev, seen := keyByDevice[dev]; seen {
+						if prev, seen := keyByInstance[inst]; seen {
 							if prev != pkey {
-								t.Fatalf("unstable partition key for device %s: %s vs %s", dev, prev, pkey)
+								t.Fatalf("unstable partition key for instance %s: %s vs %s", inst, prev, pkey)
 							}
 						} else {
-							keyByDevice[dev] = pkey
+							keyByInstance[inst] = pkey
 						}
 
-						// Promoted attribute: subsystem="charging" (from "^([a-z]+)_" on "charging_state").
-						subsys, ok := dp.Attributes().Get("subsystem")
+						// Promoted attribute: namespace="http" (from "^([a-z]+)_" on "http_requests").
+						ns, ok := dp.Attributes().Get("namespace")
 						if !ok {
-							t.Fatalf("promoted attribute 'subsystem' missing on datapoint for device %s", dev)
+							t.Fatalf("promoted attribute 'namespace' missing on datapoint for instance %s", inst)
 						}
-						if subsys.AsString() != "charging" {
-							t.Fatalf("subsystem: got %q want %q", subsys.AsString(), "charging")
+						if ns.AsString() != "http" {
+							t.Fatalf("namespace: got %q want %q", ns.AsString(), "http")
 						}
 					}
 				}
@@ -128,12 +128,12 @@ func TestKeysBasedPlanWiredThroughConsumeMetrics(t *testing.T) {
 		t.Fatalf("total datapoints: got %d want 3", totalDP)
 	}
 
-	// The two devices must have produced distinct partition keys.
-	if len(keyByDevice) != 2 {
-		t.Fatalf("distinct device keys: got %d want 2", len(keyByDevice))
+	// The two instances must have produced distinct partition keys.
+	if len(keyByInstance) != 2 {
+		t.Fatalf("distinct instance keys: got %d want 2", len(keyByInstance))
 	}
-	if keyByDevice["d1"] == keyByDevice["d2"] {
-		t.Fatalf("d1 and d2 have the same partition key %s — expected distinct keys", keyByDevice["d1"])
+	if keyByInstance["i1"] == keyByInstance["i2"] {
+		t.Fatalf("i1 and i2 have the same partition key %s — expected distinct keys", keyByInstance["i1"])
 	}
 }
 

@@ -10,10 +10,10 @@ import (
 
 // --- builders ---
 
-// gaugeMetricsWithDeviceIDs builds one ResourceMetrics with one Gauge metric
-// named metricName. Each deviceID gets one datapoint with an int value equal
+// gaugeMetricsWithInstanceIDs builds one ResourceMetrics with one Gauge metric
+// named metricName. Each instanceID gets one datapoint with an int value equal
 // to its position in the slice (0-indexed).
-func gaugeMetricsWithDeviceIDs(svcName, metricName string, deviceIDs []string) pmetric.Metrics {
+func gaugeMetricsWithInstanceIDs(svcName, metricName string, instanceIDs []string) pmetric.Metrics {
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
 	rm.Resource().Attributes().PutStr("service.name", svcName)
@@ -21,9 +21,9 @@ func gaugeMetricsWithDeviceIDs(svcName, metricName string, deviceIDs []string) p
 	m := sm.Metrics().AppendEmpty()
 	m.SetName(metricName)
 	g := m.SetEmptyGauge()
-	for i, did := range deviceIDs {
+	for i, iid := range instanceIDs {
 		dp := g.DataPoints().AppendEmpty()
-		dp.Attributes().PutStr("device.id", did)
+		dp.Attributes().PutStr("instance", iid)
 		dp.SetIntValue(int64(i))
 	}
 	return md
@@ -70,53 +70,53 @@ func totalDataPoints(md pmetric.Metrics) int {
 // --- test 1: datapoint source grouping ---
 
 func TestGroupMetricsByLeaf_DatapointSource(t *testing.T) {
-	// d1 appears twice, d2 once, d3 once → 3 batches
-	deviceIDs := []string{"d1", "d1", "d2", "d3"}
-	md := gaugeMetricsWithDeviceIDs("svc", "cpu.usage", deviceIDs)
+	// i1 appears twice, i2 once, i3 once → 3 batches
+	instanceIDs := []string{"i1", "i1", "i2", "i3"}
+	md := gaugeMetricsWithInstanceIDs("svc", "cpu.usage", instanceIDs)
 
 	plan := resolveTestPlan(t, []PartitionKeySource{
-		{Source: keySourceDatapoint, Name: "device.id"},
+		{Source: keySourceDatapoint, Name: "instance"},
 	})
 
 	batches := groupMetricsByLeaf(md, plan)
 
 	if len(batches) != 3 {
-		t.Fatalf("expected 3 batches (d1,d2,d3), got %d", len(batches))
+		t.Fatalf("expected 3 batches (i1,i2,i3), got %d", len(batches))
 	}
 
-	// Collect by device.id
-	batchByDevice := map[string]pmetric.Metrics{}
+	// Collect by instance
+	batchByInstance := map[string]pmetric.Metrics{}
 	for _, b := range batches {
 		// Each batch has one ResourceMetrics, one ScopeMetrics, one Metric.
 		rm := b.batch.ResourceMetrics().At(0)
 		m := rm.ScopeMetrics().At(0).Metrics().At(0)
 		dps := m.Gauge().DataPoints()
-		// All datapoints in this batch should share the same device.id
+		// All datapoints in this batch should share the same instance
 		if dps.Len() == 0 {
 			t.Fatalf("batch key=%q has no datapoints", b.key)
 		}
-		did, _ := dps.At(0).Attributes().Get("device.id")
-		batchByDevice[did.AsString()] = b.batch
+		iid, _ := dps.At(0).Attributes().Get("instance")
+		batchByInstance[iid.AsString()] = b.batch
 	}
 
-	// d1 should have 2 datapoints
-	if b, ok := batchByDevice["d1"]; !ok {
-		t.Fatal("no batch for d1")
+	// i1 should have 2 datapoints
+	if b, ok := batchByInstance["i1"]; !ok {
+		t.Fatal("no batch for i1")
 	} else {
 		m := b.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
 		if m.Gauge().DataPoints().Len() != 2 {
-			t.Errorf("d1: expected 2 datapoints, got %d", m.Gauge().DataPoints().Len())
+			t.Errorf("i1: expected 2 datapoints, got %d", m.Gauge().DataPoints().Len())
 		}
 	}
 
-	// d2 and d3 should each have 1 datapoint
-	for _, dev := range []string{"d2", "d3"} {
-		if b, ok := batchByDevice[dev]; !ok {
-			t.Fatalf("no batch for %s", dev)
+	// i2 and i3 should each have 1 datapoint
+	for _, inst := range []string{"i2", "i3"} {
+		if b, ok := batchByInstance[inst]; !ok {
+			t.Fatalf("no batch for %s", inst)
 		} else {
 			m := b.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
 			if m.Gauge().DataPoints().Len() != 1 {
-				t.Errorf("%s: expected 1 datapoint, got %d", dev, m.Gauge().DataPoints().Len())
+				t.Errorf("%s: expected 1 datapoint, got %d", inst, m.Gauge().DataPoints().Len())
 			}
 		}
 	}
@@ -126,26 +126,26 @@ func TestGroupMetricsByLeaf_DatapointSource(t *testing.T) {
 	for _, b := range batches {
 		total += totalDataPoints(b.batch)
 	}
-	if total != len(deviceIDs) {
-		t.Errorf("total datapoints across batches: got %d want %d", total, len(deviceIDs))
+	if total != len(instanceIDs) {
+		t.Errorf("total datapoints across batches: got %d want %d", total, len(instanceIDs))
 	}
 
-	// Keys stable: same device.id → same joined key across two groupings
+	// Keys stable: same instance → same joined key across two groupings
 	batches2 := groupMetricsByLeaf(md, plan)
-	keyByDevice := map[string]string{}
+	keyByInstance := map[string]string{}
 	for _, b := range batches {
 		rm := b.batch.ResourceMetrics().At(0)
 		m := rm.ScopeMetrics().At(0).Metrics().At(0)
-		did, _ := m.Gauge().DataPoints().At(0).Attributes().Get("device.id")
-		keyByDevice[did.AsString()] = b.key
+		iid, _ := m.Gauge().DataPoints().At(0).Attributes().Get("instance")
+		keyByInstance[iid.AsString()] = b.key
 	}
 	for _, b := range batches2 {
 		rm := b.batch.ResourceMetrics().At(0)
 		m := rm.ScopeMetrics().At(0).Metrics().At(0)
-		did, _ := m.Gauge().DataPoints().At(0).Attributes().Get("device.id")
-		if keyByDevice[did.AsString()] != b.key {
-			t.Errorf("key for device %s changed between runs: %q vs %q",
-				did.AsString(), keyByDevice[did.AsString()], b.key)
+		iid, _ := m.Gauge().DataPoints().At(0).Attributes().Get("instance")
+		if keyByInstance[iid.AsString()] != b.key {
+			t.Errorf("key for instance %s changed between runs: %q vs %q",
+				iid.AsString(), keyByInstance[iid.AsString()], b.key)
 		}
 	}
 }
@@ -226,14 +226,14 @@ func TestGroupMetricsByLeaf_MixedOrderedPlan(t *testing.T) {
 	rm.Resource().Attributes().PutStr("service.name", "my-svc")
 	sm := rm.ScopeMetrics().AppendEmpty()
 	m := sm.Metrics().AppendEmpty()
-	m.SetName("charging_state")
+	m.SetName("http_requests")
 	dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
-	dp.Attributes().PutStr("device.id", "dev-42")
+	dp.Attributes().PutStr("instance", "inst-42")
 	dp.SetIntValue(1)
 
 	plan := resolveTestPlan(t, []PartitionKeySource{
 		{Source: keySourceResource, Name: "service.name"},
-		{Source: keySourceDatapoint, Name: "device.id"},
+		{Source: keySourceDatapoint, Name: "instance"},
 		{Source: keySourceMetricName, Regex: `^([a-z]+)_`},
 	})
 
@@ -251,11 +251,11 @@ func TestGroupMetricsByLeaf_MixedOrderedPlan(t *testing.T) {
 	if parts[0] != "my-svc" {
 		t.Errorf("segment[0] (service.name): got %q want %q", parts[0], "my-svc")
 	}
-	if parts[1] != "dev-42" {
-		t.Errorf("segment[1] (device.id): got %q want %q", parts[1], "dev-42")
+	if parts[1] != "inst-42" {
+		t.Errorf("segment[1] (instance): got %q want %q", parts[1], "inst-42")
 	}
-	if parts[2] != "charging" {
-		t.Errorf("segment[2] (metric_name regex): got %q want %q", parts[2], "charging")
+	if parts[2] != "http" {
+		t.Errorf("segment[2] (metric_name regex): got %q want %q", parts[2], "http")
 	}
 }
 
@@ -277,7 +277,7 @@ func TestGroupMetricsByLeaf_MetricShellFidelity(t *testing.T) {
 	s.SetIsMonotonic(true)
 	s.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 	dp := s.DataPoints().AppendEmpty()
-	dp.Attributes().PutStr("device.id", "d1")
+	dp.Attributes().PutStr("instance", "i1")
 	dp.SetIntValue(42)
 
 	// Histogram with AggregationTemporality
@@ -286,12 +286,12 @@ func TestGroupMetricsByLeaf_MetricShellFidelity(t *testing.T) {
 	h := mHist.SetEmptyHistogram()
 	h.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
 	hdp := h.DataPoints().AppendEmpty()
-	hdp.Attributes().PutStr("device.id", "d1")
+	hdp.Attributes().PutStr("instance", "i1")
 	hdp.SetCount(5)
 
-	// Group by datapoint device.id (all same → 1 batch)
+	// Group by datapoint instance (all same → 1 batch)
 	plan := resolveTestPlan(t, []PartitionKeySource{
-		{Source: keySourceDatapoint, Name: "device.id"},
+		{Source: keySourceDatapoint, Name: "instance"},
 	})
 
 	batches := groupMetricsByLeaf(md, plan)
@@ -403,9 +403,9 @@ func TestGroupMetricsByLeaf_MetricShellFidelity(t *testing.T) {
 
 func TestGroupMetricsByLeaf_Promotion(t *testing.T) {
 	t.Run("metric_name regex promotes to datapoint attr", func(t *testing.T) {
-		md := namedMetrics("svc", []string{"charging_state"})
+		md := namedMetrics("svc", []string{"http_requests"})
 		plan := resolveTestPlan(t, []PartitionKeySource{
-			{Source: keySourceMetricName, Regex: `^([a-z]+)_`, Promote: "subsystem"},
+			{Source: keySourceMetricName, Regex: `^([a-z]+)_`, Promote: "namespace"},
 		})
 
 		batches := groupMetricsByLeaf(md, plan)
@@ -415,29 +415,29 @@ func TestGroupMetricsByLeaf_Promotion(t *testing.T) {
 
 		m := batches[0].batch.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
 		dp := m.Gauge().DataPoints().At(0)
-		v, ok := dp.Attributes().Get("subsystem")
+		v, ok := dp.Attributes().Get("namespace")
 		if !ok {
-			t.Fatal("expected 'subsystem' attribute on dest datapoint")
+			t.Fatal("expected 'namespace' attribute on dest datapoint")
 		}
-		if v.AsString() != "charging" {
-			t.Errorf("subsystem = %q; want %q", v.AsString(), "charging")
+		if v.AsString() != "http" {
+			t.Errorf("namespace = %q; want %q", v.AsString(), "http")
 		}
 	})
 
 	t.Run("absent-only: existing attribute not overwritten", func(t *testing.T) {
-		// Datapoint already has subsystem=preset; promotion must not overwrite it.
+		// Datapoint already has namespace=preset; promotion must not overwrite it.
 		md := pmetric.NewMetrics()
 		rm := md.ResourceMetrics().AppendEmpty()
 		rm.Resource().Attributes().PutStr("service.name", "svc")
 		sm := rm.ScopeMetrics().AppendEmpty()
 		m := sm.Metrics().AppendEmpty()
-		m.SetName("charging_state")
+		m.SetName("http_requests")
 		dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
-		dp.Attributes().PutStr("subsystem", "preset")
+		dp.Attributes().PutStr("namespace", "preset")
 		dp.SetIntValue(1)
 
 		plan := resolveTestPlan(t, []PartitionKeySource{
-			{Source: keySourceMetricName, Regex: `^([a-z]+)_`, Promote: "subsystem"},
+			{Source: keySourceMetricName, Regex: `^([a-z]+)_`, Promote: "namespace"},
 		})
 
 		batches := groupMetricsByLeaf(md, plan)
@@ -446,12 +446,12 @@ func TestGroupMetricsByLeaf_Promotion(t *testing.T) {
 		}
 
 		destDP := batches[0].batch.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().At(0)
-		v, ok := destDP.Attributes().Get("subsystem")
+		v, ok := destDP.Attributes().Get("namespace")
 		if !ok {
-			t.Fatal("expected 'subsystem' attribute")
+			t.Fatal("expected 'namespace' attribute")
 		}
 		if v.AsString() != "preset" {
-			t.Errorf("subsystem overwritten: got %q want %q", v.AsString(), "preset")
+			t.Errorf("namespace overwritten: got %q want %q", v.AsString(), "preset")
 		}
 	})
 
@@ -459,7 +459,7 @@ func TestGroupMetricsByLeaf_Promotion(t *testing.T) {
 		// Metric name "123x" doesn't match `^([a-z]+)_` → resolved value "" → no promotion
 		md := namedMetrics("svc", []string{"123x"})
 		plan := resolveTestPlan(t, []PartitionKeySource{
-			{Source: keySourceMetricName, Regex: `^([a-z]+)_`, Promote: "subsystem"},
+			{Source: keySourceMetricName, Regex: `^([a-z]+)_`, Promote: "namespace"},
 		})
 
 		batches := groupMetricsByLeaf(md, plan)
@@ -468,8 +468,8 @@ func TestGroupMetricsByLeaf_Promotion(t *testing.T) {
 		}
 
 		dp := batches[0].batch.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().At(0)
-		if _, ok := dp.Attributes().Get("subsystem"); ok {
-			t.Error("expected no 'subsystem' attribute for no-match regex")
+		if _, ok := dp.Attributes().Get("namespace"); ok {
+			t.Error("expected no 'namespace' attribute for no-match regex")
 		}
 	})
 
@@ -481,11 +481,11 @@ func TestGroupMetricsByLeaf_Promotion(t *testing.T) {
 		m := sm.Metrics().AppendEmpty()
 		m.SetName("cpu")
 		dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
-		dp.Attributes().PutStr("device.id", "dev-1")
+		dp.Attributes().PutStr("instance", "inst-1")
 		dp.SetIntValue(1)
 
 		plan := resolveTestPlan(t, []PartitionKeySource{
-			{Source: keySourceDatapoint, Name: "device.id"},
+			{Source: keySourceDatapoint, Name: "instance"},
 			{Source: keySourceResource, Name: "service.name", Promote: "svc"},
 		})
 
@@ -508,15 +508,15 @@ func TestGroupMetricsByLeaf_Promotion(t *testing.T) {
 // --- test 6: input not mutated ---
 
 func TestGroupMetricsByLeaf_InputNotMutated(t *testing.T) {
-	deviceIDs := []string{"d1", "d2", "d3"}
-	md := gaugeMetricsWithDeviceIDs("svc", "cpu.usage", deviceIDs)
+	instanceIDs := []string{"i1", "i2", "i3"}
+	md := gaugeMetricsWithInstanceIDs("svc", "cpu.usage", instanceIDs)
 
 	// Record original state before grouping.
 	origDPCount := md.DataPointCount()
-	origAttr := "d1" // first datapoint's device.id
+	origAttr := "i1" // first datapoint's instance
 
 	plan := resolveTestPlan(t, []PartitionKeySource{
-		{Source: keySourceDatapoint, Name: "device.id", Promote: "device"},
+		{Source: keySourceDatapoint, Name: "instance", Promote: "instance_copy"},
 	})
 
 	_ = groupMetricsByLeaf(md, plan)
@@ -528,24 +528,24 @@ func TestGroupMetricsByLeaf_InputNotMutated(t *testing.T) {
 
 	// Original first datapoint must not have the promoted attribute
 	dp := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0).Gauge().DataPoints().At(0)
-	if _, ok := dp.Attributes().Get("device"); ok {
-		t.Error("input datapoint has promoted attribute 'device' — input was mutated")
+	if _, ok := dp.Attributes().Get("instance_copy"); ok {
+		t.Error("input datapoint has promoted attribute 'instance_copy' — input was mutated")
 	}
 
-	// Original device.id must still be there untouched
-	v, ok := dp.Attributes().Get("device.id")
+	// Original instance must still be there untouched
+	v, ok := dp.Attributes().Get("instance")
 	if !ok {
-		t.Fatal("original device.id attribute missing from input")
+		t.Fatal("original instance attribute missing from input")
 	}
 	if v.AsString() != origAttr {
-		t.Errorf("original device.id changed: got %q want %q", v.AsString(), origAttr)
+		t.Errorf("original instance changed: got %q want %q", v.AsString(), origAttr)
 	}
 }
 
 // --- test 7: all metric types exercised (ExponentialHistogram + Summary) ---
 
 func TestGroupMetricsByLeaf_AllMetricTypes(t *testing.T) {
-	// Build a batch with one datapoint each of all 5 metric types, keyed by device.id.
+	// Build a batch with one datapoint each of all 5 metric types, keyed by instance.
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
 	rm.Resource().Attributes().PutStr("service.name", "svc")
@@ -555,7 +555,7 @@ func TestGroupMetricsByLeaf_AllMetricTypes(t *testing.T) {
 	mGauge := sm.Metrics().AppendEmpty()
 	mGauge.SetName("g")
 	dpG := mGauge.SetEmptyGauge().DataPoints().AppendEmpty()
-	dpG.Attributes().PutStr("device.id", "d1")
+	dpG.Attributes().PutStr("instance", "i1")
 	dpG.SetDoubleValue(1.0)
 
 	// Sum
@@ -565,7 +565,7 @@ func TestGroupMetricsByLeaf_AllMetricTypes(t *testing.T) {
 	sSum.SetIsMonotonic(true)
 	sSum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
 	dpS := sSum.DataPoints().AppendEmpty()
-	dpS.Attributes().PutStr("device.id", "d1")
+	dpS.Attributes().PutStr("instance", "i1")
 	dpS.SetIntValue(2)
 
 	// Histogram
@@ -574,7 +574,7 @@ func TestGroupMetricsByLeaf_AllMetricTypes(t *testing.T) {
 	sHist := mHist.SetEmptyHistogram()
 	sHist.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
 	dpH := sHist.DataPoints().AppendEmpty()
-	dpH.Attributes().PutStr("device.id", "d1")
+	dpH.Attributes().PutStr("instance", "i1")
 	dpH.SetCount(3)
 
 	// ExponentialHistogram
@@ -583,18 +583,18 @@ func TestGroupMetricsByLeaf_AllMetricTypes(t *testing.T) {
 	sExpHist := mExpHist.SetEmptyExponentialHistogram()
 	sExpHist.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
 	dpEH := sExpHist.DataPoints().AppendEmpty()
-	dpEH.Attributes().PutStr("device.id", "d1")
+	dpEH.Attributes().PutStr("instance", "i1")
 	dpEH.SetCount(4)
 
 	// Summary
 	mSummary := sm.Metrics().AppendEmpty()
 	mSummary.SetName("sum")
 	dpSummary := mSummary.SetEmptySummary().DataPoints().AppendEmpty()
-	dpSummary.Attributes().PutStr("device.id", "d1")
+	dpSummary.Attributes().PutStr("instance", "i1")
 	dpSummary.SetCount(5)
 
 	plan := resolveTestPlan(t, []PartitionKeySource{
-		{Source: keySourceDatapoint, Name: "device.id"},
+		{Source: keySourceDatapoint, Name: "instance"},
 	})
 
 	batches := groupMetricsByLeaf(md, plan)

@@ -119,11 +119,11 @@ additive: only absent attributes are added.
 
 #### Canonical example
 
-Fan one high-volume producer across shards by `device.id`, further
-coarse-grouped by a metric-name subsystem prefix. The `promote` on the second
-key materialises the derived subsystem as a real attribute on each record so it
-is available as a label downstream — without relocating or destroying any
-existing data:
+Fan one high-volume service across shards by `instance`, further coarse-grouped
+by a metric-name namespace prefix (e.g. `http_server_duration` → `http`). The
+`promote` on the second key materialises the derived namespace as a real
+attribute on each record so it is available as a label downstream — without
+relocating or destroying any existing data:
 
 ```yaml
 exporters:
@@ -135,8 +135,8 @@ exporters:
     partition_key:
       strategy: tag_hash
       keys:
-        - { source: datapoint, name: device.id }
-        - { source: metric_name, regex: "^([a-z]+)_", promote: subsystem }
+        - { source: datapoint, name: instance }
+        - { source: metric_name, regex: "^([a-z]+)_", promote: namespace }
 ```
 
 The two forms below are equivalent:

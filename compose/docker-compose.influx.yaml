@@ -3,7 +3,7 @@
 #
 # A separate stack from docker-compose.yaml so the traces E2E stays untouched.
 # The producer derives partition keys directly from datapoint attributes: the
-# device.id tag and a subsystem prefix extracted from the metric name via regex.
+# instance tag and a namespace prefix extracted from the metric name via regex.
 # No groupbyattrs processor is used; InfluxDB tags stay on the datapoint.
 #
 # Consumer output lands on a named volume (not a host bind mount, which colima
@@ -79,7 +79,7 @@ services:
       TOTAL: "2000"
       HOSTS: "8"
       REGIONS: "3"
-      DEVICES: "4"
+      INSTANCES: "4"
       BATCH: "200"
     depends_on:
       producer-metrics:
