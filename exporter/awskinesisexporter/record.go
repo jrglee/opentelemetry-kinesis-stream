@@ -250,7 +250,9 @@ func tryEncode[T any](e *kinesisExporter, batch T, sc signalCodec[T]) ([]byte, b
 		e.logger.Warn("compress failed", zap.Error(err), zap.Int("item_count", sc.itemCount(batch)))
 		return nil, false, dropOutcome{count: sc.itemCount(batch), reason: "compress_error"}
 	}
-	fit := len(payload) <= e.cfg.MaxRecordSize
+	// Kinesis meters data + partition-key bytes against the record limit, so
+	// the fit check budgets for the key this payload will be shipped under.
+	fit := len(payload)+e.cfg.keyOverhead() <= e.cfg.MaxRecordSize
 	e.logger.Debug(
 		"encode attempt",
 		zap.Int("raw_bytes", len(raw)),
@@ -310,7 +312,9 @@ func (e *kinesisExporter) flush(ctx context.Context, entries []types.PutRecordsR
 		end := start
 		bytes := 0
 		for end < len(entries) && end-start < maxRecords {
-			n := len(entries[end].Data)
+			// Key bytes count toward the request-level limit, same as the
+			// record-level fit check in tryEncode.
+			n := len(entries[end].Data) + len(aws.ToString(entries[end].PartitionKey))
 			if end > start && bytes+n > maxBytes {
 				break
 			}
@@ -341,7 +345,7 @@ func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRec
 		}
 		bytes := 0
 		for i := range attempt {
-			bytes += len(attempt[i].Data)
+			bytes += len(attempt[i].Data) + len(aws.ToString(attempt[i].PartitionKey))
 		}
 		start := time.Now()
 		out, err := e.client.PutRecords(ctx, &kinesis.PutRecordsInput{

@@ -306,6 +306,94 @@ func TestRandomStrategyDistinctKeysPerRecord(t *testing.T) {
 	}
 }
 
+// TestRecordFitIncludesPartitionKeyBytes pins the record-size gate to what
+// Kinesis actually enforces: data bytes plus partition-key bytes against the
+// per-record limit. A payload that fits MaxRecordSize on its own but not with
+// its key must be repacked, never shipped as-is.
+func TestRecordFitIncludesPartitionKeyBytes(t *testing.T) {
+	td := ptrace.NewTraces()
+	ss := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+	for i := 0; i < 8; i++ {
+		ss.Spans().AppendEmpty().SetName("span-name-padding-for-the-fit-check")
+	}
+	enc, err := encoding.NewTracesEncoder(encoding.EncodingOTLPProto)
+	if err != nil {
+		t.Fatalf("encoder: %v", err)
+	}
+	raw, err := enc.Marshal(td)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// Fits the payload alone but not payload + the 36-byte random UUID key.
+	limit := len(raw) + 10
+
+	cfg := &Config{
+		StreamName:    "test-stream",
+		Region:        "us-east-1",
+		Encoding:      encoding.EncodingOTLPProto,
+		Compression:   encoding.CodecNone,
+		MaxRecordSize: limit,
+		PartitionKey:  PartitionKeyConfig{Strategy: partitionStrategyRandom, Hash: hashXXHash},
+		Oversize:      OversizeConfig{Policies: []string{oversizeSplitHalf}, MaxAttempts: 16, MaxAttributeValueBytes: 4096},
+	}
+	capt := &capture{}
+	exp := newTestExporterCfg(t, cfg, capt.injectSerialize())
+	if err := exp.ConsumeTraces(context.Background(), td); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+
+	recs := capt.all()
+	dec, _ := encoding.NewTracesDecoder(encoding.EncodingOTLPProto)
+	total := 0
+	for _, r := range recs {
+		if n := len(r.Data) + len(aws.ToString(r.PartitionKey)); n > limit {
+			t.Fatalf("record exceeds Kinesis size accounting: data+key=%d > max_record_size=%d", n, limit)
+		}
+		d, _ := dec.Unmarshal(r.Data)
+		total += d.SpanCount()
+	}
+	if total != 8 {
+		t.Fatalf("spans preserved: got %d want 8", total)
+	}
+}
+
+// TestFlushByteChunkingIncludesKeyBytes pins the PutRecords request-size gate
+// to data + partition-key bytes. Three entries whose data alone fits MaxBytes
+// but whose data+keys does not must split across two calls.
+func TestFlushByteChunkingIncludesKeyBytes(t *testing.T) {
+	var cc callCapture
+	cfg := &Config{
+		StreamName:    "test-stream",
+		Region:        "us-east-1",
+		Encoding:      encoding.EncodingOTLPProto,
+		Compression:   encoding.CodecNone,
+		MaxRecordSize: 1 << 20,
+		PutRecords:    PutRecordsConfig{MaxRecords: 500, MaxBytes: 200},
+		PartitionKey:  PartitionKeyConfig{Strategy: partitionStrategyRandom, Hash: hashXXHash},
+		Oversize:      OversizeConfig{Policies: []string{oversizeSplitHalf}, MaxAttempts: 8, MaxAttributeValueBytes: 4096},
+	}
+	exp := newTestExporterCfg(t, cfg, cc.injectSerialize())
+
+	// 60 data bytes + a 36-byte key = 96 per entry: two fit under 200 (192),
+	// three would only fit if key bytes were ignored (data alone is 180).
+	key := "0123456789abcdef0123456789abcdef0123" // 36 bytes, UUID-length
+	entries := make([]types.PutRecordsRequestEntry, 3)
+	for i := range entries {
+		entries[i] = types.PutRecordsRequestEntry{
+			Data:         make([]byte, 60),
+			PartitionKey: aws.String(key),
+		}
+	}
+	if err := exp.flush(context.Background(), entries); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	sizes := cc.callSizes()
+	if len(sizes) != 2 || sizes[0] != 2 || sizes[1] != 1 {
+		t.Fatalf("PutRecords calls: got %v want [2 1] (key bytes must count toward max_bytes)", sizes)
+	}
+}
+
 func TestOversizeSingleSpanDroppedCountsMetric(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
