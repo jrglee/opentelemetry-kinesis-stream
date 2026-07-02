@@ -33,6 +33,7 @@ implementing it.
 - [0019 — Oversize recovery is a chain of policies, not a single mode](0019-oversize-recovery-chain.md)
 - [0020 — Remove `otel_arrow` encoding from the PoC](0020-remove-otel-arrow-encoding.md)
 - [0021 — Partition keys from sub-resource dimensions](0021-partition-keys-from-sub-resource-dimensions.md)
+- [0022 — Adopt exporterhelper queue, retry, and timeout](0022-adopt-exporterhelper-queue-retry-timeout.md)
 
 ## How to add an ADR
 
