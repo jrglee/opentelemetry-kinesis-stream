@@ -5,15 +5,26 @@ import (
 	"fmt"
 	"regexp"
 
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/config/configretry"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
+
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
 )
 
-// Config is the configuration for the Kinesis traces exporter.
-//
-// The PoC surface is intentionally narrow. Fields landing later (partition-key
-// strategy, microbatch triggers, oversize-record policy, retry/queue tuning)
-// stay out of the type until they have a real use case to justify them.
+// Config is the configuration for the Kinesis exporter.
 type Config struct {
+	// TimeoutConfig is the collector-standard per-request timeout (`timeout`).
+	TimeoutConfig exporterhelper.TimeoutConfig `mapstructure:",squash"`
+	// QueueConfig is the collector-standard sending queue. Enabled by default:
+	// acceptance is asynchronous and a Consume call succeeding does not mean
+	// the data reached Kinesis. Disable it (or set wait_for_result) for
+	// synchronous backpressure.
+	QueueConfig configoptional.Optional[exporterhelper.QueueBatchConfig] `mapstructure:"sending_queue"`
+	// RetryConfig is the collector-standard retry/backoff policy applied to
+	// whole-request failures and to record subsets that outlive the in-place
+	// partial-failure retry (see put_records handling).
+	RetryConfig configretry.BackOffConfig `mapstructure:"retry_on_failure"`
 	// StreamName is the target Kinesis Data Stream.
 	StreamName string `mapstructure:"stream_name"`
 	// Region is the AWS region for the stream.

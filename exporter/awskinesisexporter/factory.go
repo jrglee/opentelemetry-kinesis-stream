@@ -5,7 +5,11 @@ import (
 	"fmt"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configoptional"
+	"go.opentelemetry.io/collector/config/configretry"
+	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
 )
@@ -25,6 +29,9 @@ func NewFactory() exporter.Factory {
 
 func createDefaultConfig() component.Config {
 	return &Config{
+		TimeoutConfig: exporterhelper.NewDefaultTimeoutConfig(),
+		QueueConfig:   configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
+		RetryConfig:   configretry.NewDefaultBackOffConfig(),
 		Encoding:      encoding.EncodingOTLPProto,
 		Compression:   encoding.CodecNone,
 		MaxRecordSize: 1 << 20, // 1 MiB: conservative floor every stream accepts
@@ -44,6 +51,21 @@ func createDefaultConfig() component.Config {
 	}
 }
 
+// helperOptions is the shared exporterhelper wiring: queue, retry, and timeout
+// from config, plus lifecycle passthrough. The helper owns whole-request
+// retries; the exporter's PutRecords loop keeps only per-record partial
+// failures (see record.go).
+func helperOptions(e *kinesisExporter, cfg *Config) []exporterhelper.Option {
+	return []exporterhelper.Option{
+		exporterhelper.WithCapabilities(consumer.Capabilities{MutatesData: false}),
+		exporterhelper.WithStart(e.Start),
+		exporterhelper.WithShutdown(e.Shutdown),
+		exporterhelper.WithTimeout(cfg.TimeoutConfig),
+		exporterhelper.WithRetry(cfg.RetryConfig),
+		exporterhelper.WithQueue(cfg.QueueConfig),
+	}
+}
+
 func createTracesExporter(
 	ctx context.Context,
 	set exporter.Settings,
@@ -53,7 +75,11 @@ func createTracesExporter(
 	if !ok {
 		return nil, fmt.Errorf("unexpected config type %T", rawCfg)
 	}
-	return newExporter(ctx, cfg, set)
+	e, err := newExporter(ctx, cfg, set)
+	if err != nil {
+		return nil, err
+	}
+	return exporterhelper.NewTraces(ctx, set, cfg, e.ConsumeTraces, helperOptions(e, cfg)...)
 }
 
 func createMetricsExporter(
@@ -65,7 +91,11 @@ func createMetricsExporter(
 	if !ok {
 		return nil, fmt.Errorf("unexpected config type %T", rawCfg)
 	}
-	return newExporter(ctx, cfg, set)
+	e, err := newExporter(ctx, cfg, set)
+	if err != nil {
+		return nil, err
+	}
+	return exporterhelper.NewMetrics(ctx, set, cfg, e.ConsumeMetrics, helperOptions(e, cfg)...)
 }
 
 func createLogsExporter(
@@ -77,5 +107,9 @@ func createLogsExporter(
 	if !ok {
 		return nil, fmt.Errorf("unexpected config type %T", rawCfg)
 	}
-	return newExporter(ctx, cfg, set)
+	e, err := newExporter(ctx, cfg, set)
+	if err != nil {
+		return nil, err
+	}
+	return exporterhelper.NewLogs(ctx, set, cfg, e.ConsumeLogs, helperOptions(e, cfg)...)
 }

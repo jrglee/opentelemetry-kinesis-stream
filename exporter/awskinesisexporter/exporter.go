@@ -96,9 +96,9 @@ func (e *kinesisExporter) ConsumeLogs(ctx context.Context, ld plog.Logs) error {
 	return emit(ctx, e, ld, logsCodec(e.logsEnc))
 }
 
-// classifyPutRecordsError marks errors the Collector's retry helper has no
+// classifyPutRecordsError marks errors the exporterhelper retry sender has no
 // reason to retry. Throttling and unclassified AWS errors stay unwrapped so
-// the standard retry/backoff path picks them up.
+// the retry_on_failure backoff path picks them up.
 func classifyPutRecordsError(err error) error {
 	var notFound *types.ResourceNotFoundException
 	if errors.As(err, &notFound) {
