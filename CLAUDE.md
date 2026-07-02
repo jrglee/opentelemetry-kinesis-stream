@@ -36,7 +36,7 @@ Remaining gaps (see [ADR-0005](docs/adr/0005-poc-milestone-scope-cuts.md)):
 ```
 DESIGN.md                            architecture; the source of truth
 docs/adr/                            architectural decision records
-cmd/otelcol-kinesis/                 custom Collector binary + Dockerfile
+distro/                              OCB manifest + Dockerfile for the ADOT-aligned distribution
 compose/                             docker-compose E2E stack + configs
 e2e/                                 E2E test driver (build tag: e2e)
 exporter/awskinesisexporter/         Kinesis exporter component
