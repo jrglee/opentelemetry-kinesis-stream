@@ -5,6 +5,7 @@
 // backoff, and the graceful drain gate. Record handling is in
 // poller_records.go; lease writes (the fencing surface, serialized by
 // leaseMu) are in poller_lease.go.
+
 package awskinesisreceiver
 
 import (

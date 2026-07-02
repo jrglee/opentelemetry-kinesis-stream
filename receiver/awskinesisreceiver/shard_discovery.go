@@ -6,6 +6,7 @@
 // only, sustained absence across multiple passes, quiescent owner — rather
 // than acting on a single observation. reconcile (the fair-share decision loop
 // that consumes discovery output) lives in coordinator.go.
+
 package awskinesisreceiver
 
 import (

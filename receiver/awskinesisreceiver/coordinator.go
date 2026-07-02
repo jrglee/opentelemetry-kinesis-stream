@@ -12,6 +12,7 @@
 // Shard enumeration, lease seeding, and orphan reaping live in
 // shard_discovery.go — the eventually-consistent, defensive layer that
 // feeds this reconcile loop.
+
 package awskinesisreceiver
 
 import (

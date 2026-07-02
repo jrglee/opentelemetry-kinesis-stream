@@ -7,6 +7,7 @@
 // checkpoint, ensuring a transient downstream rejection does not silently
 // drop valid telemetry. recordSkip (permanently unprocessable, dead-lettered
 // or disabled) lets the checkpoint advance past the undeliverable record.
+
 package awskinesisreceiver
 
 import (

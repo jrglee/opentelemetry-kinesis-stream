@@ -11,6 +11,7 @@
 // so a hung store call cannot hold the collector's graceful-shutdown deadline
 // beyond releaseTimeout. Once killCtx is cancelled the write aborts
 // immediately; without it, the bounded context still enforces the deadline.
+
 package awskinesisreceiver
 
 import (
