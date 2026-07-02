@@ -2,6 +2,7 @@ package awskinesisexporter
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -246,6 +247,53 @@ func TestConsumeTraces(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestConcurrentConsumeNoRace builds one exporter with zstd compression and
+// drives ConsumeTraces, ConsumeMetrics, and ConsumeLogs concurrently from 8
+// goroutines (25 iterations each). Run under -race to confirm the shared zstd
+// encoder and the full emit pipeline are goroutine-safe.
+func TestConcurrentConsumeNoRace(t *testing.T) {
+	capt := &capture{}
+	cfg := &Config{
+		StreamName:    "test-stream",
+		Region:        "us-east-1",
+		Encoding:      encoding.EncodingOTLPProto,
+		Compression:   encoding.CodecZstd,
+		MaxRecordSize: 1 << 20,
+		PartitionKey:  PartitionKeyConfig{Strategy: partitionStrategyRandom, Hash: hashXXHash},
+		Oversize:      OversizeConfig{Policies: []string{oversizeSplitHalf}, MaxAttempts: 8, MaxAttributeValueBytes: 4096},
+	}
+	exp := newTestExporterCfg(t, cfg, capt.injectSerialize())
+
+	const (
+		goroutines = 8
+		iterations = 25
+	)
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(id int) {
+			defer wg.Done()
+			ctx := context.Background()
+			for i := 0; i < iterations; i++ {
+				var err error
+				switch i % 3 {
+				case 0:
+					err = exp.ConsumeTraces(ctx, sampleTraces())
+				case 1:
+					err = exp.ConsumeMetrics(ctx, metricsWith([][2]string{{"svc", "reg"}}))
+				case 2:
+					err = exp.ConsumeLogs(ctx, logsWith([][2]string{{"svc", "reg"}}))
+				}
+				if err != nil {
+					t.Errorf("goroutine %d iter %d: %v", id, i, err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
 }
 
 // sampleTraces returns a minimal Traces value with one span; we keep the
