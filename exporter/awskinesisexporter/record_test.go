@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 	"github.com/aws/smithy-go/middleware"
+	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -799,5 +800,197 @@ func TestRandomDefaultKey(t *testing.T) {
 	}
 	if k1 == k2 {
 		t.Fatalf("random keys should differ across calls: %s == %s", k1, k2)
+	}
+}
+
+// callCapture records the per-call record count for each PutRecords call.
+// Unlike capture it does not retain payload data — per-call sizes are enough
+// to characterize flush chunking behavior.
+type callCapture struct {
+	mu    sync.Mutex
+	sizes []int
+}
+
+func (cc *callCapture) injectSerialize() func(*kinesis.Options) {
+	return func(o *kinesis.Options) {
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			return stack.Initialize.Add(
+				middleware.InitializeMiddlewareFunc("callCapture", func(_ context.Context, in middleware.InitializeInput, _ middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
+					if pr, ok := in.Parameters.(*kinesis.PutRecordsInput); ok {
+						cc.mu.Lock()
+						cc.sizes = append(cc.sizes, len(pr.Records))
+						cc.mu.Unlock()
+					}
+					return middleware.InitializeOutput{
+						Result: &kinesis.PutRecordsOutput{FailedRecordCount: aws.Int32(0)},
+					}, middleware.Metadata{}, nil
+				}),
+				middleware.Before,
+			)
+		})
+	}
+}
+
+func (cc *callCapture) callSizes() []int {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	out := make([]int, len(cc.sizes))
+	copy(out, cc.sizes)
+	return out
+}
+
+// TestFlushChunksAtMaxRecords locks the flush-chunking behavior at the
+// MaxRecords boundary: 501 records with MaxRecords=500 must produce exactly two
+// PutRecords calls (500+1).
+func TestFlushChunksAtMaxRecords(t *testing.T) {
+	var cc callCapture
+	cfg := &Config{
+		StreamName:    "test-stream",
+		Region:        "us-east-1",
+		Encoding:      encoding.EncodingOTLPProto,
+		Compression:   encoding.CodecNone,
+		MaxRecordSize: 1 << 20,
+		PutRecords:    PutRecordsConfig{MaxRecords: 500, MaxBytes: 100 << 20},
+		PartitionKey:  PartitionKeyConfig{Strategy: partitionStrategyRandom, Hash: hashXXHash},
+		Oversize:      OversizeConfig{Policies: []string{oversizeSplitHalf}, MaxAttempts: 8, MaxAttributeValueBytes: 4096},
+	}
+	exp := newTestExporterCfg(t, cfg, cc.injectSerialize())
+
+	entries := make([]types.PutRecordsRequestEntry, 501)
+	for i := range entries {
+		entries[i] = types.PutRecordsRequestEntry{Data: []byte("x"), PartitionKey: aws.String("k")}
+	}
+	if err := exp.flush(context.Background(), entries); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	sizes := cc.callSizes()
+	if len(sizes) != 2 {
+		t.Fatalf("PutRecords calls: got %d want 2 (500+1), sizes=%v", len(sizes), sizes)
+	}
+	if sizes[0] != 500 {
+		t.Fatalf("first call: got %d records want 500", sizes[0])
+	}
+	if sizes[1] != 1 {
+		t.Fatalf("second call: got %d records want 1", sizes[1])
+	}
+}
+
+// TestFlushChunksAtMaxBytes locks the flush-chunking behavior at the MaxBytes
+// boundary. Three 60-byte entries with MaxBytes=150 must split 2+1 across two
+// PutRecords calls: the first two entries total 120 bytes (fits); adding the
+// third would reach 180, which exceeds MaxBytes, so it opens a new call.
+func TestFlushChunksAtMaxBytes(t *testing.T) {
+	var cc callCapture
+	cfg := &Config{
+		StreamName:    "test-stream",
+		Region:        "us-east-1",
+		Encoding:      encoding.EncodingOTLPProto,
+		Compression:   encoding.CodecNone,
+		MaxRecordSize: 1 << 20,
+		PutRecords:    PutRecordsConfig{MaxRecords: 500, MaxBytes: 150},
+		PartitionKey:  PartitionKeyConfig{Strategy: partitionStrategyRandom, Hash: hashXXHash},
+		Oversize:      OversizeConfig{Policies: []string{oversizeSplitHalf}, MaxAttempts: 8, MaxAttributeValueBytes: 4096},
+	}
+	exp := newTestExporterCfg(t, cfg, cc.injectSerialize())
+
+	data := make([]byte, 60) // 60+60=120 ≤ 150; adding a third: 180 > 150 → chunk boundary
+	entries := []types.PutRecordsRequestEntry{
+		{Data: data, PartitionKey: aws.String("k")},
+		{Data: data, PartitionKey: aws.String("k")},
+		{Data: data, PartitionKey: aws.String("k")},
+	}
+	if err := exp.flush(context.Background(), entries); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	sizes := cc.callSizes()
+	if len(sizes) != 2 {
+		t.Fatalf("PutRecords calls: got %d want 2 (2+1), sizes=%v", len(sizes), sizes)
+	}
+	if sizes[0] != 2 {
+		t.Fatalf("first call: got %d records want 2", sizes[0])
+	}
+	if sizes[1] != 1 {
+		t.Fatalf("second call: got %d records want 1", sizes[1])
+	}
+}
+
+// TestFlushSingleRecordOverMaxBytes locks the "always include at least one
+// record" guard in the flush loop (record.go). A single entry whose
+// len(Data) > PutRecords.MaxBytes must still be dispatched in its own call —
+// the loop's `end > start` guard prevents an infinite-skip that would stall
+// progress when every record individually exceeds the byte ceiling.
+func TestFlushSingleRecordOverMaxBytes(t *testing.T) {
+	var cc callCapture
+	cfg := &Config{
+		StreamName:    "test-stream",
+		Region:        "us-east-1",
+		Encoding:      encoding.EncodingOTLPProto,
+		Compression:   encoding.CodecNone,
+		MaxRecordSize: 1 << 20,
+		PutRecords:    PutRecordsConfig{MaxRecords: 500, MaxBytes: 50},
+		PartitionKey:  PartitionKeyConfig{Strategy: partitionStrategyRandom, Hash: hashXXHash},
+		Oversize:      OversizeConfig{Policies: []string{oversizeSplitHalf}, MaxAttempts: 8, MaxAttributeValueBytes: 4096},
+	}
+	exp := newTestExporterCfg(t, cfg, cc.injectSerialize())
+
+	// One entry whose Data is twice MaxBytes — must still be dispatched alone.
+	entries := []types.PutRecordsRequestEntry{
+		{Data: make([]byte, 100), PartitionKey: aws.String("k")},
+	}
+	if err := exp.flush(context.Background(), entries); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	sizes := cc.callSizes()
+	if len(sizes) != 1 {
+		t.Fatalf("PutRecords calls: got %d want 1, sizes=%v", len(sizes), sizes)
+	}
+	if sizes[0] != 1 {
+		t.Fatalf("call record count: got %d want 1", sizes[0])
+	}
+}
+
+// TestPutRecordsRetryExhaustionErrorShape programs every record to fail with
+// ProvisionedThroughputExceededException on every attempt. After maxPutAttempts
+// the in-place retry loop exhausts and returns a retryable (non-permanent)
+// error — the Collector's at-least-once outer retry owns the backstop, and the
+// exporter must not escalate this to permanent.
+func TestPutRecordsRetryExhaustionErrorShape(t *testing.T) {
+	defer withFastBackoff()()
+
+	inject := func(o *kinesis.Options) {
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			return stack.Initialize.Add(
+				middleware.InitializeMiddlewareFunc("alwaysThrottle", func(_ context.Context, in middleware.InitializeInput, _ middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
+					pr := in.Parameters.(*kinesis.PutRecordsInput)
+					n := len(pr.Records)
+					recs := make([]types.PutRecordsResultEntry, n)
+					for i := range recs {
+						recs[i] = types.PutRecordsResultEntry{
+							ErrorCode:    aws.String("ProvisionedThroughputExceededException"),
+							ErrorMessage: aws.String("throttled"),
+						}
+					}
+					return middleware.InitializeOutput{
+						Result: &kinesis.PutRecordsOutput{
+							FailedRecordCount: aws.Int32(int32(n)),
+							Records:           recs,
+						},
+					}, middleware.Metadata{}, nil
+				}),
+				middleware.Before,
+			)
+		})
+	}
+
+	exp := newTestExporter(t, 1<<20, inject)
+	err := exp.ConsumeTraces(context.Background(), sampleTraces())
+	if err == nil {
+		t.Fatal("expected error after retry exhaustion, got nil")
+	}
+	if consumererror.IsPermanent(err) {
+		t.Fatalf("error must not be permanent (Collector owns the outer retry backstop): %v", err)
 	}
 }
