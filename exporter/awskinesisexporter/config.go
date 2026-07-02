@@ -59,11 +59,12 @@ type Config struct {
 }
 
 // PutRecordsConfig bounds a single PutRecords call. The exporter chunks a flush
-// so no call exceeds either limit. Defaults are the conservative values every
-// Kinesis stream has historically accepted; raise them to match a stream
-// configured for larger requests.
+// so no call exceeds either limit. max_records is bounded by the AWS PutRecords
+// API hard limit of 500 records per call; max_bytes may be raised to match a
+// stream configured for larger aggregate payloads.
 type PutRecordsConfig struct {
 	// MaxRecords is the maximum number of records per PutRecords call.
+	// AWS PutRecords hard limit is 500; values above 500 are rejected by Validate.
 	MaxRecords int `mapstructure:"max_records"`
 	// MaxBytes is the maximum aggregate bytes per PutRecords call, counting
 	// each record's data plus its partition key — the same accounting Kinesis
@@ -189,6 +190,9 @@ func (c *Config) Validate() error {
 	}
 	if c.PutRecords.MaxRecords <= 0 {
 		return errors.New("put_records.max_records must be positive")
+	}
+	if c.PutRecords.MaxRecords > 500 {
+		return errors.New("put_records.max_records must not exceed 500 (AWS PutRecords API hard limit)")
 	}
 	if c.PutRecords.MaxBytes <= 0 {
 		return errors.New("put_records.max_bytes must be positive")

@@ -356,3 +356,60 @@ func TestValidateOversizePolicies(t *testing.T) {
 		})
 	}
 }
+
+func TestValidatePutRecordsMaxRecords(t *testing.T) {
+	tests := []struct {
+		name     string
+		mutate   func(c *Config)
+		wantErr  string // substring; empty means must succeed
+		wantPass bool
+	}{
+		{
+			name:     "default 500 passes",
+			mutate:   func(_ *Config) {},
+			wantPass: true,
+		},
+		{
+			name: "exactly 500 passes (API maximum)",
+			mutate: func(c *Config) {
+				c.PutRecords.MaxRecords = 500
+			},
+			wantPass: true,
+		},
+		{
+			name: "501 exceeds API maximum",
+			mutate: func(c *Config) {
+				c.PutRecords.MaxRecords = 501
+			},
+			wantErr: "500",
+		},
+		{
+			name: "1000 exceeds API maximum",
+			mutate: func(c *Config) {
+				c.PutRecords.MaxRecords = 1000
+			},
+			wantErr: "500",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidCfg()
+			tc.mutate(cfg)
+			err := cfg.Validate()
+			if tc.wantPass {
+				if err != nil {
+					t.Fatalf("expected pass, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error mismatch: got %q want substring %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
