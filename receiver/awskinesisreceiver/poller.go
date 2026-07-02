@@ -1,3 +1,10 @@
+// poller.go: poll loop and lifecycle for a single Kinesis shard.
+//
+// Contains the timing machinery: GetRecords pacing (the Kinesis API allows
+// five reads/second/shard), iterator open/reopen, stuck-shard exponential
+// backoff, and the graceful drain gate. Record handling is in
+// poller_records.go; lease writes (the fencing surface, serialized by
+// leaseMu) are in poller_lease.go.
 package awskinesisreceiver
 
 import (
@@ -136,7 +143,7 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 		return
 	}
 	stuckPasses := 0
-	// lastPoll paces GetRecords at PollInterval per call — the API allows five
+	// lastPoll paces GetRecords to PollInterval per call — the API allows five
 	// reads per second per shard, and an unpaced loop on a busy shard would
 	// hammer straight into ProvisionedThroughputExceededException. The zero
 	// value makes the first poll immediate.
@@ -217,9 +224,9 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 
 		// Advance the checkpoint only over records that were delivered or are
 		// permanently unprocessable. A record the downstream transiently
-		// rejected must NOT be skipped — we stop the batch there, checkpoint
-		// the good prefix, and re-read from that point so valid telemetry is
-		// not silently dropped under backpressure.
+		// rejected must NOT be skipped — stop the batch there, checkpoint the
+		// good prefix, and re-read from that point so valid telemetry is not
+		// silently dropped under backpressure.
 		var advanceSeq string
 		retry := false
 		for _, rec := range out.Records {
@@ -244,9 +251,9 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 		}
 		if retry {
 			// Re-read from the just-advanced checkpoint so the rejected record
-			// (and the rest of the batch) is retried. If the good prefix
-			// advanced this pass that is forward progress; only a pass that
-			// checkpointed nothing counts as "stuck" and earns a longer backoff.
+			// (and the rest of the batch) is retried. Only a pass that
+			// checkpointed nothing counts as "stuck" and earns a longer backoff;
+			// any forward progress resets the counter.
 			if advanceSeq != "" {
 				stuckPasses = 0
 			} else {
@@ -270,10 +277,9 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 			}
 			continue
 		}
-		// Forward progress (or an empty poll): clear the stuck counter. The
-		// pacing wait at the top of the loop provides the poll cadence; a nil
-		// next iterator (closed, fully drained shard) loops straight into the
-		// SHARD_END write.
+		// Reset stuck counter on forward progress or an empty poll. A nil
+		// NextShardIterator means the shard is closed; the top of the loop
+		// will write the SHARD_END sentinel on the next iteration.
 		stuckPasses = 0
 		iter = out.NextShardIterator
 	}
@@ -349,10 +355,10 @@ func (p *shardPoller) openIterator(ctx context.Context) (*string, error) {
 }
 
 // writeShardEnd persists the SHARD_END sentinel so child shards become
-// acquirable. Losing the sentinel forces the next owner of the shard to
-// re-discover the closure from scratch — correct but wasteful — so a write
-// that fails only because the poll context was cancelled (graceful shutdown
-// racing the write) is retried once under the bounded exit context.
+// acquirable. Losing the sentinel forces the next owner to re-discover the
+// closure from scratch — correct but wasteful — so a write that fails only
+// because the poll context was cancelled (graceful shutdown racing the write)
+// is retried once under the bounded exit context.
 func (p *shardPoller) writeShardEnd(ctx context.Context, logger *zap.Logger) {
 	err := p.checkpoint(ctx, lease.CheckpointShardEnd)
 	if err != nil && (ctx.Err() != nil || errors.Is(err, context.Canceled)) {
@@ -363,190 +369,4 @@ func (p *shardPoller) writeShardEnd(ctx context.Context, logger *zap.Logger) {
 	if err != nil {
 		logger.Warn("checkpoint SHARD_END failed", zap.Error(err))
 	}
-}
-
-// recordResult tells the poll loop whether the checkpoint may advance past a
-// record. recordRetry means a valid record was transiently rejected and must
-// be re-read; recordSkip and recordOK both let the checkpoint advance.
-type recordResult int
-
-const (
-	recordOK    recordResult = iota // delivered downstream
-	recordSkip                      // permanently unprocessable — safe to skip
-	recordRetry                     // transient downstream failure — must re-read
-)
-
-func (p *shardPoller) handleRecord(ctx context.Context, rec types.Record) recordResult {
-	raw, err := p.comp.Decompress(rec.Data)
-	if err != nil {
-		p.logger.Warn(
-			"decompress failed; skipping record",
-			zap.String("shard", p.shardID()),
-			zap.String("seq", aws.ToString(rec.SequenceNumber)),
-			zap.Error(err),
-		)
-		if !p.maybeDeadLetter(ctx, rec, "decompress") {
-			return recordRetry
-		}
-		return recordSkip
-	}
-	// The sink performs the only signal-specific work: decode + deliver. It
-	// reports a decode failure so the unprocessable bytes can be dead-lettered;
-	// a transient consume failure becomes recordRetry so the checkpoint does
-	// not advance past valid telemetry the downstream merely rejected.
-	result, decodeFailed := p.sink.consume(ctx, raw)
-	switch {
-	case decodeFailed:
-		p.logger.Warn(
-			"decode failed; skipping record",
-			zap.String("shard", p.shardID()),
-			zap.String("seq", aws.ToString(rec.SequenceNumber)),
-		)
-		if !p.maybeDeadLetter(ctx, rec, "decode") {
-			return recordRetry
-		}
-	case result == recordRetry:
-		p.logger.Warn(
-			"consume failed; will retry record",
-			zap.String("shard", p.shardID()),
-			zap.String("seq", aws.ToString(rec.SequenceNumber)),
-		)
-	case result == recordSkip:
-		p.logger.Warn(
-			"consume permanently rejected; skipping record",
-			zap.String("shard", p.shardID()),
-			zap.String("seq", aws.ToString(rec.SequenceNumber)),
-		)
-	}
-	return result
-}
-
-// maybeDeadLetter re-emits an unprocessable raw record into the pipeline when
-// dead-lettering is enabled, so the bytes are observable rather than silently
-// dropped. It reports whether the checkpoint may advance past the record: true
-// when dead-lettering is disabled (skipping is the configured behavior) or the
-// wrapper was accepted downstream; false when the emit failed — advancing then
-// would lose the bytes entirely, so the caller must re-read the record and
-// re-attempt the dead-letter. A persistently failing dead-letter pipeline
-// therefore wedges the shard exactly like a persistently rejecting downstream:
-// bounded by the stuck backoff and visible through its warning and the
-// dead_letter counter, rather than a silent drop.
-func (p *shardPoller) maybeDeadLetter(ctx context.Context, rec types.Record, failureClass string) bool {
-	if !p.cfg.DeadLetter.Enabled {
-		return true
-	}
-	if err := p.sink.deadLetter(ctx, rec, failureClass, string(p.cfg.Encoding), string(p.cfg.Compression)); err != nil {
-		p.tel.recordDeadLetter(ctx, resultError)
-		p.logger.Warn(
-			"dead-letter emit failed; record will be re-read",
-			zap.String("shard", p.shardID()),
-			zap.String("seq", aws.ToString(rec.SequenceNumber)),
-			zap.Error(err),
-		)
-		return false
-	}
-	p.tel.recordDeadLetter(ctx, resultSuccess)
-	return true
-}
-
-func (p *shardPoller) heartbeat(ctx context.Context) error {
-	p.leaseMu.Lock()
-	defer p.leaseMu.Unlock()
-	updated, err := p.store.Heartbeat(ctx, p.leased)
-	if err != nil {
-		return err
-	}
-	p.leased = updated
-	return nil
-}
-
-func (p *shardPoller) checkpoint(ctx context.Context, seq string) error {
-	p.leaseMu.Lock()
-	defer p.leaseMu.Unlock()
-	updated, err := p.store.Checkpoint(ctx, p.leased, seq)
-	if err != nil {
-		return err
-	}
-	p.leased = updated
-	return nil
-}
-
-// Bounds for the in-place checkpoint retry on transient store errors. Kept
-// short: a checkpoint that cannot land within a few hundred milliseconds is
-// better surfaced to the caller than silently stretched toward lease expiry.
-const (
-	checkpointAttempts     = 3
-	checkpointRetryBackoff = 100 * time.Millisecond
-)
-
-// checkpointWithRetry retries transient store failures in place so a DynamoDB
-// throttle or network blip does not tear down the poller (abandoning the
-// in-flight batch and forcing a fleet-wide reacquire storm when the blip is
-// shared). Lease conflicts and not-found are real lease loss and surface
-// immediately; context cancellation aborts the retry.
-func (p *shardPoller) checkpointWithRetry(ctx context.Context, seq string) error {
-	var err error
-	for attempt := 0; attempt < checkpointAttempts; attempt++ {
-		if attempt > 0 {
-			t := time.NewTimer(checkpointRetryBackoff)
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return ctx.Err()
-			case <-t.C:
-			}
-			p.logger.Warn("checkpoint attempt failed; retrying",
-				zap.String("shard", p.shardID()), zap.Int("attempt", attempt), zap.Error(err))
-		}
-		err = p.checkpoint(ctx, seq)
-		if err == nil ||
-			errors.Is(err, lease.ErrLeaseConflict) ||
-			errors.Is(err, lease.ErrLeaseNotFound) ||
-			errors.Is(err, context.Canceled) {
-			return err
-		}
-	}
-	return err
-}
-
-// exitCtx is the parent for best-effort exit-path store writes: killCtx when
-// the coordinator wired one (cancelled on hard shutdown), background otherwise.
-func (p *shardPoller) exitCtx() context.Context {
-	if p.killCtx != nil {
-		return p.killCtx
-	}
-	return context.Background()
-}
-
-// release is the deferred exit path. It runs under a bounded exit context so a
-// hung DynamoDB Release never blocks the collector's graceful-shutdown
-// deadline — and aborts immediately once the deadline has already hard-
-// cancelled killCtx. Lease-conflict errors are silently dropped: they mean the
-// lease was already stolen, which is the postcondition Release would have
-// achieved anyway.
-func (p *shardPoller) release() {
-	ctx, cancel := context.WithTimeout(p.exitCtx(), releaseTimeout)
-	defer cancel()
-	p.leaseMu.Lock()
-	leased := p.leased
-	p.leaseMu.Unlock()
-	if err := p.store.Release(ctx, leased); err != nil && !errors.Is(err, lease.ErrLeaseConflict) {
-		p.logger.Warn(
-			"release failed",
-			zap.String("shard", leased.ShardID),
-			zap.Error(err),
-		)
-	}
-}
-
-func (p *shardPoller) shardID() string {
-	p.leaseMu.Lock()
-	defer p.leaseMu.Unlock()
-	return p.leased.ShardID
-}
-
-func (p *shardPoller) leaseCounter() int64 {
-	p.leaseMu.Lock()
-	defer p.leaseMu.Unlock()
-	return p.leased.Counter
 }
