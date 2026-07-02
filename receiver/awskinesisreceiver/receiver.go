@@ -3,6 +3,7 @@ package awskinesisreceiver
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -119,6 +120,7 @@ func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
 	r.cancel = cancel
 	if err := r.coord.start(bgCtx); err != nil {
 		cancel()
+		killCancel()
 		return fmt.Errorf("coordinator start: %w", err)
 	}
 	r.logger.Info(
@@ -166,10 +168,24 @@ func (r *kinesisReceiver) Shutdown(ctx context.Context) error {
 		if r.killCancel != nil {
 			r.killCancel()
 		}
-		<-done
+		// Bounded join: a downstream consumer that ignores context
+		// cancellation can pin a poller in Consume forever, and an unbounded
+		// wait here would wedge the whole collector at exit. Leak the
+		// stragglers observably instead — their leases are reclaimable by
+		// peers via the counter fence regardless.
+		select {
+		case <-done:
+		case <-time.After(shutdownLeakGrace):
+			r.logger.Error("pollers still running after hard cancel; abandoning them to exit within the deadline")
+		}
 		return ctx.Err()
 	}
 }
+
+// shutdownLeakGrace is how long the deadline branch waits for hard-cancelled
+// pollers before abandoning them. Generous enough for context-honoring calls
+// to unwind; short enough that a wedged downstream cannot hold collector exit.
+const shutdownLeakGrace = 5 * time.Second
 
 // newLeaseStore constructs the lease.Store named by cfg.LeaseBackend. The
 // dynamodb implementation lives in internal/lease; this switch is the only

@@ -106,12 +106,23 @@ func (p *shardPoller) runHeartbeat(ctx context.Context, stop context.CancelFunc,
 		case <-ticker.C:
 		}
 		if err := p.heartbeat(ctx); err != nil {
-			if !errors.Is(err, context.Canceled) {
+			switch {
+			case errors.Is(err, context.Canceled):
+				stop()
+				return
+			case errors.Is(err, lease.ErrLeaseConflict), errors.Is(err, lease.ErrLeaseNotFound):
 				logger.Warn("heartbeat lost lease; stopping poller", zap.Error(err))
 				p.tel.recordLeaseEvent(ctx, leaseHeartbeatGot, resultConflict)
+				stop()
+				return
+			default:
+				// A store blip (throttle, 5xx, network) is not lease loss:
+				// keep polling and retry on the next tick. If the outage
+				// outlasts lease_duration a peer steals the lease and the
+				// next heartbeat surfaces the conflict above.
+				logger.Warn("heartbeat attempt failed; retrying next tick", zap.Error(err))
+				continue
 			}
-			stop()
-			return
 		}
 		logger.Debug("heartbeat ok", zap.Int64("counter", p.leaseCounter()))
 	}
@@ -124,12 +135,22 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 		stop()
 		return
 	}
-	pollTick := time.NewTicker(p.cfg.PollInterval)
-	defer pollTick.Stop()
 	stuckPasses := 0
+	// lastPoll paces GetRecords at PollInterval per call — the API allows five
+	// reads per second per shard, and an unpaced loop on a busy shard would
+	// hammer straight into ProvisionedThroughputExceededException. The zero
+	// value makes the first poll immediate.
+	var lastPoll time.Time
 
 	for {
 		if ctx.Err() != nil {
+			return
+		}
+		// A drained (closed) shard earned its SHARD_END sentinel even if a
+		// graceful drain arrives in the same instant — write it before honoring
+		// the drain so the next owner need not re-discover the closure.
+		if iter == nil {
+			p.writeShardEnd(ctx, logger)
 			return
 		}
 		// Graceful drain: the last completed batch is already checkpointed, so
@@ -140,10 +161,12 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 			return
 		default:
 		}
-		if iter == nil {
-			p.writeShardEnd(ctx, logger)
-			return
+		if wait := p.cfg.PollInterval - time.Since(lastPoll); wait > 0 {
+			if p.waitDurationOrStop(ctx, wait) {
+				return
+			}
 		}
+		lastPoll = time.Now()
 		pollStart := time.Now()
 		out, err := p.client.GetRecords(ctx, &kinesis.GetRecordsInput{
 			ShardIterator: iter,
@@ -166,13 +189,14 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 					stop()
 					return
 				}
-				// Fresh iterator, and GetShardIterator just succeeded, so the
-				// shard is not throttled: poll again immediately instead of
-				// sleeping a full interval on top of the expiry stall.
+				// Fresh iterator after a ≥5-minute expiry stall: the shard is
+				// nowhere near its read quota, so skip the pacing wait and poll
+				// again immediately instead of adding an interval to the stall.
+				lastPoll = time.Time{}
 				continue
 			}
 			logger.Warn("get_records failed; backing off", zap.Error(err))
-			if p.waitOrStop(ctx, pollTick) {
+			if p.waitDurationOrStop(ctx, p.cfg.PollInterval) {
 				return
 			}
 			continue
@@ -208,7 +232,7 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 			}
 		}
 		if advanceSeq != "" {
-			if err := p.checkpoint(ctx, advanceSeq); err != nil {
+			if err := p.checkpointWithRetry(ctx, advanceSeq); err != nil {
 				if !errors.Is(err, context.Canceled) {
 					logger.Warn("checkpoint lost lease; stopping poller", zap.Error(err))
 				}
@@ -246,40 +270,18 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 			}
 			continue
 		}
-		// Forward progress (or an empty poll): clear the stuck counter.
+		// Forward progress (or an empty poll): clear the stuck counter. The
+		// pacing wait at the top of the loop provides the poll cadence; a nil
+		// next iterator (closed, fully drained shard) loops straight into the
+		// SHARD_END write.
 		stuckPasses = 0
 		iter = out.NextShardIterator
-
-		if len(out.Records) == 0 {
-			// A nil next iterator means the shard is closed and fully drained:
-			// loop straight into the SHARD_END write instead of waiting out a
-			// poll interval on a shard that will never produce again.
-			if iter == nil {
-				continue
-			}
-			if p.waitOrStop(ctx, pollTick) {
-				return
-			}
-		}
 	}
 }
 
-// waitOrStop blocks until the poll ticker fires, the context is cancelled, or
-// a graceful drain is requested. It returns true if the caller should stop
-// (cancel or drain) — in both cases the last batch is already checkpointed.
-func (p *shardPoller) waitOrStop(ctx context.Context, tick *time.Ticker) bool {
-	select {
-	case <-ctx.Done():
-		return true
-	case <-p.drainCh:
-		return true
-	case <-tick.C:
-		return false
-	}
-}
-
-// waitDurationOrStop is waitOrStop for an arbitrary backoff delay rather than
-// the fixed poll ticker. Returns true if the caller should stop.
+// waitDurationOrStop blocks for d or until the context is cancelled or a
+// graceful drain is requested. Returns true if the caller should stop — in
+// both cases the last batch is already checkpointed.
 func (p *shardPoller) waitDurationOrStop(ctx context.Context, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
@@ -347,18 +349,18 @@ func (p *shardPoller) openIterator(ctx context.Context) (*string, error) {
 }
 
 // writeShardEnd persists the SHARD_END sentinel so child shards become
-// acquirable. On graceful shutdown ctx is already cancelled, in which case
-// we attempt the write under a bounded background context — losing the
-// sentinel forces the next owner of the shard to re-discover it from
-// scratch, which is correct but wasteful.
+// acquirable. Losing the sentinel forces the next owner of the shard to
+// re-discover the closure from scratch — correct but wasteful — so a write
+// that fails only because the poll context was cancelled (graceful shutdown
+// racing the write) is retried once under the bounded exit context.
 func (p *shardPoller) writeShardEnd(ctx context.Context, logger *zap.Logger) {
-	writeCtx := ctx
-	if ctx.Err() != nil {
-		var cancel context.CancelFunc
-		writeCtx, cancel = context.WithTimeout(p.exitCtx(), releaseTimeout)
+	err := p.checkpoint(ctx, lease.CheckpointShardEnd)
+	if err != nil && (ctx.Err() != nil || errors.Is(err, context.Canceled)) {
+		writeCtx, cancel := context.WithTimeout(p.exitCtx(), releaseTimeout)
 		defer cancel()
+		err = p.checkpoint(writeCtx, lease.CheckpointShardEnd)
 	}
-	if err := p.checkpoint(writeCtx, lease.CheckpointShardEnd); err != nil {
+	if err != nil {
 		logger.Warn("checkpoint SHARD_END failed", zap.Error(err))
 	}
 }
@@ -467,6 +469,44 @@ func (p *shardPoller) checkpoint(ctx context.Context, seq string) error {
 	}
 	p.leased = updated
 	return nil
+}
+
+// Bounds for the in-place checkpoint retry on transient store errors. Kept
+// short: a checkpoint that cannot land within a few hundred milliseconds is
+// better surfaced to the caller than silently stretched toward lease expiry.
+const (
+	checkpointAttempts     = 3
+	checkpointRetryBackoff = 100 * time.Millisecond
+)
+
+// checkpointWithRetry retries transient store failures in place so a DynamoDB
+// throttle or network blip does not tear down the poller (abandoning the
+// in-flight batch and forcing a fleet-wide reacquire storm when the blip is
+// shared). Lease conflicts and not-found are real lease loss and surface
+// immediately; context cancellation aborts the retry.
+func (p *shardPoller) checkpointWithRetry(ctx context.Context, seq string) error {
+	var err error
+	for attempt := 0; attempt < checkpointAttempts; attempt++ {
+		if attempt > 0 {
+			t := time.NewTimer(checkpointRetryBackoff)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return ctx.Err()
+			case <-t.C:
+			}
+			p.logger.Warn("checkpoint attempt failed; retrying",
+				zap.String("shard", p.shardID()), zap.Int("attempt", attempt), zap.Error(err))
+		}
+		err = p.checkpoint(ctx, seq)
+		if err == nil ||
+			errors.Is(err, lease.ErrLeaseConflict) ||
+			errors.Is(err, lease.ErrLeaseNotFound) ||
+			errors.Is(err, context.Canceled) {
+			return err
+		}
+	}
+	return err
 }
 
 // exitCtx is the parent for best-effort exit-path store writes: killCtx when
