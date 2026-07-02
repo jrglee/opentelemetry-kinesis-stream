@@ -17,7 +17,10 @@ import (
 // only the transient (throttled / InternalFailure) subset, with capped
 // exponential backoff, so already-succeeded records are not duplicated and
 // permanently-rejected records do not head-of-line-block. After maxPutAttempts
-// the still-failing subset is handed to the Collector's retry policy.
+// the still-failing subset surfaces as a retryable error to the exporterhelper
+// retry sender (retry_on_failure), which the factory wires around this
+// exporter. The budget here stays deliberately short so the operator-tunable
+// helper policy dominates.
 const maxPutAttempts = 5
 
 // Backoff bounds for the in-place transient retry. Vars (not consts) so tests
@@ -336,7 +339,9 @@ func (e *kinesisExporter) flush(ctx context.Context, entries []types.PutRecordsR
 // once rather than riding a whole-batch retry. Throttled / InternalFailure
 // records are retried with capped backoff; if they still fail after
 // maxPutAttempts, the remaining subset is surfaced as a retryable error for the
-// Collector's retry policy (the at-least-once backstop).
+// exporterhelper retry sender (the at-least-once backstop). Note a helper-level
+// retry re-sends the whole request, so records that succeeded before the
+// residual failure can be duplicated — accepted at-least-once behavior.
 func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRecordsRequestEntry) error {
 	attempt := records
 	for try := 0; ; try++ {
