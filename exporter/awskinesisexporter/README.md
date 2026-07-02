@@ -18,6 +18,26 @@ configuration.
 **Status:** working proof of concept for traces, metrics, and logs, including
 tag-grouped microbatching and oversize-record repacking.
 
+## Delivery semantics
+
+The exporter runs behind the collector-standard `sending_queue`,
+`retry_on_failure`, and `timeout` blocks (all on by default). Retry is split
+across two layers on purpose: `PutRecords` reports per-record results, so the
+exporter retries only the failed subset in place — that is the only way to
+avoid re-sending records that already landed — while whole-request failures
+and subsets that outlive the short internal budget go to the collector's
+retry sender, whose policy the operator owns. A helper-level retry re-sends
+the whole request, so partial-success-then-retry can duplicate: the pipeline
+is at-least-once by design. The default `timeout` is 30s, not the helper's
+5s, because one attempt must fit an entire multi-chunk flush plus the
+internal retry budget — a shorter deadline kills every attempt at the same
+point, duplicating head chunks and eventually dropping the tail.
+
+With the queue enabled, a `Consume*` call succeeds on enqueue, not delivery.
+Anywhere acceptance is load-bearing (for example downstream of a Kinesis
+receiver whose checkpoint advances on acceptance), set
+`sending_queue::wait_for_result: true` or use a persistent queue.
+
 ## Observability
 
 The exporter holds no logging or metrics configuration of its own; it logs
@@ -33,10 +53,13 @@ Instruments (scope `awskinesisexporter`):
 - `kinesis.exporter.flush.duration_ms` (histogram) — `PutRecords` latency.
 - `kinesis.exporter.records_dropped` (counter, `reason` = `marshal_error` |
   `compress_error` | `max_attempts` | `irreducible` | `reject_policy` |
-  `chain_exhausted` | `rejected`) — items dropped rather than retried forever.
-  The reason names the failure mode so silent data loss stays observable; see
-  the [user guide](../../docs/user-guide.md#oversize-records) for the policy
-  semantics behind each label.
+  `chain_exhausted`) — items dropped rather than retried forever. The reason
+  names the failure mode so silent data loss stays observable; each label
+  corresponds to one oversize-recovery outcome (below). Per-record `PutRecords`
+  errors are never dropped here — they are retried and, if persistent,
+  surfaced to the collector's retry machinery, because a per-record error code
+  is transient by AWS's own contract and anything unrecognized must fail
+  toward at-least-once.
 - `kinesis.exporter.attributes_truncated` (counter, unit `{attribute}`) —
   attribute values clamped by `truncate_attribute_values`, regardless of
   whether truncation alone fit the record. A non-zero sustained rate is the

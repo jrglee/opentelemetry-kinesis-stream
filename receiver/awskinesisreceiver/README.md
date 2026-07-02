@@ -27,7 +27,21 @@ downstream acceptance.
   is not dropped under load.
 - A failed or expired shard iterator is re-opened from the persisted
   checkpoint rather than reused, so transient `GetRecords` errors recover
-  instead of spinning.
+  instead of spinning. Polling is paced to one `GetRecords` per
+  `poll_interval` per shard because the API allows five reads per second per
+  shard — an unpaced loop on a busy shard would throttle itself and starve
+  any co-consumer of the stream's shared read quota.
+- A transient lease-store error (a DynamoDB throttle or network blip) is not
+  lease loss: heartbeats retry on the next tick and checkpoints retry in
+  place, because tearing pollers down on a shared blip would abandon every
+  in-flight batch at once and turn one outage into a fleet-wide redelivery
+  storm. Only a lease conflict — another replica provably owns the shard —
+  stops a poller.
+- With `dead_letter.enabled`, the checkpoint advances past an unprocessable
+  record only once its dead-letter wrapper is accepted downstream. A failed
+  re-emit re-reads the record instead of skipping it: advancing would lose
+  the bytes exactly when the pipeline is under enough pressure to reject
+  them, which is the moment dead-lettering exists for.
 
 ## Configuration
 
@@ -56,6 +70,10 @@ Instruments (scope `awskinesisreceiver`):
   `success`/`conflict`) — shard-lease lifecycle.
 - `kinesis.receiver.shards.owned` (up-down counter) — shards this replica is
   actively polling.
+- `kinesis.receiver.dead_letter.records` (counter, `result` =
+  `success`/`error`) — dead-letter emit attempts. A sustained `error` rate
+  means the dead-letter pipeline itself is rejecting and the affected shard
+  is intentionally held (see above) rather than silently dropping bytes.
 
 Set the Collector log level to `debug` to log poll cycles, checkpoint advances,
 lease acquisition, and reconcile decisions.
