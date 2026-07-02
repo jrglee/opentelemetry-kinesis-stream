@@ -59,3 +59,15 @@ Split retry responsibility between the two layers:
   upstream renames the blocks (e.g. a future `queue_batch` migration) or if
   per-record NACK support ever lands in the helper, which would let the
   internal loop shrink further.
+
+## Amendment (2026-07-02): timeout sizing
+
+The per-attempt `timeout` wraps the *entire* flush — every PutRecords chunk
+plus the internal transient-retry budget (`maxPutAttempts` with backoff,
+≈3s worst case). An attempt deadline shorter than a healthy flush makes every
+retry die at the same point: head chunks are re-written (duplicated) each
+attempt and, once `retry_on_failure` gives up, the tail is dropped. The
+shipped default is therefore 30s rather than the helper's 5s, the flush loop
+checks the context between chunks, and the internal backoff returns
+immediately when the deadline is nearer than the wait. Operators lowering
+`timeout` should keep it comfortably above their observed flush time.

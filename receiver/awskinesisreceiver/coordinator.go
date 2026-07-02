@@ -96,7 +96,17 @@ func (c *coordinator) start(ctx context.Context) error {
 		cancel()
 		return err
 	}
+	// Re-check under mu: a drainAndStop that raced in while discoverShards was
+	// on the network must not see a run goroutine appear after its snapshot,
+	// and wg.Add must never race a wait() at counter zero.
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		cancel()
+		return nil
+	}
 	c.wg.Add(1)
+	c.mu.Unlock()
 	go c.run(discCtx)
 	return nil
 }
@@ -125,19 +135,27 @@ func (c *coordinator) drainAndStop() {
 
 func (c *coordinator) run(ctx context.Context) {
 	defer c.wg.Done()
+	if ctx.Err() != nil {
+		// Shutdown won the start/stop race; do no work on a dead context.
+		return
+	}
 	ticker := time.NewTicker(c.cfg.DiscoveryInterval)
 	defer ticker.Stop()
-	// Reconcile once immediately so initial pollers don't wait the full interval.
-	c.reconcile(ctx)
+	// Reconcile once immediately so initial pollers don't wait the full
+	// interval. start's discoverShards just succeeded, so orphan cleanup may
+	// trust the live-shard snapshot.
+	c.reconcile(ctx, true)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			discoveryOK := true
 			if err := c.discoverShards(ctx); err != nil {
+				discoveryOK = false
 				c.logger.Warn("shard discovery failed", zap.Error(err))
 			}
-			c.reconcile(ctx)
+			c.reconcile(ctx, discoveryOK)
 		}
 	}
 }
@@ -202,7 +220,10 @@ func (c *coordinator) listShards(ctx context.Context) ([]types.Shard, error) {
 // computes this worker's target share via lease.Plan, and executes the
 // resulting acquire / release / steal actions. Every replica runs the same
 // computation against the same snapshot, so they converge without a leader.
-func (c *coordinator) reconcile(ctx context.Context) {
+// discoveryOK reports whether the current pass's shard discovery succeeded;
+// orphan cleanup is skipped otherwise so a discovery outage cannot advance
+// absence counters against a stale live-shard snapshot.
+func (c *coordinator) reconcile(ctx context.Context, discoveryOK bool) {
 	leases, err := c.store.List(ctx)
 	if err != nil {
 		c.logger.Warn("list leases failed", zap.Error(err))
@@ -260,7 +281,9 @@ func (c *coordinator) reconcile(ctx context.Context) {
 		zap.Bool("steal", plan.Steal != ""),
 	)
 
-	c.cleanupOrphans(ctx, leases)
+	if discoveryOK {
+		c.cleanupOrphans(ctx, leases)
+	}
 }
 
 // orphanReapThreshold is how many consecutive discovery passes a shard must be
@@ -425,12 +448,18 @@ func (c *coordinator) startPoller(_ context.Context, l lease.Lease) {
 	if c.stopped {
 		// Shutdown began (drainAndStop set stopped under this same lock) between
 		// our Acquire and this install, so drainAndStop's snapshot has already
-		// missed us. Do not start a poller that would never be drained: cancel the
-		// context and abandon the just-taken lease. It expires after lease_duration
-		// and a surviving replica (or this worker's next start) reclaims it from
-		// the last checkpoint — at-least-once, no stuck shard.
+		// missed us. Do not start a poller that would never be drained: cancel
+		// the context and free the just-taken lease with a best-effort fenced
+		// Release so a peer need not wait out lease_duration. A conflict means
+		// it was already re-taken — the postcondition Release wanted.
 		c.mu.Unlock()
 		cancel()
+		relCtx, relCancel := context.WithTimeout(c.exitCtx(), releaseTimeout)
+		defer relCancel()
+		if err := c.store.Release(relCtx, l); err != nil && !errors.Is(err, lease.ErrLeaseConflict) {
+			c.logger.Warn("release of shutdown-raced lease failed; peers reclaim after lease_duration",
+				zap.String("shard", l.ShardID), zap.Error(err))
+		}
 		return
 	}
 	c.active[l.ShardID] = ap
@@ -439,6 +468,10 @@ func (c *coordinator) startPoller(_ context.Context, l lease.Lease) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
+		// Release the pollerCtx once the poller exits; otherwise every
+		// finished poller leaves a live cancelCtx child registered on baseCtx
+		// for the life of the receiver.
+		defer cancel()
 		defer func() {
 			c.mu.Lock()
 			// Generation check: only clear the slot if it still holds *this*
@@ -458,6 +491,15 @@ func (c *coordinator) startPoller(_ context.Context, l lease.Lease) {
 }
 
 func (c *coordinator) wait() { c.wg.Wait() }
+
+// exitCtx parents best-effort exit-path store writes: killCtx when the
+// receiver wired one, background otherwise (tests).
+func (c *coordinator) exitCtx() context.Context {
+	if c.killCtx != nil {
+		return c.killCtx
+	}
+	return context.Background()
+}
 
 // indexCheckpoints flattens lease state for parent-drain lookup.
 func indexCheckpoints(leases []lease.Lease) map[string]string {

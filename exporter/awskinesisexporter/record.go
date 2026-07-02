@@ -13,14 +13,13 @@ import (
 	"go.uber.org/zap"
 )
 
-// PutRecords retry bounds. A partial PutRecords failure is retried in place for
-// only the transient (throttled / InternalFailure) subset, with capped
-// exponential backoff, so already-succeeded records are not duplicated and
-// permanently-rejected records do not head-of-line-block. After maxPutAttempts
-// the still-failing subset surfaces as a retryable error to the exporterhelper
-// retry sender (retry_on_failure), which the factory wires around this
-// exporter. The budget here stays deliberately short so the operator-tunable
-// helper policy dominates.
+// PutRecords retry bounds. A partial PutRecords failure is retried in place
+// for the failed subset with capped exponential backoff, so already-succeeded
+// records are not duplicated. After maxPutAttempts the still-failing subset
+// surfaces as a retryable error to the exporterhelper retry sender
+// (retry_on_failure), which the factory wires around this exporter. The
+// budget here stays deliberately short so the operator-tunable helper policy
+// dominates.
 const maxPutAttempts = 5
 
 // Backoff bounds for the in-place transient retry. Vars (not consts) so tests
@@ -29,19 +28,6 @@ var (
 	putBackoffBase = 100 * time.Millisecond
 	putBackoffMax  = 2 * time.Second
 )
-
-// transientPutError reports whether a per-record PutRecords ErrorCode is worth
-// retrying. Throttling clears once the shard has capacity, and InternalFailure
-// is a transient service error; any other code (e.g. a validation error) fails
-// identically on every retry and is treated as permanent.
-func transientPutError(code string) bool {
-	switch code {
-	case "ProvisionedThroughputExceededException", "InternalFailure":
-		return true
-	default:
-		return false
-	}
-}
 
 // taggedBatch pairs a signal batch with the joined tag value used to derive
 // its partition key. key is empty for the random strategy.
@@ -308,10 +294,17 @@ func packSplit[T any](ctx context.Context, e *kinesisExporter, batch T, sc signa
 // operator-configured per-call record-count and byte limits (put_records.*).
 // At least one record is always included per call even if it alone exceeds the
 // byte limit — a single record's size is bounded by max_record_size instead.
+// The context is checked between chunks so an attempt-deadline cancellation
+// aborts the flush promptly instead of continuing into chunks that will also
+// fail — the exporterhelper retry re-sends the whole request, so every chunk
+// written past the deadline is a duplicate on the next attempt.
 func (e *kinesisExporter) flush(ctx context.Context, entries []types.PutRecordsRequestEntry) error {
 	maxRecords := e.cfg.PutRecords.MaxRecords
 	maxBytes := e.cfg.PutRecords.MaxBytes
 	for start := 0; start < len(entries); {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		end := start
 		bytes := 0
 		for end < len(entries) && end-start < maxRecords {
@@ -333,15 +326,16 @@ func (e *kinesisExporter) flush(ctx context.Context, entries []types.PutRecordsR
 }
 
 // putRecords issues PutRecords for one chunk and resolves partial failures by
-// retrying only the transient subset in place. PutRecords returns a per-record
-// result array in request order, so a record that succeeded is never re-sent
-// (no duplication) and a permanently-rejected record is dropped-and-counted
-// once rather than riding a whole-batch retry. Throttled / InternalFailure
-// records are retried with capped backoff; if they still fail after
-// maxPutAttempts, the remaining subset is surfaced as a retryable error for the
-// exporterhelper retry sender (the at-least-once backstop). Note a helper-level
-// retry re-sends the whole request, so records that succeeded before the
-// residual failure can be duplicated — accepted at-least-once behavior.
+// retrying the failed subset in place. PutRecords returns a per-record result
+// array in request order, so a record that succeeded is never re-sent (no
+// duplication). Every per-record error code is retried — AWS documents only
+// throttling and InternalFailure here, and an unrecognized future code must
+// not be silently dropped before it can be classified. If records still fail
+// after maxPutAttempts, the remaining subset is surfaced as a retryable error
+// for the exporterhelper retry sender (the at-least-once backstop). Note a
+// helper-level retry re-sends the whole request, so records that succeeded
+// before the residual failure can be duplicated — accepted at-least-once
+// behavior.
 func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRecordsRequestEntry) error {
 	attempt := records
 	for try := 0; ; try++ {
@@ -373,25 +367,31 @@ func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRec
 		}
 
 		var retry []types.PutRecordsRequestEntry
-		var rejected int
 		for i, r := range out.Records {
 			if r.ErrorCode == nil {
 				continue // succeeded
 			}
-			if transientPutError(aws.ToString(r.ErrorCode)) {
-				retry = append(retry, attempt[i])
-				continue
+			// Every per-record ErrorCode is retried. AWS documents exactly two:
+			// "ProvisionedThroughputExceededException" (shard throttled; backoff
+			// clears the capacity debt) and "InternalFailure" (transient service
+			// error). Anything else is deliberately retry-biased — a future AWS
+			// code must not be silently dropped before it can be classified. After
+			// maxPutAttempts the still-failing subset surfaces as a retryable
+			// error for the Collector's retry policy, the at-least-once backstop.
+			code := aws.ToString(r.ErrorCode)
+			switch code {
+			case "ProvisionedThroughputExceededException", "InternalFailure":
+				// Known transient codes — retry silently.
+			default:
+				// Unknown code: log at Warn so operators see it.
+				e.logger.Warn(
+					"kinesis record: unrecognised error code (will retry)",
+					zap.Int("index", i),
+					zap.String("code", code),
+					zap.String("message", aws.ToString(r.ErrorMessage)),
+				)
 			}
-			e.logger.Warn(
-				"kinesis record rejected",
-				zap.Int("index", i),
-				zap.String("code", aws.ToString(r.ErrorCode)),
-				zap.String("message", aws.ToString(r.ErrorMessage)),
-			)
-			rejected++
-		}
-		if rejected > 0 {
-			e.tel.recordDrop(ctx, rejected, "rejected")
+			retry = append(retry, attempt[i])
 		}
 		if len(retry) == 0 {
 			return nil
@@ -406,12 +406,21 @@ func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRec
 	}
 }
 
-// sleepBackoff waits putBackoffBase*2^try (capped at putBackoffMax) or until the
-// context is cancelled, whichever comes first.
+// sleepBackoff waits putBackoffBase*2^try (capped at putBackoffMax) or until
+// the context is cancelled, whichever comes first. If the context deadline is
+// nearer than the backoff, it returns immediately — sleeping into a known
+// deadline burns the attempt's remaining budget for nothing, and the retry
+// this backoff precedes could never run anyway.
 func sleepBackoff(ctx context.Context, try int) error {
 	d := putBackoffBase << try
 	if d > putBackoffMax || d <= 0 {
 		d = putBackoffMax
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < d {
+		return context.DeadlineExceeded
 	}
 	t := time.NewTimer(d)
 	defer t.Stop()

@@ -208,6 +208,130 @@ func TestShutdownDeadlineAbortsRelease(t *testing.T) {
 	}
 }
 
+// TestPollPacingRespectsInterval pins the GetRecords cadence: the API allows
+// five reads per second per shard, so consecutive polls — including ones that
+// returned data — must be spaced at PollInterval, not issued back-to-back.
+func TestPollPacingRespectsInterval(t *testing.T) {
+	const shardID = "pace-shard"
+	fs := &fakeStream{shards: []*fakeShard{{
+		id:      shardID,
+		records: [][]byte{[]byte("r0"), []byte("r1"), []byte("r2")},
+	}}}
+	store := lease.NewMemoryStore()
+	cfg := fastCoordCfg("pace", encoding.EncodingOTLPProto, encoding.CodecNone)
+	cfg.PollInterval = 150 * time.Millisecond
+	p := newHardeningPoller(t, cfg, fakeKinesisClient(fs), store, noopSink{}, shardID)
+
+	start := time.Now()
+	runPollerToExit(t, p, 10*time.Second)
+	elapsed := time.Since(start)
+
+	if cp := shardCheckpoint(t, store, shardID); cp != lease.CheckpointShardEnd {
+		t.Fatalf("final checkpoint: got %q want SHARD_END", cp)
+	}
+	// Four calls total (three data + the closing empty poll); the first is
+	// immediate, the rest are paced: >= 3 intervals.
+	if want := 3 * cfg.PollInterval; elapsed < want {
+		t.Fatalf("drained in %v; paced polling requires at least %v", elapsed, want)
+	}
+}
+
+// transientErrStore fails a chosen operation with a generic (non-conflict)
+// error a fixed number of times, simulating a store blip.
+type transientErrStore struct {
+	lease.Store
+	heartbeatFails  atomic.Int32
+	checkpointFails atomic.Int32
+}
+
+func (s *transientErrStore) Heartbeat(ctx context.Context, l lease.Lease) (lease.Lease, error) {
+	if s.heartbeatFails.Add(-1) >= 0 {
+		return lease.Lease{}, errors.New("dynamodb 500: transient blip")
+	}
+	return s.Store.Heartbeat(ctx, l)
+}
+
+func (s *transientErrStore) Checkpoint(ctx context.Context, l lease.Lease, seq string) (lease.Lease, error) {
+	if s.checkpointFails.Add(-1) >= 0 {
+		return lease.Lease{}, errors.New("dynamodb 500: transient blip")
+	}
+	return s.Store.Checkpoint(ctx, l, seq)
+}
+
+// TestHeartbeatSurvivesTransientStoreError pins the blip semantics: a store
+// error that is not a lease conflict must not tear down the poller — the
+// next heartbeat tick retries. (Previously any error stopped the poller,
+// so a shared DynamoDB blip triggered a fleet-wide reacquire storm.)
+func TestHeartbeatSurvivesTransientStoreError(t *testing.T) {
+	const shardID = "hb-blip-shard"
+	fs := &fakeStream{shards: []*fakeShard{{id: shardID, records: [][]byte{[]byte("r0")}}}}
+	store := &transientErrStore{Store: lease.NewMemoryStore()}
+	store.heartbeatFails.Store(2)
+
+	// Hold the record in consume until both failing heartbeats have fired, so
+	// the blip provably happens while the poller is alive and mid-work.
+	snk := &gateSink{gateOn: "r0", gateHit: make(chan struct{}), gateOpen: make(chan struct{})}
+	cfg := fastCoordCfg("hb-blip", encoding.EncodingOTLPProto, encoding.CodecNone)
+	cfg.HeartbeatInterval = 20 * time.Millisecond
+	p := newHardeningPoller(t, cfg, fakeKinesisClient(fs), store, snk, shardID)
+
+	done := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go func() {
+		defer close(done)
+		p.run(ctx)
+	}()
+
+	<-snk.gateHit
+	deadline := time.Now().Add(5 * time.Second)
+	for store.heartbeatFails.Load() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("failing heartbeats never fired")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(snk.gateOpen)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("poller did not exit")
+	}
+	if cp := shardCheckpoint(t, store, shardID); cp != lease.CheckpointShardEnd {
+		t.Fatalf("final checkpoint: got %q want SHARD_END (poller must survive heartbeat blips)", cp)
+	}
+}
+
+// TestCheckpointRetriesTransientStoreError pins the in-place checkpoint retry:
+// a transient failure is retried without abandoning the batch, so records are
+// not re-read (no duplicates) and the shard still drains.
+func TestCheckpointRetriesTransientStoreError(t *testing.T) {
+	const shardID = "cp-blip-shard"
+	fs := &fakeStream{shards: []*fakeShard{{id: shardID, records: [][]byte{[]byte("r0"), []byte("r1")}}}}
+	store := &transientErrStore{Store: lease.NewMemoryStore()}
+	store.checkpointFails.Store(1)
+
+	snk := &gateSink{gateOn: "", gateHit: make(chan struct{}), gateOpen: make(chan struct{})}
+	cfg := fastCoordCfg("cp-blip", encoding.EncodingOTLPProto, encoding.CodecNone)
+	p := newHardeningPoller(t, cfg, fakeKinesisClient(fs), store, snk, shardID)
+
+	runPollerToExit(t, p, 10*time.Second)
+
+	if cp := shardCheckpoint(t, store, shardID); cp != lease.CheckpointShardEnd {
+		t.Fatalf("final checkpoint: got %q want SHARD_END", cp)
+	}
+	seen := map[string]int{}
+	for _, d := range snk.all() {
+		seen[d]++
+	}
+	for _, want := range []string{"r0", "r1"} {
+		if seen[want] != 1 {
+			t.Fatalf("record %s delivered %d times; transient checkpoint retry must not re-read the batch", want, seen[want])
+		}
+	}
+}
+
 // gateSink delivers every payload but blocks on one designated payload until
 // released, signalling when the gate is reached — the hook that lets a test
 // steal the lease while a record is mid-consume.
@@ -393,14 +517,32 @@ func TestExpiredIteratorReopensImmediately(t *testing.T) {
 	cfg.PollInterval = 5 * time.Second // sleeping this after re-open = bug
 	p := newHardeningPoller(t, cfg, client, store, noopSink{}, shardID)
 
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	done := make(chan struct{})
 	start := time.Now()
-	runPollerToExit(t, p, 10*time.Second)
-	elapsed := time.Since(start)
+	go func() {
+		defer close(done)
+		p.run(ctx)
+	}()
 
-	if cp := shardCheckpoint(t, store, shardID); cp != lease.CheckpointShardEnd {
-		t.Fatalf("final checkpoint: got %q want SHARD_END", cp)
+	// The record must land well before one PollInterval: the expired call is
+	// re-opened and re-polled immediately, not slept through.
+	deadline := time.Now().Add(2 * time.Second)
+	for shardCheckpoint(t, store, shardID) != sequence(shardID, 0) {
+		if time.Now().After(deadline) {
+			t.Fatalf("record not delivered %v after start; re-open must poll immediately, not wait out PollInterval",
+				time.Since(start))
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if elapsed > 2*time.Second {
-		t.Fatalf("drain took %v; re-open must poll immediately, not wait out PollInterval", elapsed)
+
+	// Regular pacing resumes after delivery; drain rather than waiting out the
+	// 5s interval to closure detection.
+	p.drain()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("poller did not exit after drain")
 	}
 }

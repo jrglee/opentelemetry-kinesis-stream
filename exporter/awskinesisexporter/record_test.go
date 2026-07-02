@@ -3,6 +3,7 @@ package awskinesisexporter
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"unicode/utf8"
 
@@ -453,11 +454,11 @@ func sumDropped(t *testing.T, rm *metricdata.ResourceMetrics) int64 {
 	return 0
 }
 
-// TestPutRecordsPartialFailureRetriesTransientOnly verifies the partial-failure
-// contract: a permanently-rejected record is dropped-and-counted exactly once
-// (never re-sent), while throttled / InternalFailure records are retried in
-// place — only that transient subset, so succeeded records are not duplicated.
-func TestPutRecordsPartialFailureRetriesTransientOnly(t *testing.T) {
+// TestPutRecordsPartialFailureRetriesAllErrorCodes verifies the partial-failure
+// contract: succeeded records are never re-sent, and every record with any
+// error code — including unrecognised codes — is retried in place. No per-record
+// code is permanently dropped; exhausted subsets surface as retryable errors.
+func TestPutRecordsPartialFailureRetriesAllErrorCodes(t *testing.T) {
 	defer withFastBackoff()()
 
 	reader := sdkmetric.NewManualReader()
@@ -515,27 +516,30 @@ func TestPutRecordsPartialFailureRetriesTransientOnly(t *testing.T) {
 	exp.tel = tel
 
 	if err := exp.ConsumeTraces(context.Background(), tracesWith(tuples())); err != nil {
-		t.Fatalf("consume: %v", err) // transient retried to success, permanent dropped → no error
+		t.Fatalf("consume: %v", err) // all error codes retried to success → no error
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	if len(callSizes) != 2 {
-		t.Fatalf("PutRecords calls: got %d (%v) want 2 (initial + transient retry)", len(callSizes), callSizes)
+		t.Fatalf("PutRecords calls: got %d (%v) want 2 (initial + retry of all error records)", len(callSizes), callSizes)
 	}
 	if callSizes[0] != len(tuples()) {
 		t.Fatalf("first call records: got %d want %d", callSizes[0], len(tuples()))
 	}
-	if callSizes[1] != 2 {
-		t.Fatalf("retry call records: got %d want 2 (only the transient subset)", callSizes[1])
+	// All 3 error records (ProvisionedThroughputExceededException, InternalFailure,
+	// ValidationException) are retried — no per-record code is permanently dropped.
+	if callSizes[1] != 3 {
+		t.Fatalf("retry call records: got %d want 3 (all error records, including unknown codes)", callSizes[1])
 	}
 
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatal(err)
 	}
-	if got := sumDropped(t, &rm); got != 1 {
-		t.Fatalf("dropped counter: got %d want 1 (the one permanent rejection, counted once)", got)
+	// No per-record code is dropped; drop counter must be zero.
+	if got := sumDropped(t, &rm); got != 0 {
+		t.Fatalf("dropped counter: got %d want 0 (no per-record code is permanently dropped)", got)
 	}
 }
 
@@ -1116,5 +1120,78 @@ func TestPutRecordsRetryExhaustionErrorShape(t *testing.T) {
 	}
 	if consumererror.IsPermanent(err) {
 		t.Fatalf("error must not be permanent (Collector owns the outer retry backstop): %v", err)
+	}
+}
+
+// TestUnknownErrorCodeIsRetried pins finding 3: an unrecognised per-record
+// ErrorCode must be retried (transient bias) rather than silently dropped.
+// AWS currently documents exactly two per-record codes; any future code must
+// not be lost before it is classified. The test programs the first call to
+// fail with "SomeFutureException" and asserts the record is retried on a
+// second call with no drop counter increment.
+func TestUnknownErrorCodeIsRetried(t *testing.T) {
+	defer withFastBackoff()()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	var callCount int32
+	inject := func(o *kinesis.Options) {
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			return stack.Initialize.Add(
+				middleware.InitializeMiddlewareFunc("unknownCodeKinesis", func(_ context.Context, in middleware.InitializeInput, _ middleware.InitializeHandler) (middleware.InitializeOutput, middleware.Metadata, error) {
+					pr := in.Parameters.(*kinesis.PutRecordsInput)
+					n := len(pr.Records)
+					call := atomic.AddInt32(&callCount, 1)
+
+					recs := make([]types.PutRecordsResultEntry, n)
+					var failed int32
+					if call == 1 {
+						// First call: return an unknown error code on the first record.
+						recs[0] = types.PutRecordsResultEntry{
+							ErrorCode:    aws.String("SomeFutureException"),
+							ErrorMessage: aws.String("new aws error"),
+						}
+						failed = 1
+						for i := 1; i < n; i++ {
+							recs[i] = types.PutRecordsResultEntry{SequenceNumber: aws.String("ok")}
+						}
+					} else {
+						// Subsequent calls: all succeed.
+						for i := range recs {
+							recs[i] = types.PutRecordsResultEntry{SequenceNumber: aws.String("ok")}
+						}
+					}
+					return middleware.InitializeOutput{
+						Result: &kinesis.PutRecordsOutput{FailedRecordCount: aws.Int32(failed), Records: recs},
+					}, middleware.Metadata{}, nil
+				}),
+				middleware.Before,
+			)
+		})
+	}
+
+	exp := newTestExporterCfg(t, tagHashCfg(), inject)
+	tel, err := newExporterTelemetry(mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp.tel = tel
+
+	if err := exp.ConsumeTraces(context.Background(), sampleTraces()); err != nil {
+		t.Fatalf("expected success after retry of unknown code: %v", err)
+	}
+
+	if n := atomic.LoadInt32(&callCount); n < 2 {
+		t.Fatalf("expected at least 2 PutRecords calls (initial + retry), got %d", n)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	if total := sumDropped(t, &rm); total != 0 {
+		dropped := sumByReason(t, &rm, "kinesis.exporter.records_dropped")
+		t.Fatalf("drop counter: got %d want 0 (unknown code must be retried, not dropped); reasons=%v", total, dropped)
 	}
 }

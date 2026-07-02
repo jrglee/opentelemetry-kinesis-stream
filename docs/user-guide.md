@@ -274,6 +274,16 @@ single record with a random partition key; under the `tag_hash` strategy it
 groups the batch by resource-attribute tuple and emits one record per tuple with
 a stable key (see [Tag-grouped microbatching](#tag-grouped-microbatching)).
 
+The exporter uses the collector-standard `sending_queue`, `retry_on_failure`,
+and `timeout` blocks (all enabled by default). One consequence deserves a
+callout: with the queue enabled, a `Consume*` call succeeds on **enqueue**, not
+on delivery to Kinesis. If this exporter sits downstream of the `awskinesis`
+**receiver** (a Kinesis→Kinesis relay), that turns the receiver's
+checkpoint-after-acceptance into checkpoint-after-enqueue — a crash can lose
+queued data the checkpoint already skipped past. For a relay, set
+`sending_queue::wait_for_result: true` (or disable the queue, or use a
+persistent queue via `storage`) to keep the at-least-once chain intact.
+
 | Setting                   | Type   | Default      | Required | Description |
 |---------------------------|--------|--------------|----------|-------------|
 | `stream_name`             | string | —            | yes      | Target Kinesis Data Stream. |

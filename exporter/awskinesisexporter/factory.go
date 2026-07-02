@@ -3,6 +3,7 @@ package awskinesisexporter
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/configoptional"
@@ -28,8 +29,15 @@ func NewFactory() exporter.Factory {
 }
 
 func createDefaultConfig() component.Config {
+	// The per-attempt timeout must comfortably exceed the internal PutRecords
+	// retry budget (maxPutAttempts with backoff ≈ 3s worst case) plus the RTTs
+	// of a multi-chunk flush; the helper's 5s default leaves attempts dying
+	// mid-flush, duplicating head chunks on every retry. 30s gives a full
+	// flush room to finish or fail on its own terms.
+	timeout := exporterhelper.NewDefaultTimeoutConfig()
+	timeout.Timeout = 30 * time.Second
 	return &Config{
-		TimeoutConfig: exporterhelper.NewDefaultTimeoutConfig(),
+		TimeoutConfig: timeout,
 		QueueConfig:   configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
 		RetryConfig:   configretry.NewDefaultBackOffConfig(),
 		Encoding:      encoding.EncodingOTLPProto,

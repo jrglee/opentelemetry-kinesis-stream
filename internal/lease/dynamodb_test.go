@@ -37,6 +37,37 @@ func TestMarshalUnmarshalRoundTrip(t *testing.T) {
 	}
 }
 
+// TestMarshalParentsAsStringSet pins the wire type: KCL's
+// DynamoDBLeaseSerializer stores parentShardId as a DynamoDB string set, and
+// a stock KCL reading any other type deserializes zero parents — silently
+// dropping its parent-before-child reshard barrier.
+func TestMarshalParentsAsStringSet(t *testing.T) {
+	item := marshalLease(Lease{ShardID: "c-1", Checkpoint: CheckpointTrimHorizon, ParentIDs: []string{"p-0", "p-1"}})
+	ss, ok := item[attrParentShardID].(*types.AttributeValueMemberSS)
+	if !ok {
+		t.Fatalf("parentShardId must be a string set (SS), got %T", item[attrParentShardID])
+	}
+	if !reflect.DeepEqual(ss.Value, []string{"p-0", "p-1"}) {
+		t.Fatalf("parents = %v want [p-0 p-1]", ss.Value)
+	}
+}
+
+// TestUnmarshalReadsLegacyCommaJoinedParents keeps rows written before the
+// string-set change readable: the table migrates in place as rows rewrite.
+func TestUnmarshalReadsLegacyCommaJoinedParents(t *testing.T) {
+	legacy := map[string]types.AttributeValue{
+		attrLeaseKey:      &types.AttributeValueMemberS{Value: "c-1"},
+		attrParentShardID: &types.AttributeValueMemberS{Value: "p-0,p-1"},
+	}
+	got, err := unmarshalLease(legacy)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(got.ParentIDs, []string{"p-0", "p-1"}) {
+		t.Fatalf("parents = %v want [p-0 p-1]", got.ParentIDs)
+	}
+}
+
 // TestMarshalOmitsEmptyOwnerAndParents matches KCL's "unowned" row shape: an
 // empty owner and an empty parent list must omit the attributes entirely
 // rather than writing empty strings, so a KCL consumer reads the row as
