@@ -147,6 +147,25 @@ func TestValidatePartitionKey(t *testing.T) {
 			},
 			wantErr: "partition_key.keys[0]: invalid regex",
 		},
+		{
+			name: "max_record_size at or below the random key overhead is an error",
+			mutate: func(c *Config) {
+				c.MaxRecordSize = 36 // == the 36-byte UUID key: no room for payload
+			},
+			wantErr: "must exceed the partition-key overhead",
+		},
+		{
+			name: "max_record_size just above the tag_hash key overhead passes",
+			mutate: func(c *Config) {
+				c.PartitionKey = PartitionKeyConfig{
+					Strategy: partitionStrategyTagHash,
+					Tags:     []string{"service.name"},
+					Hash:     hashXXHash,
+				}
+				c.MaxRecordSize = 17 // 16-hex digest + 1 payload byte
+			},
+			wantPass: true,
+		},
 	}
 
 	for _, tc := range tests {

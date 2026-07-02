@@ -25,12 +25,14 @@ type Config struct {
 	Encoding encoding.Encoding `mapstructure:"encoding"`
 	// Compression is the wire-level codec applied to the marshaled payload.
 	Compression encoding.Codec `mapstructure:"compression"`
-	// MaxRecordSize caps the post-compression record payload in bytes; oversize
-	// records are repacked per Oversize.Policy. This is an operator-owned limit:
-	// the exporter enforces the value you set and asserts nothing about the
-	// stream's actual ceiling, which varies by account, region, and stream
-	// configuration. The default (1 MiB) is the conservative floor that every
-	// stream accepts; raise it if your stream is configured for larger records.
+	// MaxRecordSize caps a record's total size in bytes — post-compression
+	// payload plus partition-key bytes, matching how Kinesis meters its
+	// per-record limit; oversize records are repacked per Oversize.Policy.
+	// This is an operator-owned limit: the exporter enforces the value you set
+	// and asserts nothing about the stream's actual ceiling, which varies by
+	// account, region, and stream configuration. The default (1 MiB) is the
+	// conservative floor that every stream accepts; raise it if your stream is
+	// configured for larger records.
 	MaxRecordSize int `mapstructure:"max_record_size"`
 	// PartitionKey controls how a record's Kinesis partition key is derived,
 	// which in turn controls shard fan-out and tag-grouped microbatching.
@@ -52,7 +54,9 @@ type Config struct {
 type PutRecordsConfig struct {
 	// MaxRecords is the maximum number of records per PutRecords call.
 	MaxRecords int `mapstructure:"max_records"`
-	// MaxBytes is the maximum aggregate record-data bytes per PutRecords call.
+	// MaxBytes is the maximum aggregate bytes per PutRecords call, counting
+	// each record's data plus its partition key — the same accounting Kinesis
+	// applies to the request-level limit.
 	MaxBytes int `mapstructure:"max_bytes"`
 }
 
@@ -166,6 +170,12 @@ func (c *Config) Validate() error {
 	if c.MaxRecordSize <= 0 {
 		return errors.New("max_record_size must be positive")
 	}
+	if c.MaxRecordSize <= c.keyOverhead() {
+		return fmt.Errorf(
+			"max_record_size (%d) must exceed the partition-key overhead (%d bytes for strategy %q): the key counts toward the Kinesis record limit, leaving no room for payload",
+			c.MaxRecordSize, c.keyOverhead(), c.strategy(),
+		)
+	}
 	if c.PutRecords.MaxRecords <= 0 {
 		return errors.New("put_records.max_records must be positive")
 	}
@@ -257,4 +267,23 @@ func (c *Config) Validate() error {
 // tagHash reports whether the resolved strategy is tag_hash.
 func (c *Config) tagHash() bool {
 	return c.PartitionKey.Strategy == partitionStrategyTagHash
+}
+
+// strategy resolves the effective partition-key strategy (empty means random).
+func (c *Config) strategy() string {
+	if c.tagHash() {
+		return partitionStrategyTagHash
+	}
+	return partitionStrategyRandom
+}
+
+// keyOverhead is the partition-key length in bytes. Kinesis counts the key's
+// UTF-8 bytes toward both the per-record size limit and the PutRecords
+// request-level aggregate, so size gates must budget for it. Both strategies
+// produce constant-length keys: a 16-hex tag digest or a 36-byte UUID.
+func (c *Config) keyOverhead() int {
+	if c.tagHash() {
+		return 16
+	}
+	return 36
 }

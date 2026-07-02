@@ -123,7 +123,6 @@ func emit[T any](ctx context.Context, e *kinesisExporter, b T, sc signalCodec[T]
 
 	entries := make([]types.PutRecordsRequestEntry, 0, len(groups))
 	for _, g := range groups {
-		key := e.partitionKey(g.key)
 		payloads, ds := packChain(ctx, e, g.batch, sc)
 		for _, d := range ds {
 			e.tel.recordDrop(ctx, d.count, d.reason)
@@ -135,7 +134,7 @@ func emit[T any](ctx context.Context, e *kinesisExporter, b T, sc signalCodec[T]
 			)
 		}
 		for _, p := range payloads {
-			entries = append(entries, types.PutRecordsRequestEntry{Data: p, PartitionKey: aws.String(key)})
+			entries = append(entries, types.PutRecordsRequestEntry{Data: p, PartitionKey: aws.String(e.partitionKey(g.key))})
 		}
 	}
 	return e.flush(ctx, entries)
@@ -143,7 +142,8 @@ func emit[T any](ctx context.Context, e *kinesisExporter, b T, sc signalCodec[T]
 
 // partitionKey resolves the per-record key. tag_hash maps a tag tuple to a
 // stable 16-hex key so equal tuples always land on the same key (and shard);
-// random returns a fresh UUID per group for uniform fan-out.
+// random returns a fresh UUID per record for uniform fan-out — a key shared
+// across a call's records would funnel them all onto one shard.
 func (e *kinesisExporter) partitionKey(tagValue string) string {
 	if e.cfg.tagHash() {
 		return fmt.Sprintf("%016x", xxhash.Sum64String(tagValue))
@@ -250,7 +250,9 @@ func tryEncode[T any](e *kinesisExporter, batch T, sc signalCodec[T]) ([]byte, b
 		e.logger.Warn("compress failed", zap.Error(err), zap.Int("item_count", sc.itemCount(batch)))
 		return nil, false, dropOutcome{count: sc.itemCount(batch), reason: "compress_error"}
 	}
-	fit := len(payload) <= e.cfg.MaxRecordSize
+	// Kinesis meters data + partition-key bytes against the record limit, so
+	// the fit check budgets for the key this payload will be shipped under.
+	fit := len(payload)+e.cfg.keyOverhead() <= e.cfg.MaxRecordSize
 	e.logger.Debug(
 		"encode attempt",
 		zap.Int("raw_bytes", len(raw)),
@@ -310,7 +312,9 @@ func (e *kinesisExporter) flush(ctx context.Context, entries []types.PutRecordsR
 		end := start
 		bytes := 0
 		for end < len(entries) && end-start < maxRecords {
-			n := len(entries[end].Data)
+			// Key bytes count toward the request-level limit, same as the
+			// record-level fit check in tryEncode.
+			n := len(entries[end].Data) + len(aws.ToString(entries[end].PartitionKey))
 			if end > start && bytes+n > maxBytes {
 				break
 			}
@@ -341,7 +345,7 @@ func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRec
 		}
 		bytes := 0
 		for i := range attempt {
-			bytes += len(attempt[i].Data)
+			bytes += len(attempt[i].Data) + len(aws.ToString(attempt[i].PartitionKey))
 		}
 		start := time.Now()
 		out, err := e.client.PutRecords(ctx, &kinesis.PutRecordsInput{
