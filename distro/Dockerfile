@@ -1,15 +1,16 @@
 # Builds the otelcol-kinesis distribution via the OpenTelemetry Collector
 # Builder from distro/builder-config.yaml. Build context is the repo root so
 # the builder's local-module replace (=> ../..) resolves to this checkout.
+# No BuildKit cache mounts: the E2E hosts (colima without buildx among them)
+# must build this with the legacy builder. Module downloads rely on the
+# go.mod/go.sum COPY layer staying cached between builds instead.
 FROM golang:1.26 AS build
 ARG OCB_VERSION=v0.154.0
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+RUN go mod download
 COPY . .
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go run go.opentelemetry.io/collector/cmd/builder@${OCB_VERSION} \
+RUN CGO_ENABLED=0 go run go.opentelemetry.io/collector/cmd/builder@${OCB_VERSION} \
       --config distro/builder-config.yaml
 
 # Root variant (not :nonroot) deliberately: the E2E consumer writes to the
