@@ -34,6 +34,7 @@ implementing it.
 - [0020 — Remove `otel_arrow` encoding from the PoC](0020-remove-otel-arrow-encoding.md)
 - [0021 — Partition keys from sub-resource dimensions](0021-partition-keys-from-sub-resource-dimensions.md)
 - [0022 — Adopt exporterhelper queue, retry, and timeout](0022-adopt-exporterhelper-queue-retry-timeout.md)
+- [0023 — Build the collector with OCB as an ADOT-aligned distribution](0023-ocb-adot-aligned-distribution.md) (supersedes 0007)
 
 ## How to add an ADR
 

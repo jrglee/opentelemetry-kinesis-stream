@@ -1,6 +1,6 @@
 # 0007. Hand-written collector binary and docker-compose E2E stack
 
-- **Status:** Accepted
+- **Status:** Superseded by [0023](0023-ocb-adot-aligned-distribution.md)
 - **Date:** 2026-06-13
 
 ## Context
