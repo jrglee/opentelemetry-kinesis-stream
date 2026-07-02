@@ -16,10 +16,13 @@ Working end-to-end round trip for **traces, metrics, and logs**: the exporter en
 (`otlp_proto` or `otlp_json`), compresses
 (`none`/`gzip`/`zstd`/`snappy`/`x-snappy-framed`/`zlib`/`deflate`),
 derives partition keys (random or tag-hash), tag-groups microbatches, repacks
-oversize records, and writes via `PutRecords`; the receiver coordinates shard
-ownership across replicas via a lease store (in-memory or KCL-shaped DynamoDB)
-with leaderless fair-share rebalancing and graceful handoff, polls `GetRecords`,
-dead-letters unprocessable records, and checkpoints after downstream acceptance.
+oversize records, and writes via `PutRecords` behind the collector-standard
+`sending_queue`/`retry_on_failure`/`timeout` (exporterhelper, ADR-0022); the
+receiver coordinates shard ownership across replicas via a lease store
+(in-memory or KCL-shaped DynamoDB) with leaderless fair-share rebalancing and
+graceful handoff, polls `GetRecords` paced to the shard read quota,
+dead-letters unprocessable records (checkpoint advances only once the
+dead-letter wrapper is accepted), and checkpoints after downstream acceptance.
 A docker-compose E2E proves the round trip and multi-replica no-duplicate
 delivery against the MiniStack emulator, and CI runs the gate.
 
