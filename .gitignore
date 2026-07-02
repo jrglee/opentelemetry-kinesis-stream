@@ -4,6 +4,10 @@ bin/
 *.out
 coverage.out
 
+# OCB-generated distribution sources + binary (source of truth is
+# distro/builder-config.yaml; regenerate with `make collector`)
+distro/_build/
+
 # E2E consumer output (bind-mount target)
 compose/shared/
 

@@ -58,7 +58,7 @@ func TestLogsRoundTrip(t *testing.T) {
 	// Build the collector image once, then start without --build so parallel
 	// writers do not race the shared otelcol-kinesis:dev tag (the same gotcha
 	// as the traces stack).
-	if out, err := composeLogs(t, env, 5*time.Minute, "build", "producer-logs"); err != nil {
+	if out, err := composeLogs(t, env, 10*time.Minute, "build", "producer-logs"); err != nil {
 		t.Fatalf("compose build: %v\n%s", err, out)
 	}
 	if out, err := composeLogs(t, env, 3*time.Minute, "up", "-d"); err != nil {

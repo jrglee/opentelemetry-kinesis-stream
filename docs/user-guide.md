@@ -58,16 +58,20 @@ keyword and use the appropriate source and sink.
 ## Building a collector
 
 Both components are registered with the OpenTelemetry Collector through their
-`NewFactory()` functions. The repo ships a small custom distribution at
-[`cmd/otelcol-kinesis`](../cmd/otelcol-kinesis) that wires them alongside the
-OTLP receiver, file/debug exporters, and the batch processor. Build it:
+`NewFactory()` functions. The repo ships an OCB-generated, ADOT-aligned
+distribution defined by
+[`distro/builder-config.yaml`](../distro/builder-config.yaml) that wires them
+alongside the OTLP/InfluxDB receivers, file/debug/EMF exporters, the
+batch/memory-limiter/groupbyattrs/resourcedetection processors, and the
+sigv4auth extension. Build it:
 
 ```sh
-make collector        # produces bin/otelcol-kinesis
+make collector        # OCB generate + build; produces bin/otelcol-kinesis
 make docker           # builds the otelcol-kinesis:dev image
 ```
 
-To embed the components in your own distribution, import the factories:
+To embed the components in your own distribution (including a custom ADOT-style
+build), add them to your OCB manifest or import the factories directly:
 
 ```go
 import (

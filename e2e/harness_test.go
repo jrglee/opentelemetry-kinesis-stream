@@ -45,6 +45,27 @@ func composeEnv() []string {
 	return env
 }
 
+// assertDistroComponents proves the freshly built image is the OCB-generated,
+// ADOT-aligned distribution — not a stale hand-rolled binary — by asserting
+// that representative ADOT components are compiled in alongside the Kinesis
+// pair. The `components` subcommand ships with every OCB build.
+func assertDistroComponents(t *testing.T, env []string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "otelcol-kinesis:dev", "components")
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("distro components check: %v\n%s", err, out)
+	}
+	for _, want := range []string{"awskinesis", "awsemf", "sigv4auth", "resourcedetection", "memory_limiter"} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("distro is missing component %q; not the ADOT-aligned build?\n%s", want, out)
+		}
+	}
+}
+
 // copyShared pulls the consumer output files off the shared named volume into
 // a host directory via `docker compose cp`. A host bind mount would be simpler
 // but colima does not reliably surface container writes back to the macOS

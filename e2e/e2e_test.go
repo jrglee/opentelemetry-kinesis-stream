@@ -47,9 +47,10 @@ func TestRoundTripMultiReplica(t *testing.T) {
 	// same otelcol-kinesis:dev tag; letting `up --build` build them in parallel
 	// races three writers onto one tag (AlreadyExists under the classic
 	// builder). Build a single service, then start without --build.
-	if out, err := compose(t, env, 5*time.Minute, "build", "producer"); err != nil {
+	if out, err := compose(t, env, 10*time.Minute, "build", "producer"); err != nil {
 		t.Fatalf("compose build: %v\n%s", err, out)
 	}
+	assertDistroComponents(t, env)
 	if out, err := compose(t, env, 3*time.Minute, "up", "-d"); err != nil {
 		t.Fatalf("compose up: %v\n%s", err, out)
 	}

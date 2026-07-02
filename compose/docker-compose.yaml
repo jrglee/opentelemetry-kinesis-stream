@@ -26,7 +26,7 @@ services:
     image: otelcol-kinesis:dev
     build:
       context: ..
-      dockerfile: cmd/otelcol-kinesis/Dockerfile
+      dockerfile: distro/Dockerfile
     command: ["--config", "file:/etc/otelcol/config.yaml"]
     ports:
       - "4317:4317"
@@ -46,7 +46,7 @@ services:
     image: otelcol-kinesis:dev
     build:
       context: ..
-      dockerfile: cmd/otelcol-kinesis/Dockerfile
+      dockerfile: distro/Dockerfile
     command: ["--config", "file:/etc/otelcol/config.yaml"]
     environment:
       REPLICA: a
@@ -66,7 +66,7 @@ services:
     image: otelcol-kinesis:dev
     build:
       context: ..
-      dockerfile: cmd/otelcol-kinesis/Dockerfile
+      dockerfile: distro/Dockerfile
     command: ["--config", "file:/etc/otelcol/config.yaml"]
     environment:
       REPLICA: b

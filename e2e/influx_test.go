@@ -88,7 +88,7 @@ func TestInfluxMetricsRoundTrip(t *testing.T) {
 	// Build the collector image and linegen once, then start without --build so
 	// parallel writers do not race the shared otelcol-kinesis:dev tag (the same
 	// gotcha as the traces stack).
-	if out, err := composeInflux(t, env, 5*time.Minute, "build", "producer-metrics", "linegen"); err != nil {
+	if out, err := composeInflux(t, env, 10*time.Minute, "build", "producer-metrics", "linegen"); err != nil {
 		t.Fatalf("compose build: %v\n%s", err, out)
 	}
 	if out, err := composeInflux(t, env, 3*time.Minute, "up", "-d"); err != nil {

@@ -30,7 +30,7 @@ It is a single Go module rooted at the repo root.
 | `make check`    | **the pre-push gate**: fmt + vet + lint + test                     |
 | `make ci`       | read-only gate: fails on unformatted/untidy code instead of fixing  |
 | `make cover`    | per-package statement coverage summary                             |
-| `make collector`| build the custom collector binary to `bin/otelcol-kinesis`         |
+| `make collector`| generate (OCB) + build the distribution to `bin/otelcol-kinesis`   |
 | `make docker`   | build the collector container image (`otelcol-kinesis:dev`)        |
 | `make compose-up` / `make compose-down` | bring the E2E stack up / down (with volumes) |
 | `make e2e`      | full docker-compose round-trip test (needs Docker). Honors `ENCODING=` and `COMPRESSION=` env vars; defaults to the same combo CI exercises. |
@@ -43,10 +43,12 @@ Run `make check` before pushing; every commit should build and test on its own.
 
 ## Building and running the collector
 
-`make collector` builds a Collector binary that bundles this repo's exporter and
-receiver (composed via OpenTelemetry Collector Builder; see
-[`otelcol-builder.yaml`](otelcol-builder.yaml) and
-[`cmd/otelcol-kinesis/`](cmd/otelcol-kinesis/)). Run it against a config file:
+`make collector` generates and builds the Collector distribution with the
+OpenTelemetry Collector Builder from
+[`distro/builder-config.yaml`](distro/builder-config.yaml); the generated
+sources land in the gitignored `distro/_build/` and the binary in `bin/`
+(see [ADR-0023](docs/adr/0023-ocb-adot-aligned-distribution.md)). Run it
+against a config file:
 
 ```
 ./bin/otelcol-kinesis --config path/to/config.yaml

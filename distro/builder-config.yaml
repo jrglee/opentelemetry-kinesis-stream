@@ -1,0 +1,45 @@
+# Source of truth for the otelcol-kinesis distribution (see ADR-0023).
+#
+# The component set mirrors ADOT (aws-observability/aws-otel-collector,
+# pkg/defaultcomponents) where relevant to this repo's pipelines, pinned at
+# collector v0.154.0. ADOT publishes no OCB manifest — it hand-registers
+# components — so alignment means matching its component list, not importing
+# its build. Keep the versions here in lockstep with the root go.mod and
+# OCB_VERSION in the Makefile.
+dist:
+  module: github.com/jrglee/opentelemetry-kinesis-stream/distro
+  name: otelcol-kinesis
+  description: OpenTelemetry Collector distribution with Kinesis stream transport (ADOT-aligned)
+  version: 0.0.0-dev
+  output_path: ./distro/_build
+
+receivers:
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.154.0
+  - gomod: github.com/jrglee/opentelemetry-kinesis-stream v0.0.0
+    import: github.com/jrglee/opentelemetry-kinesis-stream/receiver/awskinesisreceiver
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/influxdbreceiver v0.154.0
+
+processors:
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.154.0
+  - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.154.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/groupbyattrsprocessor v0.154.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor v0.154.0
+
+exporters:
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.154.0
+  - gomod: github.com/jrglee/opentelemetry-kinesis-stream v0.0.0
+    import: github.com/jrglee/opentelemetry-kinesis-stream/exporter/awskinesisexporter
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/fileexporter v0.154.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsemfexporter v0.154.0
+
+extensions:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/sigv4authextension v0.154.0
+
+# providers and telemetry are omitted deliberately: OCB v0.154.0 defaults are
+# the env/file/http/https/yaml providers and otelconftelemetry — identical to
+# the hand-written main.go this distribution replaces, so existing configs
+# keep working unchanged.
+
+replaces:
+  # Resolved relative to output_path (dist.use_absolute_replace_paths=false).
+  - github.com/jrglee/opentelemetry-kinesis-stream => ../..
