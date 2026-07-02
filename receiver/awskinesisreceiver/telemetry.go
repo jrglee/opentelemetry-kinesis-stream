@@ -20,6 +20,7 @@ const (
 	leaseHeartbeatGot = "heartbeat_lost"
 	resultSuccess     = "success"
 	resultConflict    = "conflict"
+	resultError       = "error"
 )
 
 // receiverTelemetry holds the component's internal performance instruments.
@@ -32,6 +33,7 @@ type receiverTelemetry struct {
 	pollDuration metric.Float64Histogram
 	leaseEvents  metric.Int64Counter
 	shardsOwned  metric.Int64UpDownCounter
+	deadLetters  metric.Int64Counter
 }
 
 func newReceiverTelemetry(mp metric.MeterProvider) (*receiverTelemetry, error) {
@@ -76,13 +78,27 @@ func newReceiverTelemetry(mp metric.MeterProvider) (*receiverTelemetry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("shards owned counter: %w", err)
 	}
+	deadLetters, err := meter.Int64Counter(
+		"kinesis.receiver.dead_letter.records",
+		metric.WithDescription("dead-letter emit attempts for unprocessable records, tagged by result"),
+		metric.WithUnit("{record}"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("dead letter counter: %w", err)
+	}
 	return &receiverTelemetry{
 		pollRecords:  pollRecords,
 		pollBytes:    pollBytes,
 		pollDuration: pollDuration,
 		leaseEvents:  leaseEvents,
 		shardsOwned:  shardsOwned,
+		deadLetters:  deadLetters,
 	}, nil
+}
+
+// recordDeadLetter counts one dead-letter emit attempt by outcome.
+func (t *receiverTelemetry) recordDeadLetter(ctx context.Context, result string) {
+	t.deadLetters.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
 }
 
 // recordPoll observes one GetRecords call's size and latency.

@@ -29,6 +29,11 @@ type kinesisReceiver struct {
 
 	coord  *coordinator
 	cancel context.CancelFunc
+	// killCancel aborts the pollers' exit-path store writes (release, SHARD_END
+	// sentinel). Left alive through a graceful drain so those bounded writes
+	// complete; fired in the deadline branch so a hung store call cannot hold
+	// shutdown past the collector's deadline.
+	killCancel context.CancelFunc
 }
 
 func newTracesReceiver(cfg *Config, next consumer.Traces, set receiver.Settings) (*kinesisReceiver, error) {
@@ -92,6 +97,9 @@ func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
 		workerID = "otelcol-" + uuid.NewString()
 	}
 
+	killCtx, killCancel := context.WithCancel(context.Background())
+	r.killCancel = killCancel
+
 	r.coord = &coordinator{
 		cfg:      r.cfg,
 		client:   client,
@@ -101,6 +109,7 @@ func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
 		logger:   r.logger,
 		tel:      r.tel,
 		workerID: workerID,
+		killCtx:  killCtx,
 		active:   make(map[string]*activePoller),
 		observed: make(map[string]observation),
 		absent:   make(map[string]int),
@@ -145,10 +154,18 @@ func (r *kinesisReceiver) Shutdown(ctx context.Context) error {
 	select {
 	case <-done:
 		r.cancel()
+		if r.killCancel != nil {
+			r.killCancel()
+		}
 		return nil
 	case <-ctx.Done():
 		r.logger.Warn("shutdown deadline expired; hard-cancelling pollers", zap.Error(ctx.Err()))
 		r.cancel()
+		// Also abort exit-path store writes: after the deadline, a hung Release
+		// must not hold shutdown for another releaseTimeout per poller.
+		if r.killCancel != nil {
+			r.killCancel()
+		}
 		<-done
 		return ctx.Err()
 	}

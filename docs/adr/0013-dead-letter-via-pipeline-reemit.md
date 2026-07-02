@@ -41,3 +41,21 @@ rather than the component implementing a bespoke dead-letter sink.
 - The transient-vs-permanent distinction (only permanent/undecodable failures
   are dead-lettered; transient ones retry) keeps the feature from masking
   backpressure as data loss.
+
+## Amendment (2026-07-02): emit failure must not advance the checkpoint
+
+As originally implemented, a failed dead-letter emit was logged and ignored
+while the checkpoint advanced past the record — the wrapper itself could
+vanish silently, violating this ADR's core premise ("unprocessable records
+must not vanish silently") exactly when the pipeline was under enough
+pressure to reject the re-emit.
+
+Amended decision: with dead-lettering enabled, the checkpoint advances past an
+unprocessable record only once its dead-letter wrapper is accepted downstream.
+A failed emit re-reads the record and re-attempts the emit, under the existing
+stuck-record backoff. A persistently failing dead-letter pipeline therefore
+wedges the shard the same observable way a persistently rejecting downstream
+does — surfaced by the stuck warning and the
+`kinesis.receiver.dead_letter.records` counter (`result=success|error`) —
+rather than silently dropping the bytes. With dead-lettering disabled, skip
+semantics are unchanged.
