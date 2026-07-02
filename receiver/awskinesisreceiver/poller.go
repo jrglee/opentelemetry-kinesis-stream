@@ -48,6 +48,13 @@ type shardPoller struct {
 	logger *zap.Logger
 	tel    *receiverTelemetry
 
+	// killCtx bounds the best-effort store writes on the exit path (release,
+	// SHARD_END sentinel). It is NOT the poll context: a graceful drain leaves
+	// it alive so final writes complete, while the receiver cancels it when the
+	// collector's shutdown deadline fires so a hung store call cannot hold
+	// shutdown for releaseTimeout per poller. Nil means background (tests).
+	killCtx context.Context
+
 	leaseMu sync.Mutex
 	leased  lease.Lease
 
@@ -159,9 +166,12 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 					stop()
 					return
 				}
-			} else {
-				logger.Warn("get_records failed; backing off", zap.Error(err))
+				// Fresh iterator, and GetShardIterator just succeeded, so the
+				// shard is not throttled: poll again immediately instead of
+				// sleeping a full interval on top of the expiry stall.
+				continue
 			}
+			logger.Warn("get_records failed; backing off", zap.Error(err))
 			if p.waitOrStop(ctx, pollTick) {
 				return
 			}
@@ -241,6 +251,12 @@ func (p *shardPoller) runPoll(ctx context.Context, stop context.CancelFunc, logg
 		iter = out.NextShardIterator
 
 		if len(out.Records) == 0 {
+			// A nil next iterator means the shard is closed and fully drained:
+			// loop straight into the SHARD_END write instead of waiting out a
+			// poll interval on a shard that will never produce again.
+			if iter == nil {
+				continue
+			}
 			if p.waitOrStop(ctx, pollTick) {
 				return
 			}
@@ -339,7 +355,7 @@ func (p *shardPoller) writeShardEnd(ctx context.Context, logger *zap.Logger) {
 	writeCtx := ctx
 	if ctx.Err() != nil {
 		var cancel context.CancelFunc
-		writeCtx, cancel = context.WithTimeout(context.Background(), releaseTimeout)
+		writeCtx, cancel = context.WithTimeout(p.exitCtx(), releaseTimeout)
 		defer cancel()
 	}
 	if err := p.checkpoint(writeCtx, lease.CheckpointShardEnd); err != nil {
@@ -367,7 +383,9 @@ func (p *shardPoller) handleRecord(ctx context.Context, rec types.Record) record
 			zap.String("seq", aws.ToString(rec.SequenceNumber)),
 			zap.Error(err),
 		)
-		p.maybeDeadLetter(ctx, rec, "decompress")
+		if !p.maybeDeadLetter(ctx, rec, "decompress") {
+			return recordRetry
+		}
 		return recordSkip
 	}
 	// The sink performs the only signal-specific work: decode + deliver. It
@@ -382,7 +400,9 @@ func (p *shardPoller) handleRecord(ctx context.Context, rec types.Record) record
 			zap.String("shard", p.shardID()),
 			zap.String("seq", aws.ToString(rec.SequenceNumber)),
 		)
-		p.maybeDeadLetter(ctx, rec, "decode")
+		if !p.maybeDeadLetter(ctx, rec, "decode") {
+			return recordRetry
+		}
 	case result == recordRetry:
 		p.logger.Warn(
 			"consume failed; will retry record",
@@ -401,20 +421,30 @@ func (p *shardPoller) handleRecord(ctx context.Context, rec types.Record) record
 
 // maybeDeadLetter re-emits an unprocessable raw record into the pipeline when
 // dead-lettering is enabled, so the bytes are observable rather than silently
-// dropped. Emit failures are logged and ignored — the record is already being
-// skipped.
-func (p *shardPoller) maybeDeadLetter(ctx context.Context, rec types.Record, failureClass string) {
+// dropped. It reports whether the checkpoint may advance past the record: true
+// when dead-lettering is disabled (skipping is the configured behavior) or the
+// wrapper was accepted downstream; false when the emit failed — advancing then
+// would lose the bytes entirely, so the caller must re-read the record and
+// re-attempt the dead-letter. A persistently failing dead-letter pipeline
+// therefore wedges the shard exactly like a persistently rejecting downstream:
+// bounded by the stuck backoff and visible through its warning and the
+// dead_letter counter, rather than a silent drop.
+func (p *shardPoller) maybeDeadLetter(ctx context.Context, rec types.Record, failureClass string) bool {
 	if !p.cfg.DeadLetter.Enabled {
-		return
+		return true
 	}
 	if err := p.sink.deadLetter(ctx, rec, failureClass, string(p.cfg.Encoding), string(p.cfg.Compression)); err != nil {
+		p.tel.recordDeadLetter(ctx, resultError)
 		p.logger.Warn(
-			"dead-letter emit failed",
+			"dead-letter emit failed; record will be re-read",
 			zap.String("shard", p.shardID()),
 			zap.String("seq", aws.ToString(rec.SequenceNumber)),
 			zap.Error(err),
 		)
+		return false
 	}
+	p.tel.recordDeadLetter(ctx, resultSuccess)
+	return true
 }
 
 func (p *shardPoller) heartbeat(ctx context.Context) error {
@@ -439,13 +469,23 @@ func (p *shardPoller) checkpoint(ctx context.Context, seq string) error {
 	return nil
 }
 
-// release is the deferred exit path. It runs under a bounded background
-// context so a hung DynamoDB Release never blocks the collector's
-// graceful-shutdown deadline. Lease-conflict errors are silently dropped:
-// they mean the lease was already stolen, which is the postcondition
-// Release would have achieved anyway.
+// exitCtx is the parent for best-effort exit-path store writes: killCtx when
+// the coordinator wired one (cancelled on hard shutdown), background otherwise.
+func (p *shardPoller) exitCtx() context.Context {
+	if p.killCtx != nil {
+		return p.killCtx
+	}
+	return context.Background()
+}
+
+// release is the deferred exit path. It runs under a bounded exit context so a
+// hung DynamoDB Release never blocks the collector's graceful-shutdown
+// deadline — and aborts immediately once the deadline has already hard-
+// cancelled killCtx. Lease-conflict errors are silently dropped: they mean the
+// lease was already stolen, which is the postcondition Release would have
+// achieved anyway.
 func (p *shardPoller) release() {
-	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
+	ctx, cancel := context.WithTimeout(p.exitCtx(), releaseTimeout)
 	defer cancel()
 	p.leaseMu.Lock()
 	leased := p.leased

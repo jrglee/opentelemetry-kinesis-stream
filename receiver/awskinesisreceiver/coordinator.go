@@ -39,6 +39,10 @@ type coordinator struct {
 	// mid-batch. stopDiscovery cancels only the discovery/reconcile loop.
 	baseCtx       context.Context
 	stopDiscovery context.CancelFunc
+	// killCtx is handed to each poller to bound exit-path store writes; the
+	// receiver cancels it when the shutdown deadline fires. Nil in tests that
+	// construct the coordinator directly (pollers fall back to background).
+	killCtx context.Context
 
 	mu       sync.Mutex
 	active   map[string]*activePoller
@@ -75,12 +79,23 @@ type observation struct {
 }
 
 func (c *coordinator) start(ctx context.Context) error {
+	discCtx, cancel := context.WithCancel(ctx)
+	// baseCtx and stopDiscovery are published under mu because drainAndStop can
+	// run from another goroutine; the component contract serializes Start and
+	// Shutdown, but that contract is enforced here, not assumed.
+	c.mu.Lock()
+	if c.stopped {
+		c.mu.Unlock()
+		cancel()
+		return nil
+	}
 	c.baseCtx = ctx
+	c.stopDiscovery = cancel
+	c.mu.Unlock()
 	if err := c.discoverShards(ctx); err != nil {
+		cancel()
 		return err
 	}
-	discCtx, cancel := context.WithCancel(ctx)
-	c.stopDiscovery = cancel
 	c.wg.Add(1)
 	go c.run(discCtx)
 	return nil
@@ -92,16 +107,17 @@ func (c *coordinator) start(ctx context.Context) error {
 // which is NOT cancelled here, so they get to finish cleanly. The caller waits
 // on wait() and hard-cancels baseCtx only if a deadline forces it.
 func (c *coordinator) drainAndStop() {
-	if c.stopDiscovery != nil {
-		c.stopDiscovery()
-	}
 	c.mu.Lock()
 	c.stopped = true
+	stop := c.stopDiscovery
 	pollers := make([]*activePoller, 0, len(c.active))
 	for _, ap := range c.active {
 		pollers = append(pollers, ap)
 	}
 	c.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
 	for _, ap := range pollers {
 		ap.drain()
 	}
@@ -229,12 +245,11 @@ func (c *coordinator) reconcile(ctx context.Context) {
 		c.releasePoller(shardID)
 	}
 	for _, shardID := range plan.Acquire {
-		c.tryAcquire(ctx, byID[shardID])
+		c.tryAcquire(ctx, byID[shardID], leaseAcquire)
 	}
 	if plan.Steal != "" {
 		c.logger.Info("stealing shard to rebalance", zap.String("shard", plan.Steal))
-		c.tel.recordLeaseEvent(ctx, leaseSteal, resultSuccess)
-		c.tryAcquire(ctx, byID[plan.Steal])
+		c.tryAcquire(ctx, byID[plan.Steal], leaseSteal)
 	}
 
 	c.logger.Debug(
@@ -323,8 +338,10 @@ func (c *coordinator) cleanupOrphans(ctx context.Context, leases []lease.Lease) 
 // tryAcquire claims a lease for this worker, conditional on the counter we
 // observed, and starts a poller on success. A conflict means another worker
 // won the race or the owner heartbeated since the snapshot; it is retried next
-// pass and not logged as an error.
-func (c *coordinator) tryAcquire(ctx context.Context, l lease.Lease) {
+// pass and not logged as an error. event names the telemetry label (acquire or
+// steal); the outcome is recorded here, after the store call, so a lost race
+// is never counted as a success.
+func (c *coordinator) tryAcquire(ctx context.Context, l lease.Lease, event string) {
 	c.mu.Lock()
 	_, own := c.active[l.ShardID]
 	c.mu.Unlock()
@@ -334,13 +351,13 @@ func (c *coordinator) tryAcquire(ctx context.Context, l lease.Lease) {
 	taken, err := c.store.Acquire(ctx, l.ShardID, c.workerID, l.Counter)
 	if err != nil {
 		if errors.Is(err, lease.ErrLeaseConflict) {
-			c.tel.recordLeaseEvent(ctx, leaseAcquire, resultConflict)
+			c.tel.recordLeaseEvent(ctx, event, resultConflict)
 		} else {
 			c.logger.Warn("acquire failed", zap.String("shard", l.ShardID), zap.Error(err))
 		}
 		return
 	}
-	c.tel.recordLeaseEvent(ctx, leaseAcquire, resultSuccess)
+	c.tel.recordLeaseEvent(ctx, event, resultSuccess)
 	c.logger.Debug("lease acquired", zap.String("shard", taken.ShardID), zap.Int64("counter", taken.Counter))
 	c.startPoller(ctx, taken)
 }
@@ -376,6 +393,14 @@ func (c *coordinator) refreshObservations(leases []lease.Lease, now time.Time) {
 			delete(c.observed, shardID)
 		}
 	}
+	// Prune absent alongside observed: a lease deleted by a peer would otherwise
+	// leave its absence counter behind forever (cleanupOrphans only clears
+	// entries it reaps itself).
+	for shardID := range c.absent {
+		if !slices.ContainsFunc(leases, func(l lease.Lease) bool { return l.ShardID == shardID }) {
+			delete(c.absent, shardID)
+		}
+	}
 }
 
 func (c *coordinator) startPoller(_ context.Context, l lease.Lease) {
@@ -390,6 +415,7 @@ func (c *coordinator) startPoller(_ context.Context, l lease.Lease) {
 		sink:    c.sink,
 		logger:  c.logger,
 		tel:     c.tel,
+		killCtx: c.killCtx,
 		leased:  l,
 		drainCh: make(chan struct{}),
 	}
