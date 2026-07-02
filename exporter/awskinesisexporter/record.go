@@ -30,19 +30,6 @@ var (
 	putBackoffMax  = 2 * time.Second
 )
 
-// transientPutError reports whether a per-record PutRecords ErrorCode is worth
-// retrying. Throttling clears once the shard has capacity, and InternalFailure
-// is a transient service error; any other code (e.g. a validation error) fails
-// identically on every retry and is treated as permanent.
-func transientPutError(code string) bool {
-	switch code {
-	case "ProvisionedThroughputExceededException", "InternalFailure":
-		return true
-	default:
-		return false
-	}
-}
-
 // taggedBatch pairs a signal batch with the joined tag value used to derive
 // its partition key. key is empty for the random strategy.
 type taggedBatch[T any] struct {
@@ -373,25 +360,31 @@ func (e *kinesisExporter) putRecords(ctx context.Context, records []types.PutRec
 		}
 
 		var retry []types.PutRecordsRequestEntry
-		var rejected int
 		for i, r := range out.Records {
 			if r.ErrorCode == nil {
 				continue // succeeded
 			}
-			if transientPutError(aws.ToString(r.ErrorCode)) {
-				retry = append(retry, attempt[i])
-				continue
+			// Every per-record ErrorCode is retried. AWS documents exactly two:
+			// "ProvisionedThroughputExceededException" (shard throttled; backoff
+			// clears the capacity debt) and "InternalFailure" (transient service
+			// error). Anything else is deliberately retry-biased — a future AWS
+			// code must not be silently dropped before it can be classified. After
+			// maxPutAttempts the still-failing subset surfaces as a retryable
+			// error for the Collector's retry policy, the at-least-once backstop.
+			code := aws.ToString(r.ErrorCode)
+			switch code {
+			case "ProvisionedThroughputExceededException", "InternalFailure":
+				// Known transient codes — retry silently.
+			default:
+				// Unknown code: log at Warn so operators see it.
+				e.logger.Warn(
+					"kinesis record: unrecognised error code (will retry)",
+					zap.Int("index", i),
+					zap.String("code", code),
+					zap.String("message", aws.ToString(r.ErrorMessage)),
+				)
 			}
-			e.logger.Warn(
-				"kinesis record rejected",
-				zap.Int("index", i),
-				zap.String("code", aws.ToString(r.ErrorCode)),
-				zap.String("message", aws.ToString(r.ErrorMessage)),
-			)
-			rejected++
-		}
-		if rejected > 0 {
-			e.tel.recordDrop(ctx, rejected, "rejected")
+			retry = append(retry, attempt[i])
 		}
 		if len(retry) == 0 {
 			return nil
