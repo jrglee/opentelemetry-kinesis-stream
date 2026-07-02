@@ -270,6 +270,42 @@ func TestOversizeSplitPreservesSpans(t *testing.T) {
 	}
 }
 
+func TestRandomStrategyDistinctKeysPerRecord(t *testing.T) {
+	cfg := &Config{
+		StreamName:    "test-stream",
+		Region:        "us-east-1",
+		Encoding:      encoding.EncodingOTLPProto,
+		Compression:   encoding.CodecNone,
+		MaxRecordSize: 120, // tiny: forces split_half into several records
+		PartitionKey:  PartitionKeyConfig{Strategy: partitionStrategyRandom, Hash: hashXXHash},
+		Oversize:      OversizeConfig{Policies: []string{oversizeSplitHalf}, MaxAttempts: 16, MaxAttributeValueBytes: 4096},
+	}
+	capt := &capture{}
+	exp := newTestExporterCfg(t, cfg, capt.injectSerialize())
+
+	td := ptrace.NewTraces()
+	ss := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+	for i := 0; i < 8; i++ {
+		ss.Spans().AppendEmpty().SetName("span-name-padding-to-exceed-the-limit")
+	}
+	if err := exp.ConsumeTraces(context.Background(), td); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	recs := capt.all()
+	if len(recs) <= 1 {
+		t.Fatalf("expected split into >1 record, got %d", len(recs))
+	}
+	// Random promises uniform shard fan-out; a shared key would funnel every
+	// record of this batch onto a single shard.
+	seen := map[string]struct{}{}
+	for _, r := range recs {
+		seen[aws.ToString(r.PartitionKey)] = struct{}{}
+	}
+	if len(seen) != len(recs) {
+		t.Fatalf("expected %d distinct partition keys, got %d", len(recs), len(seen))
+	}
+}
+
 func TestOversizeSingleSpanDroppedCountsMetric(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))

@@ -123,7 +123,6 @@ func emit[T any](ctx context.Context, e *kinesisExporter, b T, sc signalCodec[T]
 
 	entries := make([]types.PutRecordsRequestEntry, 0, len(groups))
 	for _, g := range groups {
-		key := e.partitionKey(g.key)
 		payloads, ds := packChain(ctx, e, g.batch, sc)
 		for _, d := range ds {
 			e.tel.recordDrop(ctx, d.count, d.reason)
@@ -135,7 +134,7 @@ func emit[T any](ctx context.Context, e *kinesisExporter, b T, sc signalCodec[T]
 			)
 		}
 		for _, p := range payloads {
-			entries = append(entries, types.PutRecordsRequestEntry{Data: p, PartitionKey: aws.String(key)})
+			entries = append(entries, types.PutRecordsRequestEntry{Data: p, PartitionKey: aws.String(e.partitionKey(g.key))})
 		}
 	}
 	return e.flush(ctx, entries)
@@ -143,7 +142,8 @@ func emit[T any](ctx context.Context, e *kinesisExporter, b T, sc signalCodec[T]
 
 // partitionKey resolves the per-record key. tag_hash maps a tag tuple to a
 // stable 16-hex key so equal tuples always land on the same key (and shard);
-// random returns a fresh UUID per group for uniform fan-out.
+// random returns a fresh UUID per record for uniform fan-out — a key shared
+// across a call's records would funnel them all onto one shard.
 func (e *kinesisExporter) partitionKey(tagValue string) string {
 	if e.cfg.tagHash() {
 		return fmt.Sprintf("%016x", xxhash.Sum64String(tagValue))
