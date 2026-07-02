@@ -2,6 +2,7 @@ package awskinesisexporter
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -308,4 +309,102 @@ func sampleTraces() ptrace.Traces {
 	span.SetTraceID([16]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10})
 	span.SetSpanID([8]byte{0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18})
 	return td
+}
+
+// TestSleepBackoffRespectsDeadline verifies that sleepBackoff fails fast
+// instead of consuming the attempt budget. Both an already-expired context and
+// a live deadline that would fire before the backoff completes must return
+// immediately — sleeping into a known deadline wastes time the caller could
+// spend surfacing the error to the Collector's retry policy. Nominal backoff
+// for try=4 is putBackoffBase*2^4 = 1600ms.
+func TestSleepBackoffRespectsDeadline(t *testing.T) {
+	t.Run("expired context returns its error immediately", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+		defer cancel()
+		time.Sleep(10 * time.Millisecond) // ensure deadline has elapsed
+
+		start := time.Now()
+		err := sleepBackoff(ctx, 4)
+		elapsed := time.Since(start)
+
+		if err == nil {
+			t.Fatal("expected context error, got nil")
+		}
+		if elapsed > 100*time.Millisecond {
+			t.Fatalf("sleepBackoff took %v with expired deadline; want < 100ms (nominal backoff is 1600ms)", elapsed)
+		}
+	})
+
+	t.Run("live deadline nearer than backoff returns without sleeping", func(t *testing.T) {
+		// Deadline 500ms out, backoff 1600ms: sleeping into the deadline would
+		// block ~500ms. The fast-path must return DeadlineExceeded well before.
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		err := sleepBackoff(ctx, 4)
+		elapsed := time.Since(start)
+
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+		}
+		if elapsed > 100*time.Millisecond {
+			t.Fatalf("sleepBackoff took %v with live 500ms deadline; want immediate return, not a sleep into the deadline", elapsed)
+		}
+	})
+}
+
+// TestFlushAbortsOnCancelledCtx verifies that flush() checks ctx.Err() between
+// chunks and aborts immediately — without sending subsequent chunks — when the
+// context is already cancelled. The SDK fake ignores the context so that without
+// the inter-chunk check flush would drive all chunks regardless of cancellation.
+func TestFlushAbortsOnCancelledCtx(t *testing.T) {
+	var callCount int32
+	inject := func(o *kinesis.Options) {
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			return stack.Initialize.Add(
+				middleware.InitializeMiddlewareFunc("ignoreCtxCapture", func(
+					_ context.Context, // deliberately ignore ctx so the fake always succeeds
+					_ middleware.InitializeInput,
+					_ middleware.InitializeHandler,
+				) (middleware.InitializeOutput, middleware.Metadata, error) {
+					atomic.AddInt32(&callCount, 1)
+					return middleware.InitializeOutput{
+						Result: &kinesis.PutRecordsOutput{FailedRecordCount: aws.Int32(0)},
+					}, middleware.Metadata{}, nil
+				}),
+				middleware.Before,
+			)
+		})
+	}
+
+	cfg := &Config{
+		StreamName:    "test-stream",
+		Region:        "us-east-1",
+		Encoding:      encoding.EncodingOTLPProto,
+		Compression:   encoding.CodecNone,
+		MaxRecordSize: 1 << 20,
+		PartitionKey:  PartitionKeyConfig{Strategy: partitionStrategyRandom, Hash: hashXXHash},
+		Oversize:      OversizeConfig{Policies: []string{oversizeSplitHalf}, MaxAttempts: 8, MaxAttributeValueBytes: 4096},
+		PutRecords:    PutRecordsConfig{MaxRecords: 1, MaxBytes: 5 << 20}, // 1 record per chunk
+	}
+	exp := newTestExporterCfg(t, cfg, inject)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel so ctx.Err() is non-nil
+
+	entries := []types.PutRecordsRequestEntry{
+		{Data: []byte("a"), PartitionKey: aws.String("key")},
+		{Data: []byte("b"), PartitionKey: aws.String("key")},
+		{Data: []byte("c"), PartitionKey: aws.String("key")},
+	}
+	err := exp.flush(ctx, entries)
+	if err == nil {
+		t.Fatal("expected error for cancelled ctx, got nil")
+	}
+	// With the ctx.Err() guard at the top of each chunk iteration, zero
+	// PutRecords calls should be made.
+	if n := atomic.LoadInt32(&callCount); n != 0 {
+		t.Fatalf("flush made %d PutRecords calls with pre-cancelled ctx, want 0", n)
+	}
 }

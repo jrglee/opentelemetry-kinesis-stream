@@ -21,8 +21,8 @@ func TestDefaultConfigHasQueueRetryTimeout(t *testing.T) {
 	if !cfg.RetryConfig.Enabled {
 		t.Fatal("retry_on_failure should be enabled by default")
 	}
-	if cfg.TimeoutConfig.Timeout <= 0 {
-		t.Fatalf("timeout should default positive, got %v", cfg.TimeoutConfig.Timeout)
+	if cfg.TimeoutConfig.Timeout != 30*time.Second {
+		t.Fatalf("timeout default: got %v want 30s (must cover the internal PutRecords retry budget plus a multi-chunk flush)", cfg.TimeoutConfig.Timeout)
 	}
 }
 
