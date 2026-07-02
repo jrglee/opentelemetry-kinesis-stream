@@ -3,9 +3,62 @@ package awskinesisexporter
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"go.opentelemetry.io/collector/confmap"
 
 	"github.com/jrglee/opentelemetry-kinesis-stream/internal/encoding"
 )
+
+// TestDefaultConfigHasQueueRetryTimeout pins the exporterhelper defaults: the
+// sending queue and retry-on-failure are on out of the box, so a whole-request
+// failure is retried instead of silently dropped.
+func TestDefaultConfigHasQueueRetryTimeout(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	if !cfg.QueueConfig.HasValue() {
+		t.Fatal("sending_queue should be enabled by default")
+	}
+	if !cfg.RetryConfig.Enabled {
+		t.Fatal("retry_on_failure should be enabled by default")
+	}
+	if cfg.TimeoutConfig.Timeout <= 0 {
+		t.Fatalf("timeout should default positive, got %v", cfg.TimeoutConfig.Timeout)
+	}
+}
+
+// TestConfigUnmarshalsHelperBlocks proves the collector-standard block names
+// (timeout, sending_queue, retry_on_failure) reach their fields.
+func TestConfigUnmarshalsHelperBlocks(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	conf := confmap.NewFromStringMap(map[string]any{
+		"stream_name": "s",
+		"region":      "us-east-1",
+		"timeout":     "7s",
+		"sending_queue": map[string]any{
+			"queue_size":      123,
+			"wait_for_result": true,
+		},
+		"retry_on_failure": map[string]any{
+			"initial_interval": "42ms",
+		},
+	})
+	if err := conf.Unmarshal(cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cfg.TimeoutConfig.Timeout != 7*time.Second {
+		t.Fatalf("timeout: got %v want 7s", cfg.TimeoutConfig.Timeout)
+	}
+	queue := cfg.QueueConfig.Get()
+	if queue == nil {
+		t.Fatal("sending_queue should be set")
+	}
+	if queue.QueueSize != 123 || !queue.WaitForResult {
+		t.Fatalf("sending_queue: got queue_size=%d wait_for_result=%v", queue.QueueSize, queue.WaitForResult)
+	}
+	if cfg.RetryConfig.InitialInterval != 42*time.Millisecond {
+		t.Fatalf("retry_on_failure.initial_interval: got %v want 42ms", cfg.RetryConfig.InitialInterval)
+	}
+}
 
 // baseValidCfg is the minimal Config that passes Validate. Each table case
 // mutates one field to exercise its rule in isolation.
