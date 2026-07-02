@@ -10,7 +10,11 @@ expectations and contributors know where the edges are.
 We do not vendor KCL (it has no idiomatic Go port — that absence is the whole
 reason this project exists). We instead copy KCL's decomposition and its
 lease-count load-balancing algorithm, and we keep the **DynamoDB lease table
-schema KCL-compatible** so a real KCL consumer can share the table.
+schema KCL-shaped** — matching column names and types (including
+`parentShardId` as a string set, per KCL's `DynamoDBLeaseSerializer`) — with
+the intent that a real KCL consumer could share the table. That interop has
+not been exercised against a stock KCL; treat it as designed-for, not
+verified.
 
 ## Component mapping
 
@@ -72,7 +76,8 @@ writes live in `lease.Store`.
 
 KCL-compatible columns we write: `leaseKey` (shard id, HASH), `leaseOwner`,
 `leaseCounter`, `checkpoint` (sequence number or `TRIM_HORIZON` / `SHARD_END`),
-`parentShardId` (comma-joined). KCL's other columns
+`parentShardId` (string set, matching KCL's serializer; comma-joined string
+rows from earlier versions of this store are still read). KCL's other columns
 (`checkpointSubSequenceNumber`, `ownerSwitchesSinceCheckpoint`, `childShardIds`,
 `startingHashKey`/`endingHashKey`, multi-stream `streamName`/`shardID`) are not
 written.
@@ -102,7 +107,7 @@ not a tested guarantee, until exercised against a real KCL consumer.
 | KPL sub-sequence checkpoints | **Not implemented** | No `checkpointSubSequenceNumber`; whole-record granularity. |
 | Multi-stream | **Not implemented** | One stream per receiver instance. |
 | Enhanced fan-out (EFO) | **Not implemented** | Polling (`GetRecords`) only. |
-| KCL-table compatibility | **Implemented** | Columns above; migration to/from KCL intended. |
+| KCL-table compatibility | **Partial** | Columns and types above match KCL's serializer; not yet exercised against a stock KCL consumer. |
 
 ## Guarantees and sharp edges (inherited from KCL)
 
@@ -113,8 +118,9 @@ not a tested guarantee, until exercised against a real KCL consumer.
   counter changes. Large clock skew across replicas can cause premature or late
   reclaim — keep hosts NTP-synced, as KCL requires.
 - **`heartbeat_interval` < `lease_duration`** is required (validated). KCL keeps
-  renewal at roughly `lease_duration / 3`; the defaults here (5s / 30s) follow
-  that ratio.
+  renewal at roughly `lease_duration / 3` (`CommonCalculations`); the defaults
+  here (5s / 30s) renew twice as often as that rule requires — safer against
+  missed beats, at double the per-shard DynamoDB write rate.
 - **Hot spots from mismatched counts.** With more shards than the even split
   allows, some workers carry one extra shard (KCL's "stable disbalance").
   Observability, not finer balancing, is the answer at this scope.

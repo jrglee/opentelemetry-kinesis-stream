@@ -23,8 +23,10 @@ const (
 	attrCheckpoint    = "checkpoint"
 	attrParentShardID = "parentShardId"
 
-	// parentSeparator matches KCL's join character for multi-parent rows.
-	// A single parent is stored as the bare shard ID.
+	// parentSeparator is read-side only: earlier versions of this store wrote
+	// parents as one comma-joined string. KCL has no such separator — it
+	// stores parentShardId as a DynamoDB string set, which is what marshal
+	// now writes.
 	parentSeparator = ","
 )
 
@@ -256,8 +258,11 @@ func leaseKey(shardID string) map[string]types.AttributeValue {
 
 // marshalLease serializes a Lease into the KCL attribute layout. Owner is
 // omitted entirely when empty so the row matches KCL's "unowned" shape.
-// Parents are joined with ',' (KCL's separator); a missing/empty list
-// omits the attribute, again matching KCL.
+// Parents are a DynamoDB string set — KCL's DynamoDBLeaseSerializer stores
+// parentShardId as SS, and a stock KCL reading anything else deserializes
+// zero parents and loses its parent-before-child reshard barrier. A
+// missing/empty list omits the attribute (sets cannot be empty), matching
+// KCL.
 func marshalLease(l Lease) map[string]types.AttributeValue {
 	item := map[string]types.AttributeValue{
 		attrLeaseKey:     &types.AttributeValueMemberS{Value: l.ShardID},
@@ -268,9 +273,7 @@ func marshalLease(l Lease) map[string]types.AttributeValue {
 		item[attrLeaseOwner] = &types.AttributeValueMemberS{Value: l.Owner}
 	}
 	if len(l.ParentIDs) > 0 {
-		item[attrParentShardID] = &types.AttributeValueMemberS{
-			Value: strings.Join(l.ParentIDs, parentSeparator),
-		}
+		item[attrParentShardID] = &types.AttributeValueMemberSS{Value: l.ParentIDs}
 	}
 	return item
 }
@@ -298,8 +301,16 @@ func unmarshalLease(m map[string]types.AttributeValue) (Lease, error) {
 		}
 		l.Counter = v
 	}
-	if parents, ok := stringAttr(m, attrParentShardID); ok && parents != "" {
-		l.ParentIDs = strings.Split(parents, parentSeparator)
+	switch parents := m[attrParentShardID].(type) {
+	case *types.AttributeValueMemberSS:
+		l.ParentIDs = append([]string(nil), parents.Value...)
+	case *types.AttributeValueMemberS:
+		// Rows written before parents became a string set used a comma-joined
+		// string; keep reading them so an existing lease table migrates in
+		// place as rows are rewritten.
+		if parents.Value != "" {
+			l.ParentIDs = strings.Split(parents.Value, parentSeparator)
+		}
 	}
 	return l, nil
 }
