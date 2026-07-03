@@ -60,8 +60,10 @@ compose-down:
 # E2E spins the full stack up and down itself; -count=1 defeats caching.
 # ENCODING and COMPRESSION are passed through to the compose configs so the
 # same harness can spot-check different combos without editing YAML.
+# The timeout matches CI: an uncached in-Docker OCB image rebuild alone can
+# take several minutes before the first stack even starts.
 e2e:
-	go test -tags e2e -count=1 -timeout 300s ./e2e/...
+	go test -tags e2e -count=1 -timeout 900s ./e2e/...
 
 # Sequential sweep over a small representative set of (encoding, compression)
 # combos. Heavy — ~15 min per combo — opt-in, not part of `check`.

@@ -1084,7 +1084,7 @@ Emitted instruments (scope `awskinesisexporter` / `awskinesisreceiver`):
 | `kinesis.exporter.batch.records` | histogram | `{record}` | records per `PutRecords` call |
 | `kinesis.exporter.batch.bytes` | histogram | `By` | aggregate payload bytes per call |
 | `kinesis.exporter.flush.duration_ms` | histogram | `ms` | `PutRecords` latency |
-| `kinesis.exporter.records_dropped` | counter | `{item}` | `reason` = `marshal_error` \| `compress_error` \| `max_attempts` \| `irreducible` \| `reject_policy` \| `chain_exhausted` \| `rejected` |
+| `kinesis.exporter.records_dropped` | counter | `{item}` | `reason` = `marshal_error` \| `compress_error` \| `max_attempts` \| `irreducible` \| `reject_policy` \| `chain_exhausted` |
 | `kinesis.exporter.attributes_truncated` | counter | `{attribute}` | attribute values clamped by `truncate_attribute_values`. Emitted on every mutation regardless of whether truncation alone fit the record — a non-zero sustained rate means something upstream is generating long values. |
 | `kinesis.receiver.poll.records` | histogram | `{record}` | records per `GetRecords` call |
 | `kinesis.receiver.poll.bytes` | histogram | `By` | aggregate record bytes per call |
