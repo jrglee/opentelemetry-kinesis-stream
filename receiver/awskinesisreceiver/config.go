@@ -19,6 +19,43 @@ const (
 	LeaseBackendDynamoDB LeaseBackend = "dynamodb"
 )
 
+// WorkerResolutionStrategy selects how the lease-owner identity (the DynamoDB
+// leaseOwner attribute) is resolved at startup.
+//
+// The identity MUST be unique per live replica: this is a correctness
+// invariant, not just an efficiency knob. A replica reclaims a lease whose
+// stored owner equals its own identity without waiting out lease_duration (that
+// is what makes a restart fast), so two live replicas that resolve the same
+// identity will each keep reclaiming the other's shards and deliver them twice.
+// A stable identity additionally lets a restarted replica reclaim its own
+// leases immediately instead of waiting out lease_duration.
+type WorkerResolutionStrategy string
+
+const (
+	// WorkerStrategyStatic uses WorkerID verbatim; when WorkerID is empty a
+	// random "otelcol-<uuid>" is generated (unique, but not stable across
+	// restarts). The default, and the only strategy that reads WorkerID.
+	WorkerStrategyStatic WorkerResolutionStrategy = "static"
+	// WorkerStrategyHostname uses the OS hostname. Safe only where each replica
+	// has a unique, stable hostname (e.g. a Kubernetes StatefulSet pod). It is
+	// the wrong choice where hostnames collide (host-network mode, or several
+	// replicas per host) — that double-delivers — or where the hostname is the
+	// container id (plain Docker, ECS bridge mode), which is unique but changes
+	// every restart, so no leases are reclaimed.
+	WorkerStrategyHostname WorkerResolutionStrategy = "hostname"
+	// WorkerStrategyECS reads the task ID from the ECS container metadata
+	// endpoint. Unique per task and stable across in-task container restarts,
+	// so a container that restarts within its task reclaims its own leases with
+	// no operator wiring. A task *replacement* gets a new task ID (a fresh
+	// identity), which is safe — just the normal reclaim-after-lease_duration.
+	WorkerStrategyECS WorkerResolutionStrategy = "ecs"
+	// WorkerStrategyFile reads the trimmed contents of WorkerIDFile. For
+	// platforms that project a unique, stable identity onto a file (e.g. the
+	// downward API) rather than an environment variable. Mounting the same
+	// content to two replicas double-delivers.
+	WorkerStrategyFile WorkerResolutionStrategy = "file"
+)
+
 // Config is the configuration for the Kinesis traces receiver.
 type Config struct {
 	// StreamName is the source Kinesis Data Stream.
@@ -38,11 +75,17 @@ type Config struct {
 	// MaxRecords caps the GetRecords response size. Default 10000 (Kinesis maximum).
 	MaxRecords int32 `mapstructure:"max_records"`
 
-	// WorkerID uniquely identifies this receiver replica. Two replicas with
-	// the same WorkerID will fight over leases. Empty means a random UUID is
-	// generated at startup; persisting a stable WorkerID across restarts is
-	// recommended in production.
+	// WorkerResolutionStrategy selects how the lease-owner identity is resolved
+	// at startup. Default: static. See WorkerResolutionStrategy for the options.
+	WorkerResolutionStrategy WorkerResolutionStrategy `mapstructure:"worker_resolution_strategy"`
+	// WorkerID uniquely identifies this receiver replica under the static
+	// strategy. Two replicas with the same WorkerID will fight over leases.
+	// Empty means a random UUID is generated at startup; persisting a stable
+	// WorkerID across restarts is recommended in production. Ignored by every
+	// non-static strategy.
 	WorkerID string `mapstructure:"worker_id"`
+	// WorkerIDFile is the path read by the file strategy. Ignored otherwise.
+	WorkerIDFile string `mapstructure:"worker_id_file"`
 	// LeaseBackend selects the lease store. Default: memory.
 	LeaseBackend LeaseBackend `mapstructure:"lease_backend"`
 	// LeaseTable names the DynamoDB table for the dynamodb backend. Ignored
@@ -89,6 +132,20 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxRecords <= 0 || c.MaxRecords > 10000 {
 		return errors.New("max_records must be in (0, 10000]")
+	}
+	switch c.WorkerResolutionStrategy {
+	case WorkerStrategyStatic, WorkerStrategyHostname, WorkerStrategyECS, WorkerStrategyFile:
+	default:
+		return fmt.Errorf("unknown worker_resolution_strategy %q", c.WorkerResolutionStrategy)
+	}
+	if c.WorkerID != "" && c.WorkerResolutionStrategy != WorkerStrategyStatic {
+		return fmt.Errorf("worker_id is only used with worker_resolution_strategy: static, not %q", c.WorkerResolutionStrategy)
+	}
+	if c.WorkerIDFile != "" && c.WorkerResolutionStrategy != WorkerStrategyFile {
+		return fmt.Errorf("worker_id_file is only used with worker_resolution_strategy: file, not %q", c.WorkerResolutionStrategy)
+	}
+	if c.WorkerResolutionStrategy == WorkerStrategyFile && c.WorkerIDFile == "" {
+		return errors.New("worker_id_file is required when worker_resolution_strategy=file")
 	}
 	switch c.LeaseBackend {
 	case LeaseBackendMemory:

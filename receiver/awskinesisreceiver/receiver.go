@@ -8,7 +8,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/google/uuid"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/receiver"
@@ -93,9 +92,9 @@ func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
 			"set lease_backend: dynamodb in production")
 	}
 
-	workerID := r.cfg.WorkerID
-	if workerID == "" {
-		workerID = "otelcol-" + uuid.NewString()
+	workerID, err := resolveWorkerID(ctx, r.cfg)
+	if err != nil {
+		return fmt.Errorf("resolve worker id: %w", err)
 	}
 
 	killCtx, killCancel := context.WithCancel(context.Background())
@@ -127,6 +126,7 @@ func (r *kinesisReceiver) Start(ctx context.Context, _ component.Host) error {
 		"kinesis receiver started",
 		zap.String("stream", r.cfg.StreamName),
 		zap.String("worker_id", workerID),
+		zap.String("worker_resolution_strategy", string(r.cfg.WorkerResolutionStrategy)),
 		zap.String("lease_backend", string(r.cfg.LeaseBackend)),
 	)
 	return nil

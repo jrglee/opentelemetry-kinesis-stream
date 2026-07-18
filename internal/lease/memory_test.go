@@ -51,6 +51,26 @@ func TestAcquireFencesStaleWriter(t *testing.T) {
 	}
 }
 
+func TestAcquireRejectsEmptyOwner(t *testing.T) {
+	s := NewMemoryStore()
+	ctx := context.Background()
+	mustEnsure(t, s, "shard-1")
+
+	// An empty owner would persist a row that reads as unowned — reject it.
+	if _, err := s.Acquire(ctx, "shard-1", "", 0); !errors.Is(err, ErrEmptyOwner) {
+		t.Fatalf("empty-owner Acquire err=%v, want ErrEmptyOwner", err)
+	}
+	// The rejected attempt must not have mutated the row: a real owner can
+	// still claim it at the original counter.
+	got, err := s.Acquire(ctx, "shard-1", "worker-A", 0)
+	if err != nil {
+		t.Fatalf("Acquire after rejected empty owner: %v", err)
+	}
+	if got.Owner != "worker-A" || got.Counter != 1 {
+		t.Fatalf("acquire returned %+v; the empty-owner attempt must not have mutated the row", got)
+	}
+}
+
 func TestHeartbeatRequiresOwnerAndCounter(t *testing.T) {
 	s := NewMemoryStore()
 	ctx := context.Background()

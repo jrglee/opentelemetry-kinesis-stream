@@ -52,6 +52,14 @@ var ErrLeaseConflict = errors.New("lease conflict")
 // ErrLeaseNotFound signals that the lease row does not exist.
 var ErrLeaseNotFound = errors.New("lease not found")
 
+// ErrEmptyOwner signals an attempt to Acquire with an empty owner string. An
+// empty leaseOwner is the store's "unowned" marker (see [Lease.IsOwnedBy] and
+// the DynamoDB omit-when-empty encoding), so claiming a lease under an empty
+// owner would persist a row that reads as unowned — every replica would then
+// re-claim it and deliver its shard, causing duplicate delivery. Acquire
+// rejects it at the seam rather than trust every caller to guard.
+var ErrEmptyOwner = errors.New("lease owner must not be empty")
+
 // Store is the persistence contract for the lease coordinator.
 //
 // Implementations must be safe for concurrent use across goroutines and
@@ -72,7 +80,9 @@ type Store interface {
 	// Acquire takes ownership of a lease. expectedCounter is the value the
 	// caller observed via List; the write succeeds only if the row's Counter
 	// still matches. Returns the new Lease with bumped Counter and the
-	// caller as Owner. Returns ErrLeaseConflict on a counter mismatch.
+	// caller as Owner. Returns ErrLeaseConflict on a counter mismatch, and
+	// ErrEmptyOwner if owner is empty (an owned lease must have a non-empty
+	// owner; empty is the unowned marker).
 	Acquire(ctx context.Context, shardID, owner string, expectedCounter int64) (Lease, error)
 
 	// Heartbeat re-asserts ownership, bumping Counter. Conditional on the

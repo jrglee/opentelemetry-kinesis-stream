@@ -35,6 +35,7 @@ implementing it.
 - [0021 — Partition keys from sub-resource dimensions](0021-partition-keys-from-sub-resource-dimensions.md)
 - [0022 — Adopt exporterhelper queue, retry, and timeout](0022-adopt-exporterhelper-queue-retry-timeout.md)
 - [0023 — Build the collector with OCB as an ADOT-aligned distribution](0023-ocb-adot-aligned-distribution.md) (supersedes 0007)
+- [0024 — Worker identity resolution strategies](0024-worker-identity-resolution-strategies.md)
 
 ## How to add an ADR
 

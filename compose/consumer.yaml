@@ -1,7 +1,9 @@
 # Consumer collector: Kinesis in, file out. Run as two replicas (a/b) that
 # share one DynamoDB lease table, so shard ownership is split between them.
-# REPLICA is injected per container and disambiguates both the lease worker
-# identity and the output file.
+# REPLICA is injected per container and names the output file. The lease worker
+# identity comes from the `file` resolution strategy: each container mounts a
+# different worker-id file at the same path, exercising strategy resolution
+# end-to-end (the resolved id lands in the DynamoDB leaseOwner column).
 receivers:
   awskinesis:
     stream_name: otel-traces
@@ -13,7 +15,8 @@ receivers:
     max_records: 1000
     lease_backend: dynamodb
     lease_table: otel-leases
-    worker_id: ${env:REPLICA}
+    worker_resolution_strategy: file
+    worker_id_file: /etc/otelcol/worker-id
     # Short timings so a takeover is observable within an E2E run.
     lease_duration: 10s
     heartbeat_interval: 2s

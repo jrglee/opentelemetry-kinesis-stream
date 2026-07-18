@@ -62,6 +62,11 @@ func TestRoundTripMultiReplica(t *testing.T) {
 	// exactly-once delivery requires a settled assignment first.
 	waitForBalancedOwnership(t)
 
+	// Prove the file worker-resolution strategy resolved end-to-end: the lease
+	// owners are the identities read from each consumer's mounted worker-id
+	// file, confirming a non-static strategy round-trips into leaseOwner.
+	assertLeaseOwners(t, "kinesis-worker-a", "kinesis-worker-b")
+
 	// telemetrygen connects to the producer's OTLP listener; wait for it to
 	// accept connections so a fast --rate=0 burst is not dropped before the
 	// gRPC server binds.
