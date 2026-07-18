@@ -281,6 +281,14 @@ func TestAcquire(t *testing.T) {
 			t.Fatalf("want ErrLeaseConflict, got %v", err)
 		}
 	})
+
+	t.Run("empty owner → ErrEmptyOwner before any store call", func(t *testing.T) {
+		f := newFakeDynamo() // nothing enqueued: the guard must short-circuit the AWS call
+		_, err := newFakeStore(t, f).Acquire(context.Background(), "s-1", "", 2)
+		if !errors.Is(err, ErrEmptyOwner) {
+			t.Fatalf("want ErrEmptyOwner, got %v", err)
+		}
+	})
 }
 
 // TestDynamoDBDelete covers the three Delete outcomes defined by the Store contract:

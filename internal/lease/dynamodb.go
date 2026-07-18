@@ -112,6 +112,9 @@ func (s *DynamoDBStore) Ensure(ctx context.Context, shardID string, parentIDs []
 // new owner is allowed to overwrite whatever owner string is currently
 // stored, because Counter alone is the fencing token at takeover time.
 func (s *DynamoDBStore) Acquire(ctx context.Context, shardID, owner string, expectedCounter int64) (Lease, error) {
+	if owner == "" {
+		return Lease{}, ErrEmptyOwner
+	}
 	upd := expression.
 		Set(expression.Name(attrLeaseOwner), expression.Value(owner)).
 		Set(expression.Name(attrLeaseCounter), expression.Value(expectedCounter+1))

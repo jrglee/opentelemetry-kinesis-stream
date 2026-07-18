@@ -57,6 +57,7 @@ services:
       COMPRESSION: ${COMPRESSION:-gzip}
     volumes:
       - ./consumer.yaml:/etc/otelcol/config.yaml:ro
+      - ./worker-a.id:/etc/otelcol/worker-id:ro
       - shared:/shared
     depends_on:
       stream-init:
@@ -77,6 +78,7 @@ services:
       COMPRESSION: ${COMPRESSION:-gzip}
     volumes:
       - ./consumer.yaml:/etc/otelcol/config.yaml:ro
+      - ./worker-b.id:/etc/otelcol/worker-id:ro
       - shared:/shared
     depends_on:
       stream-init:

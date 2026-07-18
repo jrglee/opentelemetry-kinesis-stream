@@ -163,6 +163,34 @@ func ownersSignature(owners map[string]int) string {
 	return b.String()
 }
 
+// assertLeaseOwners proves a non-static worker-resolution strategy resolved
+// end-to-end: the distinct leaseOwner values in DynamoDB equal the identities
+// the consumers were configured to resolve. The traces stack uses the `file`
+// strategy, so the owners are the contents of each consumer's mounted
+// worker-id file — not a configured worker_id.
+func assertLeaseOwners(t *testing.T, want ...string) {
+	t.Helper()
+	client := dynamoClient(t)
+	wantSorted := append([]string(nil), want...)
+	sort.Strings(wantSorted)
+	// Poll rather than assert on a single scan: scanOwners returns an empty set
+	// on any transient DynamoDB error, and with one lease per worker a momentary
+	// single-owner state (a heartbeat CAS rewrite, a late steal settling) would
+	// flip the exact-set check. Tolerate both by retrying until it matches.
+	deadline := time.Now().Add(settleDeadline)
+	var got []string
+	for time.Now().Before(deadline) {
+		owners, _, _ := scanOwners(t, client)
+		got = keys(owners)
+		sort.Strings(got)
+		if strings.Join(got, ",") == strings.Join(wantSorted, ",") {
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Fatalf("leaseOwners = %v, want %v: file worker-resolution strategy did not resolve", got, wantSorted)
+}
+
 // waitForProducer blocks until the producer's OTLP gRPC port (published to the
 // host) accepts a TCP connection, so telemetrygen does not blast spans before
 // the listener is bound.

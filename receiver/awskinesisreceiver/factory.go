@@ -27,14 +27,15 @@ func NewFactory() receiver.Factory {
 
 func createDefaultConfig() component.Config {
 	return &Config{
-		Encoding:          encoding.EncodingOTLPProto,
-		Compression:       encoding.CodecNone,
-		PollInterval:      250 * time.Millisecond,
-		MaxRecords:        10000,
-		LeaseBackend:      LeaseBackendMemory,
-		LeaseDuration:     30 * time.Second,
-		HeartbeatInterval: 5 * time.Second,
-		DiscoveryInterval: 30 * time.Second,
+		Encoding:                 encoding.EncodingOTLPProto,
+		Compression:              encoding.CodecNone,
+		PollInterval:             250 * time.Millisecond,
+		MaxRecords:               10000,
+		WorkerResolutionStrategy: WorkerStrategyStatic,
+		LeaseBackend:             LeaseBackendMemory,
+		LeaseDuration:            30 * time.Second,
+		HeartbeatInterval:        5 * time.Second,
+		DiscoveryInterval:        30 * time.Second,
 	}
 }
 

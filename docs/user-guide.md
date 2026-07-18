@@ -628,7 +628,9 @@ pipeline, and checkpoints after downstream acceptance.
 | `dead_letter.enabled`| bool     | `false`      | no       | When true, a record that cannot be decompressed or decoded is wrapped with its metadata and re-emitted into this receiver's own pipeline instead of being skipped. See [Dead-letter handling](#dead-letter-handling). |
 | `poll_interval`      | duration | `250ms`      | no       | Delay between `GetRecords` calls on a shard after an empty response. Stay under the 5-reads/s/shard Kinesis limit. |
 | `max_records`        | int      | `10000`      | no       | Cap on records per `GetRecords` (1–10000; 10000 is the Kinesis maximum). |
-| `worker_id`          | string   | (random UUID)| no       | Unique id for this replica. A **stable** id across restarts is recommended in production so a restarting replica reclaims its own leases. Two replicas sharing an id will fight. |
+| `worker_resolution_strategy` | string | `static` | no | How the lease-owner identity is resolved at startup: `static`, `hostname`, `ecs`, or `file`. See [Worker identity](#worker-identity). |
+| `worker_id`          | string   | (random UUID)| no       | Identity for the `static` strategy. A **stable** id across restarts is recommended in production so a restarting replica reclaims its own leases. Two replicas sharing an id will fight. Ignored by every non-`static` strategy. |
+| `worker_id_file`     | string   | —            | if file  | Path read by the `file` strategy. Ignored otherwise. |
 | `lease_backend`      | string   | `memory`     | no       | `memory` (single replica, no durability) or `dynamodb` (multi-replica, durable). See [Lease backends](#lease-backends). |
 | `lease_table`        | string   | —            | if dynamodb | DynamoDB lease table name. |
 | `lease_duration`     | duration | `30s`        | no       | A lease whose heartbeat lapses for this long may be reclaimed by a peer. Must be greater than `heartbeat_interval`. |
@@ -668,6 +670,52 @@ receivers:
     lease_duration: 30s
     heartbeat_interval: 5s
     discovery_interval: 15s
+```
+
+### Worker identity
+
+Each replica claims shards under a **worker identity** — the `leaseOwner` column
+in the DynamoDB lease table. `worker_resolution_strategy` selects how that
+identity is resolved at startup:
+
+| Strategy   | Identity source | Use when |
+|------------|-----------------|----------|
+| `static`   | `worker_id`, or a random `otelcol-<uuid>` if unset | You inject a stable id yourself, e.g. `worker_id: ${env:POD_NAME}` on Kubernetes. The default. |
+| `hostname` | the OS hostname | Each replica has a unique, stable hostname (e.g. a Kubernetes StatefulSet pod). **Not** host-network mode or several replicas per host (hostnames collide), and not plain Docker / ECS bridge mode (the hostname is the container id — unique but changes every restart, so no reclaim). |
+| `ecs`      | the ECS task ID | Running on ECS/Fargate — see below. |
+| `file`     | the trimmed contents of `worker_id_file` | The platform projects a unique, stable id onto a file rather than an environment variable. |
+
+> **The identity must be unique per live replica — this is a correctness
+> requirement, not just an efficiency knob.** A replica reclaims a lease whose
+> stored owner equals its own identity without waiting `lease_duration` (that is
+> what makes a restart fast). So if two *live* replicas resolve the **same**
+> identity — colliding hostnames, or the same `worker_id_file` content mounted to
+> two tasks — they will each keep reclaiming the other's shards and **deliver
+> records twice**. Give every replica a distinct identity.
+
+A **stable** identity additionally lets a restarting replica reclaim its own
+leases immediately instead of waiting out `lease_duration`.
+
+`worker_id` is read only by `static`; setting it under another strategy is a
+configuration error. A non-`static` strategy that cannot resolve (metadata
+endpoint absent, file missing or empty, a non-UTF-8 file) fails startup rather
+than silently falling back.
+
+On **ECS/Fargate** the task ID is the natural stable, unique identity, but ECS
+exposes it only through the container metadata endpoint — never as an
+environment variable a task definition can reference, so `${env:...}` cannot
+reach it. The `ecs` strategy reads it directly (the ECS agent injects
+`ECS_CONTAINER_METADATA_URI_V4`; the endpoint is link-local and needs no extra
+IAM permission), so no entrypoint wiring is required:
+
+```yaml
+receivers:
+  awskinesis:
+    stream_name: otel-traces
+    region: us-east-1
+    lease_backend: dynamodb
+    lease_table: otel-kinesis-leases
+    worker_resolution_strategy: ecs   # leaseOwner = ECS task id, stable per task
 ```
 
 ### Dead-letter handling
@@ -961,8 +1009,10 @@ sequenceDiagram
     Note over B: re-reads only what A delivered but did not checkpoint
 ```
 
-Set a **stable `worker_id`** so a quickly-restarting replica reclaims its own
-leases immediately rather than waiting out `lease_duration`.
+Give each replica a **stable identity** so a quickly-restarting replica reclaims
+its own leases immediately rather than waiting out `lease_duration` — a static
+`worker_id`, or a `worker_resolution_strategy` that derives one (`ecs` on
+ECS/Fargate). See [Worker identity](#worker-identity).
 
 ### Resharding
 

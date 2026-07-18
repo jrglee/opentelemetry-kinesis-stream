@@ -47,6 +47,9 @@ func (s *MemoryStore) Ensure(_ context.Context, shardID string, parentIDs []stri
 
 // Acquire implements [Store].
 func (s *MemoryStore) Acquire(_ context.Context, shardID, owner string, expectedCounter int64) (Lease, error) {
+	if owner == "" {
+		return Lease{}, ErrEmptyOwner
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, ok := s.leases[shardID]
