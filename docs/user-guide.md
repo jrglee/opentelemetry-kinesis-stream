@@ -120,12 +120,12 @@ aws dynamodb wait table-exists --table-name "$LEASE_TABLE"
 
 ### 2. Grant IAM permissions
 
-The collector process needs, on the stream:
-`kinesis:DescribeStreamSummary`, `kinesis:ListShards`,
+The collector process needs, on the stream: `kinesis:ListShards`,
 `kinesis:GetShardIterator`, `kinesis:GetRecords`, `kinesis:PutRecords`; and on
 the lease table: `dynamodb:Scan`, `dynamodb:GetItem`, `dynamodb:PutItem`,
-`dynamodb:UpdateItem`. Attach these to the role or user whose credentials the
-collector runs with (instance role, IRSA, or `AWS_*` environment variables).
+`dynamodb:UpdateItem`, `dynamodb:DeleteItem`. Attach these to the role or user
+whose credentials the collector runs with (instance role, IRSA, or `AWS_*`
+environment variables).
 
 ### 3. Write the producer and consumer configs
 
@@ -757,10 +757,10 @@ unowned), `leaseCounter` (fencing token), `checkpoint` (sequence number or the
 sentinels `TRIM_HORIZON` / `SHARD_END`), and `parentShardId` (comma-joined
 parents). KCL's other columns are left to KCL's defaults.
 
-The receiver's IAM role needs `kinesis:DescribeStream*`, `kinesis:ListShards`,
+The receiver's IAM role needs `kinesis:ListShards`,
 `kinesis:GetShardIterator`, `kinesis:GetRecords` on the stream, and
-`dynamodb:Scan`, `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem`
-on the lease table.
+`dynamodb:Scan`, `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:GetItem`,
+`dynamodb:DeleteItem` on the lease table.
 
 ## Metrics with InfluxDB line protocol
 
