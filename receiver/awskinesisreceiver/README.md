@@ -45,65 +45,51 @@ downstream acceptance.
 
 ## Operating under backpressure
 
-The receiver is synchronous and holds no buffer of its own: a shard's goroutine
-delivers each record downstream and only then reads the next batch, so a
-downstream that cannot keep up structurally throttles reads at the source.
-Kinesis is meant to be the buffer here — when the pipeline slows, unread records
-stay in the stream (iterator age rises) rather than piling up in Collector
-memory. Realizing that requires one thing from the downstream exporter, and it
-is easy to give up by accident.
+The receiver is synchronous and unbuffered: a shard goroutine delivers each
+record downstream before reading the next batch, so a slow downstream throttles
+reads at the source and unread records stay in Kinesis (iterator age rises)
+instead of piling up in Collector memory. This holds only if nothing between the
+receiver and its sink buffers acceptances asynchronously.
 
 **Acceptance is not durable delivery.** The receiver checkpoints a record once
-the downstream *accepts* it. Under the Collector's consumer contract,
-"acceptance" means "accepted for processing," not "written to its destination."
-If a component between this receiver and the sink buffers acceptances
-asynchronously — most commonly an exporter `sending_queue`, which is enabled by
-default — then a record is "accepted" the moment it enters the queue, not when
-it is durably written. The consequences compound under load:
+the downstream *accepts* it, and under the Collector's consumer contract
+"acceptance" means "accepted for processing," not "written." An exporter
+`sending_queue` — enabled by default — accepts a record the moment it enters the
+queue. Under load that breaks the chain:
 
-- The read rate stops tracking the write rate. The receiver fills the queue at
-  read speed while the sink drains it slower, so ingress far outruns egress and
-  the checkpoint runs ahead of what has actually been written.
-- When the queue fills, the enqueue fails with a transient error, which the
-  receiver treats as backpressure: it re-reads rather than skips, freezes the
-  checkpoint, and pauses. As the queue drains it resumes and races ahead again.
-  That cycle shows up as an oscillating (sawtooth) iterator age and a resident
-  memory footprint the size of the queue.
-- A non-persistent queue loses whatever it holds on restart, and because the
-  checkpoint already advanced past those records, they are not re-read. What
-  looks like a smoothing buffer is a silent-loss window.
+- Ingress outruns egress: the receiver fills the queue at read speed while the
+  sink drains slower, and the checkpoint runs ahead of what was actually written.
+- When the queue fills, enqueue fails transiently; the receiver re-reads,
+  freezes the checkpoint, and pauses, then races ahead as the queue drains. The
+  result is a sawtooth iterator age and memory sized to the queue.
+- A non-persistent queue drops its contents on restart, and the checkpoint has
+  already advanced past them — a silent-loss window.
 
-**The operating contract.** For backpressure to reach Kinesis and for
-at-least-once delivery to hold, do not place an asynchronous, non-persistent
-buffer between this receiver and its sink. Either run the downstream exporter
-with its sending queue disabled — so a delivery call blocks until the write (and
-its retries) complete, making acceptance equal durable delivery — or, if you
-need the queue to smooth bursts, make it both blocking on overflow and backed by
-persistent storage. This is guidance the operator applies to the pipeline, not a
-constraint the receiver enforces.
-
-The synchronous shape, for a metrics pipeline writing to a remote-write backend:
+**Keep the path synchronous.** For backpressure to reach Kinesis and
+at-least-once to hold, don't put an async, non-persistent buffer between the
+receiver and its sink. Either disable the exporter's sending queue — so delivery
+blocks until the write and its retries finish — or, to smooth bursts, make the
+queue block on overflow and persist it. This is operator configuration, not
+something the receiver enforces.
 
 ```yaml
 exporters:
   prometheusremotewrite:
     endpoint: https://backend.example/api/v1/write
-    # Disable the async queue: delivery blocks until the write completes, so
-    # the receiver's checkpoint tracks durable writes and reads pause when the
-    # backend is slow. Kinesis holds the backlog.
+    # Delivery blocks until the write completes: the checkpoint tracks durable
+    # writes and reads pause when the backend is slow. Kinesis holds the backlog.
     sending_queue:
       enabled: false
-    # Keep retries: a backend that stays down past max_elapsed_time surfaces a
-    # retryable error, and the receiver re-reads (holding the lease) rather than
-    # dropping. Bound it so a hard outage is not retried forever in-line.
+    # A backend down past max_elapsed_time surfaces a retryable error; the
+    # receiver re-reads (holding the lease) rather than dropping.
     retry_on_failure:
       enabled: true
       max_elapsed_time: 30s
     timeout: 10s
 ```
 
-To smooth bursts instead of blocking outright, keep the queue but make overflow
-block and persist it (requires a `file_storage` extension):
+To smooth bursts instead, keep the queue but block on overflow and persist it
+(needs a `file_storage` extension):
 
 ```yaml
     sending_queue:
@@ -112,26 +98,20 @@ block and persist it (requires a `file_storage` extension):
       storage: file_storage
 ```
 
-**Tune `max_records` and `poll_interval` for the synchronous path.** With a
-blocking downstream, each poll delivers its whole batch in-line before the next
-read, and a transient rejection re-reads from the last checkpoint rather than
-mid-batch. A smaller `max_records` (the E2E stack uses `1000`, not the `10000`
-default) checkpoints more often and re-reads less on a rejection, at the cost of
-more `GetRecords` calls; keep `poll_interval` at or above the 5-reads/sec/shard
-quota (default `250ms`).
+**Tuning.** With a blocking downstream, a transient rejection re-reads from the
+last checkpoint, not mid-batch, so a smaller `max_records` (the E2E stack uses
+`1000` vs. the `10000` default) checkpoints more often and re-reads less, at the
+cost of more `GetRecords` calls. Keep `poll_interval` at or above the
+five-reads/sec/shard quota (default `250ms`).
 
-**Reading the signals when the contract holds.** Ingress and egress converge,
-iterator age becomes a clean measure of backlog rather than a sawtooth, and the
+**Signals.** When the path is synchronous, ingress and egress converge, iterator
+age measures real backlog instead of oscillating, and the
 `kinesis.receiver.poll.*` histograms reflect true throughput. A rising stuck
-backoff — logged after five consecutive passes that checkpoint nothing — means
-the sink is genuinely rejecting the head record, so the shard is deliberately
-held (and its lease kept) rather than dropping bytes.
-
-This pipeline has no `memory_limiter`. If one is added ahead of the sink, its
-data-refused error is transient, so the receiver backpressures (re-reads) rather
-than drops under memory pressure — the correct behavior, but it means a refusing
-`memory_limiter` also freezes the checkpoint and holds the shard; size its
-limits with that in mind.
+backoff — logged after five passes that checkpoint nothing — means the sink is
+genuinely rejecting the head record, so the shard is held (lease kept) rather
+than dropped. A `memory_limiter` ahead of the sink behaves the same way: its
+refusal is transient, so the receiver holds the shard rather than dropping —
+size its limits accordingly.
 
 ## Configuration
 
